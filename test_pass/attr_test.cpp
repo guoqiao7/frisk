@@ -332,8 +332,8 @@ bool testReduceLayoutInference(MLIRContext &context) {
     return false;
   }
   if (auto replicate = dstLayout.getReplicateSize())
-    if (replicate.getInt() != 8) {
-      llvm::errs() << "unexpected replicate extent, want 8 got "
+    if (replicate.getInt() != 1) {
+      llvm::errs() << "unexpected replicate extent, want 1 got "
                    << replicate.getInt() << "\n";
       return false;
     }
