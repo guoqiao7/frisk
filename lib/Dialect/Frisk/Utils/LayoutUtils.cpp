@@ -422,8 +422,6 @@ compressReplicateDimInMap(OpBuilder &builder, AffineMapAttr mapAttr,
 
   unsigned newDimCount = map.getNumDims() - 1;
   unsigned newSymCount = originalSymCount + (needsReplicateSymbol ? 1 : 0);
-  for (AffineExpr &expr : rewrittenResults)
-    expr = simplifyAffineExpr(expr, newDimCount, newSymCount);
 
   AffineMap newMap =
       AffineMap::get(newDimCount, newSymCount, rewrittenResults,
