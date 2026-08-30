@@ -8,9 +8,7 @@ namespace mlir::frisk {
 #define GEN_PASS_DECL
 #include "Dialect/Frisk/Transforms/Passes.h.inc"
 
-std::unique_ptr<Pass> createLayoutInferPass();
-
-
+std::unique_ptr<Pass> createFriskInferLayoutsPass();
 
 #define GEN_PASS_REGISTRATION
 #include "Dialect/Frisk/Transforms/Passes.h.inc"
