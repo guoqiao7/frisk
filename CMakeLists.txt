@@ -9,6 +9,9 @@ set(CMAKE_CXX_STANDARD 17)
 
 project(frisk LANGUAGES CXX C)
 
+include(CTest)
+enable_testing()
+
 find_package(MLIR REQUIRED CONFIG)
 message(STATUS "MLIR_DIR=${MLIR_DIR}")
 message(STATUS "LLVM_DIR=${LLVM_DIR}")
@@ -20,6 +23,8 @@ list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 include(TableGen) # required by AddMLIR
 include(AddLLVM)
 include(AddMLIR)
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(LLVM_MAIN_SRC_DIR "${LLVM_BUILD_MAIN_SRC_DIR}")
 
@@ -62,6 +67,7 @@ include_directories(${PROJECT_BINARY_DIR}/include)
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/include)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/lib)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/tools)
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/exp)
 
@@ -94,5 +100,5 @@ install(TARGETS frisk_ffi LIBRARY DESTINATION ${PY_BUILD_CMAKE_MODULE_NAME} COMP
 # target_include_directories(frisk_ffi PRIVATE
 #   "${PROJECT_BINARY_DIR}/include"
 # )
-# add_subdirectory(test)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/test)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/test_pass)

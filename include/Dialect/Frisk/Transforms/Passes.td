@@ -3,16 +3,10 @@
 
 include "mlir/Pass/PassBase.td"
 
-def FriskLayoutInfer: InterfacePass<"frisk-layoutInfer", "FunctionOpInterface">{
-    let summary = "Frisk layoutInfer";
-    let description = [{
-        Infer layout op
-    }];
-
-    let constructor = "mlir::frisk::createFriskLayoutInferPass";
-
-    let dependentDialects = [];
-
+def FriskInferLayouts : InterfacePass<"frisk-infer-layouts", "FunctionOpInterface"> {
+  let summary = "Infer and materialize Frisk layouts";
+  let constructor = "mlir::frisk::createFriskInferLayoutsPass()";
+  let dependentDialects = ["::mlir::frisk::FriskDialect"];
 }
 
 #endif // FRISK_PASSES

@@ -117,7 +117,7 @@ static AffineExpr floorDivConst(AffineExpr expr, int64_t divisor,
 }
 
 static AffineExpr modConst(AffineExpr expr, int64_t divisor, MLIRContext *ctx) {
-  return expr - getConstExpr(divisor, ctx) * floorDivConst(expr, divisor, ctx);
+  return expr % getConstExpr(divisor, ctx);
 }
 
 static AffineExpr xor2x2(AffineExpr a, AffineExpr b, MLIRContext *ctx) {

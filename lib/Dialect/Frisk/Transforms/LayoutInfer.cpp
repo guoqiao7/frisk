@@ -1,25 +1,26 @@
-#include "mlir/IR/PatternMatch.h"
-#include "mlir/Pass/Pass.h"
+#include "Dialect/Frisk/Transforms/Passes.h"
 
-#include "frisk/Dialect/Frisk/Transforms/Passes.h"
-#include "frisk/Dialect/Frisk/IR/FriskDialect.h"
+#include "Dialect/Frisk/IR/FriskDialect.h"
+#include "mlir/IR/BuiltinAttributes.h"
 
 namespace mlir::frisk {
 
-#define GEN_PASS_DEF_FRISKLAYOUTINFER
-#include "frisk/Dialect/Frisk/Transforms/Passes.h.inc"
+#define GEN_PASS_DEF_FRISKINFERLAYOUTS
+#include "Dialect/Frisk/Transforms/Passes.h.inc"
 
-} // namespace mlir::frisk
+namespace {
+class FriskInferLayoutsPass final
+    : public impl::FriskInferLayoutsBase<FriskInferLayoutsPass> {
+public:
+  void runOnOperation() override {
+    getOperation()->setAttr("frisk.layout_inference_ran",
+                            UnitAttr::get(&getContext()));
+  }
+};
+} // namespace
 
-namespace mlir::frisk
-{
-
-namespace{
-
-
-
-
-
+std::unique_ptr<Pass> createFriskInferLayoutsPass() {
+  return std::make_unique<FriskInferLayoutsPass>();
 }
 
 } // namespace mlir::frisk

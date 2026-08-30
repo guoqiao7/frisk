@@ -10,3 +10,47 @@ target_link_libraries(frisk_attr_test
   MLIRFuncDialect
   MLIRParser
 )
+
+add_executable(frisk_reduce_layout_test
+  reduce_layout_test.cpp
+)
+
+llvm_update_compile_flags(frisk_reduce_layout_test)
+
+target_link_libraries(frisk_reduce_layout_test
+  PRIVATE
+  FriskIR
+  MLIRFuncDialect
+  MLIRParser
+)
+
+add_test(NAME FriskAttrTest COMMAND frisk_attr_test)
+add_test(NAME FriskReduceLayoutTest COMMAND frisk_reduce_layout_test)
+
+add_executable(frisk_layout_pass_test
+  layout_pass_test.cpp
+)
+
+llvm_update_compile_flags(frisk_layout_pass_test)
+
+target_link_libraries(frisk_layout_pass_test
+  PRIVATE
+  FriskTransforms
+)
+
+add_test(NAME FriskLayoutPassTest COMMAND frisk_layout_pass_test)
+
+add_executable(frisk_memory_effect_test
+  memory_effect_test.cpp
+)
+
+llvm_update_compile_flags(frisk_memory_effect_test)
+
+target_link_libraries(frisk_memory_effect_test
+  PRIVATE
+  FriskIR
+  MLIRFuncDialect
+  MLIRSideEffectInterfaces
+)
+
+add_test(NAME FriskMemoryEffectTest COMMAND frisk_memory_effect_test)

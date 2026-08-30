@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <functional>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -26,10 +27,6 @@
 #include "Dialect/Frisk/IR/FriskEnums.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "Dialect/Frisk/Utils/LayoutUtils.h"
-
-#define GET_OP_CLASSES
-#include "Dialect/Frisk/IR/FriskOps.cpp.inc"
-#include "Dialect/Frisk/IR/FriskDialect.cpp.inc"
 
 namespace mlir {
 namespace frisk {
@@ -105,66 +102,6 @@ static AffineMapAttr remapReduceDimension(OpBuilder &builder,
   return AffineMapAttr::get(newMap);
 }
 
-static bool exprUsesDim(AffineExpr expr, unsigned dimIdx) {
-  if (auto dim = expr.dyn_cast<AffineDimExpr>())
-    return dim.getPosition() == dimIdx;
-  if (expr.isa<AffineSymbolExpr>() || expr.isa<AffineConstantExpr>())
-    return false;
-  if (auto bin = expr.dyn_cast<AffineBinaryOpExpr>())
-    return exprUsesDim(bin.getLHS(), dimIdx) ||
-           exprUsesDim(bin.getRHS(), dimIdx);
-  return false;
-}
-
-static AffineMapAttr condensePlaceholderDimension(OpBuilder &builder,
-                                                  AffineMapAttr mapAttr,
-                                                  bool keepPlaceholderSymbol) {
-  if (!mapAttr)
-    return AffineMapAttr();
-  AffineMap map = mapAttr.getValue();
-  unsigned dimCount = map.getNumDims();
-  if (dimCount == 0)
-    return mapAttr;
-
-  unsigned placeholder = dimCount - 1;
-  bool placeholderUsed = llvm::any_of(map.getResults(), [&](AffineExpr expr) {
-    return exprUsesDim(expr, placeholder);
-  });
-
-  unsigned newSymCount = map.getNumSymbols();
-  AffineExpr placeholderValue = builder.getAffineConstantExpr(0);
-  if (keepPlaceholderSymbol && placeholderUsed) {
-    placeholderValue = builder.getAffineSymbolExpr(newSymCount);
-    ++newSymCount;
-  }
-
-  SmallVector<AffineExpr> dimSubs;
-  dimSubs.reserve(dimCount);
-  for (unsigned i = 0; i < dimCount; ++i) {
-    if (i < placeholder)
-      dimSubs.push_back(builder.getAffineDimExpr(i));
-    else if (i == placeholder)
-      dimSubs.push_back(placeholderValue);
-    else
-      dimSubs.push_back(builder.getAffineDimExpr(i - 1));
-  }
-
-  SmallVector<AffineExpr> symSubs;
-  symSubs.reserve(map.getNumSymbols());
-  for (unsigned i = 0; i < map.getNumSymbols(); ++i)
-    symSubs.push_back(builder.getAffineSymbolExpr(i));
-
-  SmallVector<AffineExpr> newResults;
-  newResults.reserve(map.getNumResults());
-  for (AffineExpr expr : map.getResults())
-    newResults.push_back(expr.replaceDimsAndSymbols(
-        dimSubs, symSubs, /*numResultDims=*/dimCount - 1,
-        /*numResultSymbols=*/newSymCount));
-  AffineMap newMap =
-      AffineMap::get(dimCount - 1, newSymCount, newResults, builder.getContext());
-  return AffineMapAttr::get(newMap);
-}
-
 static DenseI64ArrayAttr buildShapeAttr(OpBuilder &builder,
                                         ArrayRef<int64_t> shape) {
   SmallVector<int64_t> values(shape.begin(), shape.end());
@@ -173,12 +110,79 @@ static DenseI64ArrayAttr buildShapeAttr(OpBuilder &builder,
   return builder.getDenseI64ArrayAttr(values);
 }
 
-static bool affineMapAttrsEqual(AffineMapAttr lhs, AffineMapAttr rhs) {
-  if (!lhs && !rhs)
-    return true;
-  if (!lhs || !rhs)
+static bool mapsAgreeOnDomain(MLIRContext *ctx, AffineMap lhs, AffineMap rhs,
+                              ArrayRef<int64_t> dimExtents,
+                              ArrayRef<int64_t> lhsSymbolExtents,
+                              ArrayRef<int64_t> rhsSymbolExtents) {
+  if (lhs.getNumDims() != rhs.getNumDims() ||
+      lhs.getNumResults() != rhs.getNumResults())
     return false;
-  return lhs == rhs;
+  if (lhs.getNumDims() != dimExtents.size() ||
+      lhs.getNumSymbols() != lhsSymbolExtents.size() ||
+      rhs.getNumSymbols() != rhsSymbolExtents.size())
+    return false;
+
+  Builder builder(ctx);
+  SmallVector<int64_t> dimValues(dimExtents.size(), 0);
+  SmallVector<int64_t> lhsSymValues(lhsSymbolExtents.size(), 0);
+  SmallVector<int64_t> rhsSymValues(rhsSymbolExtents.size(), 0);
+
+  auto foldMap = [&](AffineMap map, ArrayRef<int64_t> dims,
+                     ArrayRef<int64_t> symbols,
+                     SmallVectorImpl<Attribute> &results) -> LogicalResult {
+    SmallVector<Attribute> operands;
+    operands.reserve(dims.size() + symbols.size());
+    for (int64_t value : dims)
+      operands.push_back(builder.getI64IntegerAttr(value));
+    for (int64_t value : symbols)
+      operands.push_back(builder.getI64IntegerAttr(value));
+    return map.constantFold(operands, results);
+  };
+
+  std::function<bool(unsigned)> enumerateDims = [&](unsigned index) -> bool {
+    if (index == dimExtents.size()) {
+      std::function<bool(unsigned)> enumerateLhsSymbols =
+          [&](unsigned lhsIndex) -> bool {
+        if (lhsIndex == lhsSymbolExtents.size()) {
+          std::function<bool(unsigned)> enumerateRhsSymbols =
+              [&](unsigned rhsIndex) -> bool {
+            if (rhsIndex == rhsSymbolExtents.size()) {
+              SmallVector<Attribute> lhsResults;
+              SmallVector<Attribute> rhsResults;
+              if (failed(foldMap(lhs, dimValues, lhsSymValues, lhsResults)) ||
+                  failed(foldMap(rhs, dimValues, rhsSymValues, rhsResults)))
+                return false;
+              return lhsResults == rhsResults;
+            }
+            for (int64_t value = 0; value < rhsSymbolExtents[rhsIndex];
+                 ++value) {
+              rhsSymValues[rhsIndex] = value;
+              if (!enumerateRhsSymbols(rhsIndex + 1))
+                return false;
+            }
+            return true;
+          };
+          return enumerateRhsSymbols(0);
+        }
+        for (int64_t value = 0; value < lhsSymbolExtents[lhsIndex]; ++value) {
+          lhsSymValues[lhsIndex] = value;
+          if (!enumerateLhsSymbols(lhsIndex + 1))
+            return false;
+        }
+        return true;
+      };
+      return enumerateLhsSymbols(0);
+    }
+
+    for (int64_t value = 0; value < dimExtents[index]; ++value) {
+      dimValues[index] = value;
+      if (!enumerateDims(index + 1))
+        return false;
+    }
+    return true;
+  };
+
+  return enumerateDims(0);
 }
 
 static LogicalResult checkLayoutCompatibility(ReduceOp op,
@@ -194,18 +198,35 @@ static LogicalResult checkLayoutCompatibility(ReduceOp op,
   if (!existing)
     return success();
 
-  if (computed.getInputShape() != existing.getInputShape())
+  auto dimShape = computed.getInputShape();
+  if (dimShape != existing.getInputShape())
     return emitConflict("input shapes disagree");
-  if (!affineMapAttrsEqual(computed.getForwardIndex(),
-                           existing.getForwardIndex()))
-    return emitConflict("forward index maps differ");
-  if (!affineMapAttrsEqual(computed.getForwardThread(),
-                           existing.getForwardThread()))
-    return emitConflict("thread maps differ");
+
   auto lhsRep = computed.getReplicateSize();
   auto rhsRep = existing.getReplicateSize();
-  if (lhsRep && rhsRep && lhsRep.getInt() > rhsRep.getInt())
+  int64_t computedRep = lhsRep ? lhsRep.getInt() : 1;
+  int64_t existingRep = rhsRep ? rhsRep.getInt() : 1;
+  if (computedRep <= 0 || existingRep <= 0)
+    return emitConflict("replicate extent must be positive");
+  if (computedRep > existingRep)
     return emitConflict("existing layout replicates fewer lanes than inferred");
+
+  SmallVector<int64_t> dimExtents(dimShape.asArrayRef().begin(),
+                                  dimShape.asArrayRef().end());
+  if (!mapsAgreeOnDomain(op.getContext(), computed.getForwardIndex().getValue(),
+                         existing.getForwardIndex().getValue(), dimExtents,
+                         /*lhsSymbolExtents=*/{}, /*rhsSymbolExtents=*/{}))
+    return emitConflict("forward index maps differ");
+
+  AffineMap computedThread = computed.getForwardThread().getValue();
+  AffineMap existingThread = existing.getForwardThread().getValue();
+  SmallVector<int64_t> computedSymbols(computedThread.getNumSymbols(),
+                                       computedRep);
+  SmallVector<int64_t> existingSymbols(existingThread.getNumSymbols(),
+                                       computedRep);
+  if (!mapsAgreeOnDomain(op.getContext(), computedThread, existingThread,
+                         dimExtents, computedSymbols, existingSymbols))
+    return emitConflict("thread maps differ");
   return success();
 }
 
@@ -245,9 +266,8 @@ LogicalResult ReduceOp::inferLayout(OpBuilder &builder,
   if (!srcLayout)
     return emitOpError("source layout entry must be a frisk.layout attribute");
 
-  auto srcIndexMap = srcLayout.getForwardIndex();
   auto srcThreadMap = srcLayout.getForwardThread();
-  if (!srcIndexMap || !srcThreadMap)
+  if (!srcThreadMap)
     return success();
 
   DenseI64ArrayAttr layoutShape = srcLayout.getInputShape();
@@ -269,33 +289,9 @@ LogicalResult ReduceOp::inferLayout(OpBuilder &builder,
   if (reduceExtent <= 0)
     return emitOpError("reduce extent must be positive for layout inference");
 
-  auto remappedIndex = remapReduceDimension(
-      builder, srcIndexMap, static_cast<unsigned>(dim), reduceExtent,
-      /*useFloorDiv=*/false);
   auto remappedThread = remapReduceDimension(
       builder, srcThreadMap, static_cast<unsigned>(dim), reduceExtent,
       /*useFloorDiv=*/false);
-
-  int64_t reduceFactor = 1;
-  if (remappedThread) {
-    AffineMap threadMap = remappedThread.getValue();
-    if (threadMap.getNumDims() == 0)
-      return emitOpError("thread layout missing placeholder dimension");
-    unsigned placeholder = threadMap.getNumDims() - 1;
-    auto used = computeUsedExtentForDim(remappedThread, placeholder,
-                                        reduceExtent);
-    if (!used)
-      return emitOpError("unable to analyze reduce dimension usage in "
-                         "thread map for layout inference");
-    reduceFactor = std::max<int64_t>(int64_t(1), *used);
-  }
-
-  auto dstIndexMap =
-      condensePlaceholderDimension(builder, remappedIndex, /*keepPlaceholderSymbol=*/false);
-  auto dstThreadMap =
-      condensePlaceholderDimension(builder, remappedThread, /*keepPlaceholderSymbol=*/true);
-  if (!dstIndexMap || !dstThreadMap)
-    return emitOpError("failed to synthesize destination layout for reduce op");
 
   std::optional<int64_t> replicateValue;
   int64_t baseReplicate = 1;
@@ -306,36 +302,53 @@ LogicalResult ReduceOp::inferLayout(OpBuilder &builder,
     replicateValue = baseReplicate;
   }
 
-  int64_t factor = std::max<int64_t>(int64_t(1), reduceFactor);
-  int64_t base = std::max<int64_t>(int64_t(1), baseReplicate);
-  if (llvm::MulOverflow(base, factor, base))
+  int64_t uncondensedReplicate = std::max<int64_t>(int64_t(1), baseReplicate);
+  if (llvm::MulOverflow(uncondensedReplicate, reduceExtent, uncondensedReplicate))
     return emitOpError("replicate extent overflow while inferring layout");
-  replicateValue = base;
 
-  IntegerAttr replicateAttr;
-  if (replicateValue) {
-    if (*replicateValue <= 0)
-      return emitOpError("replicate extent must be positive");
-    replicateAttr = builder.getI64IntegerAttr(*replicateValue);
+  auto threads = inferThreadBlockSize(getOperation());
+  if (threads && *threads > 0 && uncondensedReplicate > 0 &&
+      (*threads % uncondensedReplicate != 0) &&
+      (uncondensedReplicate % *threads != 0)) {
+    return emitOpError()
+           << "reduce layout inference requires thread count divisible by "
+              "replicate extent before condense (threads="
+           << *threads << ", replicate=" << uncondensedReplicate << ")";
   }
 
-  if (replicateAttr) {
-    auto threads = inferThreadBlockSize(getOperation());
-    if (threads && *threads > 0) {
-      int64_t replicate = replicateAttr.getInt();
-      if (replicate > 0 && (*threads % replicate != 0) &&
-          (replicate % *threads != 0)) {
-        return emitOpError()
-               << "reduce layout inference requires thread count divisible "
-                  "by replicate extent (threads="
-               << *threads << ", replicate=" << replicate << ")";
-      }
-    }
-  }
+  if (!remappedThread)
+    return emitOpError("failed to remap source thread layout for reduce op");
+  AffineMap remappedThreadMap = remappedThread.getValue();
+  if (remappedThreadMap.getNumDims() == 0)
+    return emitOpError("thread layout missing placeholder dimension");
+
+  unsigned placeholder = remappedThreadMap.getNumDims() - 1;
+  auto compressedThread =
+      compressReplicateDimInMap(builder, remappedThread, placeholder,
+                                reduceExtent);
+  if (!compressedThread || !compressedThread->mapAttr)
+    return emitOpError("unable to condense reduce replicate dimension in "
+                       "thread map");
+
+  auto dstThreadMap = compressedThread->mapAttr;
+  auto dstIndexMap =
+      inferFragmentIndexFromThreadMap(builder, dstThreadMap, dstType.getShape());
+  if (!dstIndexMap)
+    return emitOpError("failed to infer destination fragment index from "
+                       "thread map");
+
+  int64_t condensedReplicate = std::max<int64_t>(
+      int64_t(1), compressedThread->replicateExtent);
+  int64_t finalReplicate = std::max<int64_t>(int64_t(1), baseReplicate);
+  if (llvm::MulOverflow(finalReplicate, condensedReplicate, finalReplicate))
+    return emitOpError("replicate extent overflow while inferring layout");
+  replicateValue = finalReplicate;
+
+  IntegerAttr replicateAttr = builder.getI64IntegerAttr(finalReplicate);
 
   auto dstShapeAttr = buildShapeAttr(builder, dstType.getShape());
   LayoutAttr dstLayout = LayoutAttr::get(
-      builder.getContext(), dstShapeAttr, dstIndexMap, dstThreadMap,
+      builder.getContext(), dstShapeAttr, *dstIndexMap, dstThreadMap,
       replicateAttr);
 
   auto dstIt = layoutMap.find(getDst());
