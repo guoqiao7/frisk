@@ -591,10 +591,11 @@ git commit -m "fix: model Frisk memory effects"
 ```bash
 ctest --test-dir build --output-on-failure
 cmake --build build --target check-frisk --parallel 32
-build/bin/frisk-opt --help | rg "frisk-infer-layouts"
+build/bin/frisk-opt --help-list | rg "frisk-infer-layouts"
 ```
 
-Expected: CTest/lit 全部通过，pass 出现在帮助信息中。未满足时不得进入 M1。
+Expected: CTest/lit 全部通过，pass 出现在完整帮助列表中。MLIR 21 的普通
+`--help` 不展开 pass 清单，因此这里必须使用 `--help-list`。未满足时不得进入 M1。
 
 ### M0 执行记录（2026-08-30）
 
@@ -619,7 +620,7 @@ cmake --build build --target check-frisk --parallel 32
   Total Discovered Tests: 1
   Passed: 1
 
-build/bin/frisk-opt --help | rg "frisk-infer-layouts"
+build/bin/frisk-opt --help-list | rg "frisk-infer-layouts"
   --frisk-infer-layouts - Infer and materialize Frisk layouts
 ```
 
@@ -629,6 +630,7 @@ build/bin/frisk-opt --help | rg "frisk-infer-layouts"
 2. 调用 `registerAllDialects()`/`registerAllPasses()` 的静态链接 driver 必须链接 MLIR dialect、conversion、extension 及核心 transform 库集合。
 3. lit 配置前必须提供 `Python3_EXECUTABLE`；`frisk-opt` 必须显式输出到 `build/bin`。
 4. RecursiveMemoryEffects 容器中的 `frisk.end` 必须显式 `Pure`，否则递归 effect 查询会返回 unknown。
+5. MLIR 21 的 pass 注册验收使用 `frisk-opt --help-list`；普通 `--help` 不展示 pass 清单。
 
 ---
 
