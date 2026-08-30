@@ -27,7 +27,8 @@ class Frisk_Op<string mnemonic, list<Trait> traits = []> :
 def ImplicitFriskTerminator : SingleBlockImplicitTerminator<"EndOp">;
 
 // KernelOp
-def Frisk_KernelOp : Frisk_Op<"kernel", [ImplicitFriskTerminator]> {
+def Frisk_KernelOp : Frisk_Op<"kernel", [RecursiveMemoryEffects,
+                                          ImplicitFriskTerminator]> {
     let summary = "Kernel operation";
   let description = [{
     A simple kernel operation that represents a compute kernel.
@@ -78,7 +79,9 @@ def Frisk_KernelOp : Frisk_Op<"kernel", [ImplicitFriskTerminator]> {
 }
 
 // parallelOp
-def Frisk_ParallelOp : Frisk_Op<"parallel", [Pure, HasParent<"KernelOp">, ImplicitFriskTerminator]> {
+def Frisk_ParallelOp : Frisk_Op<"parallel", [RecursiveMemoryEffects,
+                                              HasParent<"KernelOp">,
+                                              ImplicitFriskTerminator]> {
   let summary = "parallel opeartion";
   let description = [{
     parallel
@@ -140,7 +143,8 @@ def Frisk_ParallelOp : Frisk_Op<"parallel", [Pure, HasParent<"KernelOp">, Implic
 }
 
 // blockOp
-def Frisk_BlockOp : Frisk_Op<"block", [Pure, ImplicitFriskTerminator]> {
+def Frisk_BlockOp : Frisk_Op<"block", [RecursiveMemoryEffects,
+                                        ImplicitFriskTerminator]> {
   let summary = "block opeartion";
   let description = [{
     block
@@ -190,7 +194,8 @@ def Frisk_BlockOp : Frisk_Op<"block", [Pure, ImplicitFriskTerminator]> {
 }
 
 // forOp
-def Frisk_ForOp : Frisk_Op<"for", [Pure, ImplicitFriskTerminator]> {
+def Frisk_ForOp : Frisk_Op<"for", [RecursiveMemoryEffects,
+                                    ImplicitFriskTerminator]> {
   let summary = "for opeartion";
   let description = [{
     for
@@ -228,7 +233,7 @@ def Frisk_ForOp : Frisk_Op<"for", [Pure, ImplicitFriskTerminator]> {
 }
 
 // EndOp
-def Frisk_EndOp : Frisk_Op<"end", [Terminator, ReturnLike]> {
+def Frisk_EndOp : Frisk_Op<"end", [Pure, Terminator, ReturnLike]> {
   let summary = "Invisible kernel termination operation";
   let description = [{
     An invisible terminator operation for frisk kernels that dose not appear in printed IR.
@@ -245,13 +250,13 @@ def Frisk_EndOp : Frisk_Op<"end", [Terminator, ReturnLike]> {
 }
 
 // gemmOp
-def Frisk_GemmOp: Frisk_Op<"gemm", [Pure]> {
+def Frisk_GemmOp: Frisk_Op<"gemm"> {
   let summary = "General matrix multiplication operation";
   let description = [{}];
   let arguments = (ins
-    AnyMemRef:$A,
-    AnyMemRef:$B,
-    AnyMemRef:$C,
+    Arg<AnyMemRef, "", [MemRead]>:$A,
+    Arg<AnyMemRef, "", [MemRead]>:$B,
+    Arg<AnyMemRef, "", [MemRead, MemWrite]>:$C,
 
     BoolAttr:$transA,
     BoolAttr:$transB,
@@ -289,7 +294,7 @@ def Frisk_GemmOp: Frisk_Op<"gemm", [Pure]> {
 }
 
 // allocOp
-def Frisk_AllocBufferOp: Frisk_Op<"alloc_buffer", [Pure]> {
+def Frisk_AllocBufferOp: Frisk_Op<"alloc_buffer"> {
   let summary = "allocate buffer operation";
   let description = [{ 
     Allocates a buffer with the specified shape, element type and optional attributes.
@@ -304,7 +309,7 @@ def Frisk_AllocBufferOp: Frisk_Op<"alloc_buffer", [Pure]> {
   );
 
   let results = (outs 
-    Res<AnyMemRef>:$result
+    Res<AnyMemRef, "", [MemAlloc]>:$result
   );
 
   let builders = [
@@ -345,7 +350,7 @@ def Frisk_AllocBufferOp: Frisk_Op<"alloc_buffer", [Pure]> {
 }
 
 // copyOp
-def Frisk_CopyOp: Frisk_Op<"copy", [Pure, AttrSizedOperandSegments]> {
+def Frisk_CopyOp: Frisk_Op<"copy", [AttrSizedOperandSegments]> {
   let summary = "copy";
   let description = [{ 
     copy
@@ -389,7 +394,7 @@ def Frisk_CopyOp: Frisk_Op<"copy", [Pure, AttrSizedOperandSegments]> {
 }
 
 // fillOp
-def Frisk_FillOp: Frisk_Op<"fill", [Pure]> {
+def Frisk_FillOp: Frisk_Op<"fill"> {
   let summary = "fill";
   let description = [{ 
     fill
@@ -410,7 +415,7 @@ def Frisk_FillOp: Frisk_Op<"fill", [Pure]> {
 }
 
 // reduceOp
-def Frisk_ReduceOp: Frisk_Op<"reduce", [Pure]> {
+def Frisk_ReduceOp: Frisk_Op<"reduce"> {
   let summary = "reduce";
   let description = [{ 
     reduce

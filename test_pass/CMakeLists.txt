@@ -39,3 +39,18 @@ target_link_libraries(frisk_layout_pass_test
 )
 
 add_test(NAME FriskLayoutPassTest COMMAND frisk_layout_pass_test)
+
+add_executable(frisk_memory_effect_test
+  memory_effect_test.cpp
+)
+
+llvm_update_compile_flags(frisk_memory_effect_test)
+
+target_link_libraries(frisk_memory_effect_test
+  PRIVATE
+  FriskIR
+  MLIRFuncDialect
+  MLIRSideEffectInterfaces
+)
+
+add_test(NAME FriskMemoryEffectTest COMMAND frisk_memory_effect_test)
