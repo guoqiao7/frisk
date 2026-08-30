@@ -23,3 +23,6 @@ target_link_libraries(frisk_reduce_layout_test
   MLIRFuncDialect
   MLIRParser
 )
+
+add_test(NAME FriskAttrTest COMMAND frisk_attr_test)
+add_test(NAME FriskReduceLayoutTest COMMAND frisk_reduce_layout_test)

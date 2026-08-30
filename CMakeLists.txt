@@ -9,6 +9,9 @@ set(CMAKE_CXX_STANDARD 17)
 
 project(frisk LANGUAGES CXX C)
 
+include(CTest)
+enable_testing()
+
 find_package(MLIR REQUIRED CONFIG)
 message(STATUS "MLIR_DIR=${MLIR_DIR}")
 message(STATUS "LLVM_DIR=${LLVM_DIR}")
