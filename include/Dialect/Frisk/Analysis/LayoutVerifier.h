@@ -11,6 +11,7 @@ namespace mlir::frisk {
 struct LayoutSolution {
   DenseMap<LayoutVarID, Attribute> assignments;
   SmallVector<LayoutConversionEdge> conversions;
+  DenseMap<LayoutConstraintID, Attribute> instructionBindings;
 };
 
 struct BootstrapSolverLimits {

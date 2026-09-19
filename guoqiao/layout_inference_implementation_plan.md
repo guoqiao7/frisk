@@ -8,9 +8,11 @@
 
 **Tech Stack:** C++17、LLVM/MLIR ODS/TableGen、MLIR Pass/Dialect Conversion、Affine/Presburger、SCF、MemRef、Tensor、GPU/NVGPU/NVVM、LLVM ADT/APInt、CMake/Ninja、llvm-lit/FileCheck、CTest、CUDA/Nsight 性能工具。
 
-> **执行状态（2026-09-16）：M0–M3 与 M4 Task 18 已实现；Task 18 通过独立复审及 30 lit / 104 unit / 4 CTest，按用户授权提交并合入本地 main，未推送远端。Task 19–22 尚未实施，不把 Task 18 等同于整个 M4 完成。集成记录见 §18.10。**
+> **执行状态（2026-09-19）：M0–M3 与 M4 Task 18–20 已完成。Task 20 按用户确认契约实现，独立复审与 34 lit / 165 unit / 4 CTest 全部通过，记录见 §20.13。Task 21–22 尚未实施，不把 Task 20 等同于整个 M4 完成。Task 19 历史 Gate 为 32 lit / 129 unit / 4 CTest；Task 19/20 修改保留在源目录 main，未自动提交或推送。**
 
-> **工作区说明：M3 从 `feature/m3-distributed-layout`（`be71d91`，实现验收基线 `642c30b`）于 2026-09-11 合入 `main`，合并提交 `b120d06400a14a703a44dac1a37a0b38d8110935` 已在此前按用户要求推送至 `origin`（guoqiao7/frisk）。上一轮仅审计/设计，本轮在 `.worktrees/m4-task18` 实现 Task 18 并同步三份设计文档；不改动用户独立 `guoqiao/inference_detail/README.md`，不自动 push/merge。27 lit、74 unit、4 CTest 是实现前重跑的 M3 基线，新增 Gate 另见 §18.9。**
+> **设计更新（2026-09-19）：Task 20 的 SS＋RS 具体契约 v1 已由用户确认；§20.1–20.11 是契约，§20.12 是执行计划，§20.13 记录实际实现、验证证据和限制。通用 encoding＋操作级指令 binding 的适配同时写入设计总文档 §19。**
+
+> **工作区说明：M3 从 `feature/m3-distributed-layout`（`be71d91`，实现验收基线 `642c30b`）于 2026-09-11 合入 `main`，合并提交 `b120d06400a14a703a44dac1a37a0b38d8110935` 已在此前按用户要求推送至 `origin`（guoqiao7/frisk）。Task 18 历史上使用 `.worktrees/m4-task18`，集成记录见 §18.10。本轮 Task 19 遵照用户新要求直接在主源码 main 中实现，不使用 worktree，不改动独立的 `guoqiao/inference_detail/README.md`，不自动 commit/push。27 lit、74 unit、4 CTest 是 M3 基线；Task 18/19 Gate 分别见 §18.9/§19.9。**
 
 ## Global Constraints
 
@@ -2018,8 +2020,8 @@ Expected: 多 consumer IR 合法；共同布局或 conversion 由 solution 明�
 | 阶段     | Task   | 本阶段目的                                | 本轮状态                                                            |
 | -------- | ------ | ----------------------------------------- | ------------------------------------------------------------------- |
 | 第一阶段 | 18     | 坐标 alias、显式 region graph、可审计收敛 | 用户已确认，已编码；最终 Gate 见 §18.9                             |
-| 第二阶段 | 19     | Copy/Fill/Parallel 进入新接口与约束       | 未开始；须复核新版 Copy ABI、读写/replication 区别                  |
-| 第三阶段 | 20–21 | Tensor MMA/GEMM 与 Reduce 规则适配        | 未开始；须复核 target contract、PartialFragment/owner、reducer 语境 |
+| 第二阶段 | 19     | Copy/Fill/Parallel 进入新接口与约束       | 已按确认契约实现；独立复审及 Gate 记录见 §19.9                      |
+| 第三阶段 | 20–21 | Tensor MMA/GEMM 与 Reduce 规则适配        | Task 20 已实现并通过 Gate，见 §20.13；Task 21 未开始，须复核 reducer 语境 |
 | 第四阶段 | 22     | normalization、旧生产逻辑退役和集成       | 未开始；依赖前三阶段 Gate                                           |
 
 审计起点结论与具体修正（以下 Frisk 缺口描述固定于 `b120d06`，实施后状态见 §18.9）：
@@ -2321,6 +2323,183 @@ git diff --check
 
 ### Task 19: 迁移 Copy、Fill 和 Parallel 约束
 
+**状态（2026-09-16）：具体契约 v1 已获用户书面确认，§19.8 A–F 已完成，独立复审及全量 Gate 通过。代码尚未提交或推送，实际接口、设计适配和支持边界见 §19.9。**
+
+#### 19.1 当前代码审计与设计取舍
+
+审计起点为 `ef85a0d`，直接在主源码目录工作，不新建 worktree。本任务不自动 commit/push。
+
+- `LayoutPropagation.cpp::collectLayoutConstraints` 已收集整块静态 Copy，但只接受直接 `layout_view` 操作数；现有 Storage–Storage `StorageAccess` 在 `LayoutRelations.cpp` 中要求 map 相同。这是 M2 的受限实现，不是复制操作的一般正确性条件。
+- `FriskOps.td` 的 Copy 和 Fill 都只有 MemRef 操作数。不能按 memory space 把某个 MemRef 暗中当作 Tensor，也不能凭空插入一个无法在最终 IR 中找到的执行布局变量。
+- `FillOp::verify` 当前只接受与元素类型匹配的 FloatAttr；本任务不顺带扩展整数 Fill 或任意标量表达式。
+- `ParallelOp::inferLayout` 保留旧的 DenseMap 递归路径；新 `FriskInferLayoutsPass` 当前已经走 collect/propagate/solve/verify/materialize，不调用旧方法。本任务补充隔离证据，不把现有隔离重复计为新增能力。
+- `Ownership`、`ResourceLimit` 目前有枚举名，但 bootstrap solver 尚不执行其语义。仅生成这两种约束并打印出来，不算完成迁移；传播、求解和 actual-only verifier 必须共同执行它们。
+
+方案比较：
+
+| 方案 | 取舍 | 决定 |
+| --- | --- | --- |
+| 继续要求 Copy 两端布局相同，Fill 只检查存储单射 | 改动小，但没有表达真正的执行者，也错误限制独立存储的复制 | 不采用 |
+| 将 Copy/Fill 改为 Tensor 新算子族 | 可直接使用 Tensor encoding，但扩展前端、结果类型和旧调用迁移范围 | 本任务不采用 |
+| 保留现有 MemRef 算子，新增实际可物化的执行布局与写入者契约 | 存储与执行分布分开，能接入统一约束和独立核验 | 采用 |
+
+#### 19.2 公共表示：存储布局与操作执行布局分开
+
+每个 Copy/Fill 新增一个操作级 Distributed 执行变量，逻辑 shape/dtype 来自完整复制/填充区域。内部可用同 shape 的 RankedTensorType 描述布局域，但不新增虚构的 Tensor SSA value，也不改变 MemRef 类型。
+
+选定结果写回原操作的以下属性，并由 Op verifier 检查属性类型与基本格式：
+
+```text
+frisk.execution_layout : DistributedEncodingAttr
+frisk.execution_threads : i64
+frisk.writer_policy : "all" | "first_owner"
+frisk.vector_bytes : i64
+```
+
+- 无这些属性的旧 IR 仍可作为推断输入；推断成功后四项必须齐全。
+- 显式给出的属性是硬要求。不能覆盖显式 encoding、改变显式 writer policy，或静默降低显式 vector width。
+- 不存在 enclosing Parallel 时，默认执行环境为单 CTA、32 线程，并在操作上物化 `execution_threads = 32`；显式给出的合法线程数可替代默认值。
+- 存在 enclosing Parallel 时，执行线程数必须等于该作用域的 `threads`；不能用操作上的属性覆盖外层线程数。
+- LayoutVar 增加专门的操作级绑定标记，区别于 Value、OpOperand use 和函数结果槽位；stable identity 包含所属操作的稳定位置及属性角色，不依赖指针排序。
+- MaterializeLayouts 对该变量写操作属性，actual-only verifier 从同一操作属性读取实际 assignment；不得沿用候选缓存或想象未物化的执行布局。
+- Writer policy 和 vector width 在本任务中是明确输入/确定性默认契约，不作为完整性能成本搜索的新维度。默认 vector width 为 1；默认 writer policy 为 `first_owner`。
+- 新增执行变量继续受 M3 候选生成边界约束：非零 rank、各维为大于 1 的静态二次幂。不能因 Storage 端可表示任意静态 shape 就宣称执行端也支持；不满足时明确拒绝，不 padding 或修改 shape。这是新增执行模型的首版限制，须在迁移兼容性测试中单独记录。
+- bootstrap solver 的每连通分量 8 个变量、每域 4 个候选限制保持不变；执行变量计入限制。不为通过测试而隐藏变量或任意截断到前 4 个候选。
+
+#### 19.3 Copy：逻辑对应，不是物理地址相等
+
+支持边界仍为：同 shape、同元素类型、静态非空整块区域，src/dst 为直接 `layout_view` 结果，两个 copy map 均无输入及输出，indices 为空。被绑定的 MemRef 可以是 Task 18 已支持的静态切片；不扩大到 Copy 自带动态 indices、部分区域或 Local MemRef 冒充寄存器布局。
+
+设执行布局为 `D(h)=q`，源和目的存储布局为 `S_src(q)`、`S_dst(q)`，复制契约为：
+
+```text
+同一个逻辑坐标 q：读取 S_src(q)，写入 S_dst(q)。
+```
+
+建立两条带明确角色的 `StorageAccess`：执行布局→src 为 Read，执行布局→dst 为 Write；建立执行变量上的 Ownership 与 ResourceLimit。不得建立 src/dst 的 AliasLayout，也不得仅因复制就添加 Storage–Storage SameLayout。
+
+例如两块独立的 `2×2xf32` 存储，源地址公式为 `8i+4j`、目的为 `4i+8j`，只要各自合法且执行访问满足契约，Copy 可以成立。它不是把两个地址公式声明为相等，而是按逻辑元素搬运。
+
+双向信息利用限定为候选准备：已知 src 可向 dst 提供有限合法存储方案，已知 dst 同样可向 src 提供方案；跨不同 root 不直接复制绝对地址或对齐声明。只允许可证明的地址原点重定位和目标域重绑定，重新检查目标 root 容量、单射性、对齐与向量访问。无法证明的生成建议丢弃；显式绑定不得静默丢弃。不同而合法的显式两端布局不能因候选传播被强绑为相同。
+
+与 Task 18 相同，候选准备结束后冻结域；不把双向生成放进删减 worklist，不做无界来回投影。双向测试检查“对端获得合法候选且解满足访问关系”，不再把两个 Attribute 相等作为通用正确性标准。
+
+Copy 的读写依赖不是 alias 布局一致性的替代品。同一已知 root 的区域如存在非恒等重叠，首版拒绝，避免将可能需要临时缓冲或有序搬运的操作当成无序并行复制；完全不相交或逐元素相同的视图可接受。不同 root ID 不构成运行时 NoAlias 证明；独立 MemRef 参数间的不重叠要求属于 Copy 的调用前置契约，必须在文档和诊断中与已证明的同 root 信息区分，不宣称本任务完成跨过程 alias 分析。
+
+#### 19.4 Fill 与 Copy 的实际写入者契约
+
+`replication` 描述同一逻辑元素的硬件持有者数量，不直接等于实际写入次数。给执行坐标规定与 map 输入顺序无关的规范顺序：
+
+```text
+(cta, warp_group, warp, lane, register) 的字典序。
+```
+
+两种 writer policy 的含义：
+
+- `all`：每个持有者都执行写入。只有每个 live logical point 恰好有一个持有者时合法；replication > 1 的 all-writer store 拒绝。
+- `first_owner`：对每个逻辑坐标只允许规范顺序最小的持有者执行写入，其他持有者不写。必须精确证明覆盖完整、被选写入者唯一；这一选择显式保存在实际 IR，不能只留在 solver 中或假定未来 lowering 会自动处理。
+
+例如 32 线程填充 4 个元素，执行布局可能每个元素有 8 个持有者。`all` 会重复写入，应报错；`first_owner` 明确选出每个元素的一个写入者，才允许通过。Copy 的重复读取可以合法，但目的写入仍必须经过同样的 writer policy 核验。
+
+Fill 建立执行布局→目标存储的 Write StorageAccess，以及 Ownership/ResourceLimit；标量常数不创建布局变量。执行坐标枚举及逻辑域验证各限制为最多 65536 点，乘法/位移先做溢出检查。超限返回 Unknown/unsupported，不抽样证明。
+
+这补充了原计划“禁止 replicated store”的准确含义：禁止同一元素的多写入者，不禁止带显式唯一写入策略的 replicated read/持有布局。首版不实现 reducer 的 partial addend、原子写入或跨操作写竞争分析。
+
+#### 19.5 向量访问契约
+
+`vector_bytes` 仅接受 `{1,2,4,8,16}`。它是操作的执行访问宽度，不等于 StorageLayout 的 `vector_granularity`，不能只比较两个数值大小就认为合法。
+
+- 宽度 1 是标量/packed 基线；较宽访问首版仅支持字节整齐的标量元素。
+- 必须根据 `S(D(h))` 验证每个实际执行者的连续寄存器元素形成完整向量块，物理地址连续、块起点满足绝对对齐、无越界和尾部缺失。元素大于向量宽度时只允许可证明对齐的标量子块。
+- Copy 两端都需证明同一执行分组有效，不能源端连续就默认目的端连续。Fill 检查唯一写入者选择后的分组，不能把由不同线程负责的元素拼成一个向量块。
+- 对齐证据沿用 Task 18 的 root provenance。操作要求不能提升根指针的已知对齐。
+- 不满足硬 vector width 的候选在冻结后的传播中删除；显式编码没有其他选择时报告冲突，不修改 shape、allocation 或显式属性。候选的独立合法性证明与操作访问证明分别记录来源。
+
+#### 19.6 Parallel：执行环境约束，不是最终布局生成器
+
+保留现有 Parallel 的 Kernel 父操作与 region 结构，不引入新的嵌套 Parallel 语义。`ranges` 的静态正范围和区域参数契约由 verifier 检查，不把它们误当作 Copy/Fill 的 tile shape。
+
+首版支持 `threads ∈ {32,64,128,256,512,1024}`，单 CTA。Distributed topology 的线程数按 `lane × warp × warp_group` 计算，不乘 register。要求 lane=32、CTA=1，线程数与作用域精确一致；输入格式错误或乘积溢出直接诊断。
+
+128 线程的默认候选采用 lane=32、warp=4、warp_group=1，但这只是候选生成所用的资源环境，不代表自动选择 WGMMA。显式合法拓扑可以采用等价的分组方式，由实际线程乘积和 map 契约共同验证。
+
+区域内 Copy/Fill 执行变量以及当前支持的 Tensor 值/具体消费边界都受最近的 Parallel 环境约束。区域外生产的 Tensor 不能只因跨边界使用就改写生产者编码；必要转换仍在实际 use 上显式物化。未建模的 Tensor region 边界继续明确拒绝，不隐式扩大 M3 支持范围。
+
+ResourceLimit 是真正的硬约束：影响候选筛选、求解可行性和最终核验。目标模型依据线程环境生成有限拓扑候选，不再只生成固定 32/128 线程后指望其他线程数自行成立。Parallel 自身不调用旧递归推断，也不直接写最终执行布局。
+
+#### 19.7 求解、物化、失败语义与文件分工
+
+通用规则与 SM90 规则分开：collector 负责操作角色与绑定；Analysis 中的纯 helper 负责有界执行/向量访问证明，SM90 target 依据资源环境生成候选；统一 relation evaluator 负责硬关系执行，不能在 solver 中硬编码 Copy 例外。实现采用下述 Analysis helper 分层，避免 Analysis → Target → Analysis 循环链接。
+
+已实现的主要接口与 payload 如下：
+
+```cpp
+// OperationLayoutConstraints.h：在图 finalize 之前创建实际操作绑定。
+LogicalResult collectOperationLayoutConstraints(
+    Operation *root, LayoutConstraintGraph &graph,
+    LayoutConstraintBuilder &builder);
+
+LogicalResult collectParallelResourceConstraints(LayoutConstraintGraph &graph);
+
+// ExecutionLayoutProof.h：不改 IR 的有界证明，返回 Proven/Disproven/Unknown。
+LayoutProof proveExecutionOwnership(
+    DistributedEncodingAttr execution, RankedTensorType logicalType,
+    StringRef writerPolicy);
+LayoutProof proveExecutionVectorAccess(
+    DistributedEncodingAttr execution, const StorageAliasInfo &storageInfo,
+    const StorageAliasFootprint &storage,
+    unsigned vectorBytes, AccessKind access, StringRef writerPolicy);
+
+struct OperationExecutionBinding {
+  int64_t threads = 32;
+  unsigned vectorBytes = 1;
+  std::string writerPolicy = "first_owner";
+};
+// LayoutVar 新增：optional<OperationExecutionBinding> operationExecution;
+//                 int64_t requiredThreads = 0;
+// LayoutConstraint 新增：int64_t requiredThreads = 0;
+```
+
+`CopyAccess` 是新增的 Storage–Storage 硬关系：核验同 shape/dtype、合法 footprint，以及同 root 的逐点恒等或完全不相交。它也供既有 `StorageAliasCandidates` 有限 origin 准备遍历使用；投影通过 `rebaseStorageCopyCandidate` 重建目的地址原点/容量，并削弱到目的 root 实际具备的对齐保证。它不等于 `AliasLayout`、`SameLayout`，也不证明不同 MemRef 参数运行时不重叠。
+
+新增/修改职责：
+
+- `include/Dialect/Frisk/IR/FriskOps.td`、`lib/Dialect/Frisk/IR/FriskOps.cpp`：操作属性及语法/类型 verifier，Parallel 资源输入检查；保留旧 adapter 方法。
+- `include/Dialect/Frisk/Analysis/OperationLayoutConstraints.h`、`lib/Dialect/Frisk/Analysis/OperationLayoutConstraints.cpp`：Copy/Fill/Parallel 收集与执行绑定，替代 LayoutPropagation 中内嵌的受限 Copy 收集器。
+- `include/Dialect/Frisk/Analysis/ExecutionLayoutProof.h`、`lib/Dialect/Frisk/Analysis/ExecutionLayoutProof.cpp`：纯执行证明 helper；未新增原提纲中的 SM90CopyConstraints 文件，数学证明不依赖目标候选枚举。
+- `LayoutConstraint.{h,cpp}`、`LayoutSolver.h`、`LayoutRelations.{h,cpp}`、`LayoutPropagation.cpp`、`LayoutVerifier.cpp`：操作级身份、带类型的 unary/binary payload、graph invariants、冻结后的硬约束删减、solver/actual verifier 共用关系语义。
+- `SM90DistributedCandidates.cpp`：依据线程环境生成有限执行候选；复用未改动的 `StorageAliasCandidates.cpp` 调度 CopyAccess 的有限双向建议；RelationsOnly 禁止调用这些生成逻辑。
+- `MaterializeLayouts.cpp`：在 detached module 中物化操作属性，与现有 Tensor/Storage 改写一起核验后原子提交。
+- 对应 CMake 文件、新单元测试及 lit 文件：新增源文件和测试注册；不改无关构建依赖。
+
+所有新绑定都要在 graph finalize 中保持稳定身份。新增 unary 约束必须接入 Strict/Common 的计数与调度，不得通过“关系没有第二个端点所以默认成功”。实际核验不允许为缺失属性补默认值、重新枚举候选或选择 writer policy。
+
+任何失败均保持原 IR 不变。缺失或篡改 execution_layout/threads/writer_policy/vector_bytes、根对齐证据丢失、资源或写入者冲突都必须有对应负例。
+
+#### 19.8 实施顺序与验收清单
+
+使用 writing-plans、test-driven-development 和分阶段执行/复审流程；保持用户指定的源目录工作方式，不创建 worktree。先完成本设计的书面复核，再进入下面的红灯测试与实现。
+
+- [x] **A：执行绑定与 Ownership。** 在 `CopyFillConstraintTest.cpp` 先测试未物化绑定被拒绝、32 线程/4 元素的 all-writer 失败与 first-owner 成功、缺失元素覆盖失败；再实现操作级变量、Ownership 和 actual-only 属性读取。
+- [x] **B：Copy 双向与向量访问。** 先测试 src 已知/dst 未知、dst 已知/src 未知、两端合法异构存储、不同根偏移不直接复制、同 root 非恒等重叠拒绝；向量宽度测试 3 非法、16 字节未对齐失败、目的不连续失败、标量基线成功。再替换旧 Copy 收集器并实现有界证明。
+- [x] **C：Parallel。** 先测试 128 线程候选、32/128 显式编码冲突、其他合法线程数、非法线程数和 Tensor 消費边界，再接入 ResourceLimit 与目标候选环境。
+- [x] **D：独立核验与事务性。** 从合法结果分别篡改四项操作属性，测试 actual verifier 拒绝且 target enumeration 次数为 0；测试推断一次/两次输出一致，失败前后原 IR 逐字一致。
+- [x] **E：旧路径隔离与回归。** 用真实 pass 调用检查 legacy Parallel inference 的调用次数为 0，单独运行旧 adapter 测试；统计只反映实际调用，不添加永远为零的伪计数。生产新路径与 legacy 行为不要求文本一致，差异按逻辑坐标和硬契约解释。
+- [x] **F：全量 Gate 与文档。** 运行以下命令，记录实际新增测试数量、支持边界及设计偏差；同步比较文档，不以 M3/Task 18 的旧测试数代替本任务验收。
+
+```bash
+cmake --build build --target FriskLayoutUnitTests check-frisk \
+  frisk_attr_test frisk_reduce_layout_test frisk_layout_pass_test \
+  frisk_memory_effect_test --parallel 16
+./build/unittests/Dialect/Frisk/FriskLayoutUnitTests --gtest_brief=1
+ctest --test-dir build --output-on-failure
+git diff --check
+```
+
+红灯测试先运行新增测试过滤器及新 lit 文件，确认因缺失行为而失败，再编写生产实现。完成标准是全量测试通过、独立复审无未处理阻断项、两份长期文档与代码一致；未运行上游运行差分或 GPU benchmark 时不得声明行为全面兼容或性能领先。
+
+以下保留原始迁移提纲以追踪计划演进，复选框不再代表当前验收状态，以 §19.8 A–F 与 §19.9 为准；若与上面 v1 契约冲突，以上面的具体契约为准。特别是 Copy 的 SameLayout 仅能用于真正同编码的执行槽位，不能再用于要求两个独立存储地址公式相同；Step 6 的 git 命令需用户另行授权。
+
 **Files:**
 
 - Modify: `include/Dialect/Frisk/IR/FriskOps.td`
@@ -2382,7 +2561,339 @@ git add include/Dialect/Frisk/IR lib/Dialect/Frisk test unittests
 git commit -m "feat: migrate copy fill and parallel constraints"
 ```
 
+#### 19.9 实施记录与设计适配（2026-09-16）
+
+实现起点 `ef85a0d`，在源目录 main 工作，未创建 worktree，未自动提交或推送。以下内容是 Task 19 的实际增量，不表示 M4 整体完成。
+
+| 已实现能力 | 实现位置 | 直接验证 |
+| --- | --- | --- |
+| 操作级执行变量、四项实际 IR 契约 | `OperationLayoutConstraints`、`LayoutConstraint`、`MaterializeLayouts` | Fill 推断后可读取全部属性；删除任意一项、篡改 encoding/threads/writer/vector 均拒绝；actual verifier 的目标枚举次数为 0 |
+| Copy 的读写坐标关系与有限双向建议 | `LayoutRelations` 的 CopyAccess/StorageAccess、`LayoutAliasAnalysis::rebaseStorageCopyCandidate` | 2×2 f32 的行主序源/列主序目的可复制；已知任一端可向另一端提供重定位候选；同 root 恒等和不相交成功，位移重叠失败 |
+| 实際写入者与向量访问证明 | `ExecutionLayoutProof` | all-writer replica 冲突、first_owner 规范选择、缺失覆盖、输入名字重排、寄存器向量连续性/对齐/尾部、packed 标量基线、65536 点上界 |
+| Parallel 线程环境与实际 use 转换 | `collectParallelResourceConstraints`、`SM90DistributedCandidates` | 六种合法线程数；128 线程作用域拒绝 32 线程显式属性/编码；外部 32 线程 Tensor 在内部消费边界插入转换，生产者保持原编码 |
+| 硬约束闭环和可核验统计 | Strict/Common worklist、bootstrap solver、actual verifier | Ownership/ResourceLimit 不再是未执行的枚举名；宽向量要求真实删除候选；冻结候选与 monotone stats 上界保持有效 |
+| 旧路径隔离与文本回放 | 真实 legacy 调用计数、Kernel/Parallel/Copy printer/parser | 显式调用 legacy 后计数增加；运行新 pass 后不增加；打印后重新解析、第二次推断与第一次逐字一致 |
+
+具体例子：在 `threads=128` 的 Parallel 中对 `memref<4xf32>` 做 Fill，默认执行布局可以让每个元素有 32 个持有者，但物化的 `writer_policy="first_owner"` 只允许每个元素的首个规范持有者写入。把属性显式设为 `all` 会因重复写入被拒绝。128 线程对应的默认 topology 是 `[register=1, lane=32, warp=4, warp_group=1, cta=1]`，不是已选择 WGMMA 指令。
+
+适配与复审记录：
+
+- 证明模块放入 Analysis，collector 和 target 分开；没有机械新增一个反向依赖 Target 的 SM90 helper。
+- 为支持真实 Kernel/Parallel 输入，Task 18 的静态存储根识别补充了类型与签名一致的 Kernel 入口 MemRef；没有扩展到未知 region 参数或动态别名。
+- 回放测试暴露并修正旧 Kernel 入口参数名丢失、空签名解析、Parallel induction 参数类型/终结符、Copy 双重解析方括号和 extents/属性打印位置问题。Copy 的 map 使用 ODS getter 获取，extents 用 `srcExtents`/`dstExtents` 的 DenseI64Array 保存；不是扩大 Copy 的推断支持范围。
+- Copy 候选重建后的地址上界按目的 descriptor 的实际可达容量规范化。旧 lit 中 16/160 改为 14/134 的两例仍保持相同物理地址公式，并未扩大 allocation 或更改 shape。
+- 对齐负例保留 Task 18 的完整根 binding 前置契约语义：仅删除 allocation alignment，若完整根 `layout_view` 仍显式声明相同保证，不能称为证据全丢失。测试同时将 allocation 保证移除、whole-root storage binding 的 alignment/vector_granularity 降为 1，并保留操作 vector_bytes=16，要求 actual verifier 拒绝且不枚举候选。操作自己的向量需求不能充当根指针对齐依据。
+- 纯证明独立复审指出：相同 root 不足以证明 footprint 属于当前 view；标量宽度也必须检查区间不重叠。新增两个先红后绿的反例，核对 view→root 坐标并在宽度 1 快速返回前核验物理区间。复审已确认这两项解决。
+- 全任务独立复审补出了零输入 Kernel 回放反例，已修正；最新代码复审无未处理的 Critical/Important 项。首次核心红灯涉及未物化绑定、all-writer 误接收及 Copy 强制相同地址图；不是只编写通过测试。
+
+验证命令沿用 §19.8，2026-09-16 最终结果：
+
+- 构建 `FriskLayoutUnitTests check-frisk frisk_attr_test frisk_reduce_layout_test frisk_layout_pass_test frisk_memory_effect_test` 成功。
+- **129/129 单元测试通过**（17 个 suite）：相对 Task 18 的 104 项新增 25 项，其中 `CopyFillConstraintTest` 16 项、`ExecutionLayoutProofTest` 9 项。
+- **32/32 lit 通过**：相对 Task 18 新增 `infer-copy-fill-parallel.mlir`、`infer-copy-fill-parallel-errors.mlir` 两份，覆盖图输出、属性物化、打印解析后二次推断逐字一致和错误诊断。
+- **4/4 CTest 通过**，包括旧 attribute、reduce、layout pass 与 memory effect 回归；单元中的 legacy adapter 测试一并通过。
+- `git diff --check` 无错误。构建日志中的既有 Ninja 日志恢复提示未阻断构建；没有借此删除或重建用户工作区。
+
+新增单元位于 `unittests/Dialect/Frisk/Layout/CopyFillConstraintTest.cpp` 和 `ExecutionLayoutProofTest.cpp`。负例测试主动产生的 expected error 不代表测试失败，以测试程序退出码和汇总为准。
+
+仍不支持：动态/部分区域 Copy、执行域非二次幂或含 extent=1、一般跨过程 NoAlias 证明、跨操作竞争分析、GPU 写入谓词/向量指令生成、TMA/cp.async、GEMM/Reduce 迁移和完整性能成本求解。`first_owner` 是已经验证并物化的执行契约，未来 lowering 仍须消费它。未运行 TileLang/Triton 执行差分或 GPU benchmark，本轮不宣称全面兼容、独创性已证明或性能领先。
+
 ### Task 20: 增加内部 Tensor MMA Op 并迁移 Gemm 约束
+
+**状态（2026-09-19）：已按用户确认的以下 SS＋RS 契约完成实现与测试。全量 165 unit / 34 lit / 4 CTest 通过；实际实现、复审修正与边界见 §20.13。Task 21/22 及 GPU lowering 未包含在本次交付内。**
+
+#### 20.1 实现前审计与方案选择
+
+工作基线是 `ef85a0d` 加当前未提交的 Task 19 实现与文档，而不是只有该提交的干净源码。在 `/home/baopeihua/frisk` 的主工作区继续，不创建 worktree，不自动 commit/push，不改写独立汇报文档。
+
+本轮只读检查发现：
+
+- `FriskLayoutOps.td` 尚无 `MmaOp`；`FriskLayoutAttrs.td` 只有通用 Distributed/Storage encoding，没有实现设计目标中的 Mma/DotOperand 专用 encoding。
+- `GemmOp::verify` 要求 A/B/C 同元素类型，且按未转置形状检查维度；不能作为新操作的数学 verifier。
+- 旧 `GemmOp::inferLayout` 用 Local MemRef 表示寄存器 fragment，直接更新 `DenseMap<Value, Attribute>`；新接口必须使用 Tensor SSA 和图中的实际消费位置，不能机械复用旧容器。
+- `InstructionContract` 目前只有枚举名。现有 relation evaluator 主要执行 unary/binary 关系，不能把 A/B/accumulator 的联合契约拆成若干可能不相容的两两“存在某个方案”。
+- Task 19 的操作执行变量专门绑定 Copy/Fill；MMA 已有 Tensor accumulator/result，不借用这类变量虚构另一份结果编码。
+- `LayoutTarget` 目前只枚举/核验单个布局，没有指令级联合接口；需要补充有界生成与纯核验的分层，避免 Analysis 反向链接 SM90。
+- Task 22 已单独安排旧 Local MemRef 生命周期 normalization；本任务不提前自动改写旧 `frisk.gemm`。
+
+采用“内部 Tensor MMA ＋显式指令契约 ＋通用 canonical maps”的方案。只实现 SS 会遗漏寄存器 A 的迁移验证；同时加入旧 IR 自动转换及 GPU pipeline 会跨越 Task 22 和 lowering 的边界。本任务完成 SS、RS 的布局正确性闭环，不生成 WGMMA/fence/commit/wait 指令序列。
+
+本轮重新核对了既有审计快照的相关源码，HEAD 分别为 TileLang `5e149e31674658f94779c7d0c6039549a1853123`、Triton `42c5e89c3871e1472968c92dd8e5c02d0b3dd40c`；没有刷新到浮动 main，也没有运行上游测试。具体证据与取舍见 §20.10 及比较文档的 Task 20 设计增量。
+
+#### 20.2 `frisk.mma` 的数学语义、类型与副作用
+
+新操作固定表达：
+
+```text
+result[i,j] = init[i,j] + sum(k = 0 .. K-1) A_eff[i,k] * B_eff[k,j]
+
+A_eff[i,k] = trans_a ? A[k,i] : A[i,k]
+B_eff[k,j] = trans_b ? B[j,k] : B[k,j]
+```
+
+这定义逻辑对应，不承诺浮点归约顺序或比目标指令更强的数值精度。没有隐含的 alpha/beta、清零开关、额外输出写回或动态 clear 条件。
+
+- 操作数顺序固定为 A、B、init，唯一结果为 result。A/B 在类型层可为 RankedTensor 或 MemRef；init/result 必须为 RankedTensor。
+- 首版数学 verifier 接受静态正 extent 的 rank-2 浮点矩阵；A/B 元素类型相同，init/result 的元素类型相同且位宽不小于输入。特定 dtype 是否有目标指令由 target 判断。
+- 属性 `m/n/k` 为正的 signless i64；`trans_a/trans_b` 为 BoolAttr，缺省 false；`policy` 为已有 GemmWarpPolicy，缺省 Square。维度按上述逻辑转置精确匹配；矩形转置负例必须覆盖。
+- init/result 的逻辑 shape 必须都是 `[M,N]`。输入阶段允许缺失 encoding 或两者 encoding 不同；最终通过 init 的实际消费位置转换，使该位置与 result 的 accumulator encoding 一致，不能直接改写 init 的其他使用者。
+- MemRef 输入只有 Read effect，不写 A/B、不分配存储；Tensor 输入是 SSA 依赖，result 不是 MemRef 写入。带 MemRef 输入的 MMA 不可标为 Pure，不可因漏报 memory effect 而跨越写操作随意移动。
+- `clear_accum=true` 的未来迁移应传入显式零 Tensor，普通累加传入实际旧 accumulator；动态 clear 的语义与转换留给 Task 22。不得用 `tensor.empty` 充当已初始化的零。
+- 这是高层同步数学操作：result 在该操作之后可用。未来异步 lowering 必须建立这一可见性，当前布局验证不声称已经证明 pipeline 同步安全。
+
+原 Task 20 示例仍有效：`A:128×64xbf16`、`B:64×128xbf16`、`init/result:128×128xf32`。示例只展示操作类型，不省略测试所需的合法 shared layout、根对齐契约和目标环境。
+
+#### 20.3 SM90a 首版支持集与明确拒绝项
+
+数学操作不内嵌 PTX mnemonic；目标规则按以下受限表选择契约：
+
+| 项目 | 本任务设计边界 |
+| --- | --- |
+| 目标 | 最近的 `frisk.target` 必须明确为 `"sm_90a"`；缺失、`sm_90` 基础能力或其他目标在 MMA target 校验中拒绝。不改变 Task 19 普通操作的默认目标行为 |
+| 数据类型 | A/B 同为 f16 或同为 bf16；init/result 为 f32。暂不接入 f16 accumulator、TF32、FP8、整数或稀疏路径 |
+| SS | A/B 为 Shared MemRef，必须是直接 `layout_view` 结果；根和静态别名链沿用 Task 18 |
+| RS | A 为 RankedTensor，B 为上述 Shared MemRef；禁止将 Local MemRef 当作 Tensor fragment |
+| Tensor B | 通用类型语法可表达，但本 SM90a target 拒绝。不得偷偷插入 shared allocation/store 把它变成另一种路径 |
+| 执行域 | 保留现有 Distributed 的非零 rank、每维大于 1 的二次幂限制；M 是 64 的倍数，K 是 16 的倍数，N 至少为 8 |
+| 原子与拼接 | 原子为 `64×n_atom×16`，`n_atom ∈ {8,16,32,64,128,256}`；整 tile 可以在 M/N/K 上重复原子，不 padding、不改 shape、不处理尾块 |
+| 线程 | 单 CTA，`threads ∈ {128,256,512,1024}`；外层 Parallel 的线程数必须一致，无 Parallel 时缺省 128，显式合法线程数可替代缺省值 |
+| 控制流 | 保留 M3 的 SSA/SCF 布局规则；Task 20 不新增 warpgroup 分歧、动态线程参与或异步 token 分析 |
+
+硬件支持不等于 Frisk 当前表示支持：例如硬件存在的 `n=24` 原子不属于上述二次幂子集，不能通过改 shape 或忽略 encoding verifier 来接受。
+
+SS 支持数学上的 `trans_a/trans_b` 四种组合。RS 的 `trans_a=true` 通过 A fragment 的逻辑坐标交换和必要的输入布局转换表达，不伪造硬件 RS 的 A-transpose immediate。逻辑 transpose 与硬件 major mode 是两层信息：major mode 从最终地址关系解码，不能把 BoolAttr 原样当作 PTX immediate。
+
+#### 20.4 线程组织、policy 和寄存器坐标
+
+每组固定 4 个连续 warp，lane extent=32、CTA extent=1，warp_group extent=`threads/128`。线程编号解释为 `((warp_group * 4 + warp) * 32 + lane)`，不能只检查线程数乘积而放过不符合组边界的任意拓扑。
+
+设 group 数为 G，在有限因子对中选择 `[gM,gN]`，满足：
+
+```text
+gM * gN = G
+M % (64*gM) == 0
+N % (8*gN) == 0
+```
+
+- FullRow：在合法因子对中取最大 gM。
+- FullCol：取最大 gN。
+- Square：最小化整数值 `abs(M/gM - N/gN)`；相同值按 `(gM,gN)` 字典序稳定选择。这是 Frisk 首版确定性几何策略，不复现旧代码的浮点打分，也不是性能最优结论。
+- 分组后取能够整除 `N/gN` 的最大受支持 `n_atom`。记录重复次数 `[M/(64*gM), N/(n_atom*gN), K/16]`；不搜索全部指令宽度组合。
+- 没有合法分组就报错；不截断线程数、不忽略 policy。128 线程时只有 `[1,1]`，不同 policy 得到相同分组是合法退化情形；256 线程的 `128×128` 用例须展示 FullRow/FullCol 的差别。
+
+group 坐标固定为 `groupM = warp_group / gN`、`groupN = warp_group % gN`，各 group 负责连续的 `[M/gM,N/gN]` 子块。原子外层寄存器槽按 accumulator 的 `(mRepeat,nRepeat,innerSlot)`、RS A 的 `(mRepeat,kRepeat,innerSlot)` 字典序展开，最右侧变化最快；innerSlot 顺序取硬件原子规范。K 重复更新同一 accumulator，不新增一份 result 槽。线程环境只约束 MMA 的消费槽与结果；不得为满足指令而改写外部 A/init 生产者的显式线程/encoding 契约。
+
+结果与 init 消费槽使用按硬件 accumulator 原子展开的 DistributedEncoding，逐点验证完整覆盖和唯一持有者。RS 的 A 使用按寄存器输入原子展开的 DistributedEncoding；不同 N 方向的 group 可以持有相同 A 元素，这种只读 replication 必须被精确描述，不能沿用 Fill 的 all-writer 判定。
+
+**packing 的语义必须明确：**现有 Distributed map 的 `register` 坐标在 16-bit A 上表示逻辑元素槽，不直接表示 32-bit 物理寄存器编号。每个 A 原子的 8 个元素槽要按契约组合成 4 个 32-bit packed registers，低/高半字顺序纳入指令核验；f32 accumulator 每槽对应一个 32-bit 寄存器。不能把“覆盖了同一批元素”当成“寄存器顺序满足指令”。原子外层的 M/K 重复及 N-group replication 同样进入规范 map。
+
+共享与寄存器布局优先展开为当前已支持的 canonical BitLinear/Affine 表示，不在本任务顺带放宽一般 Product map 的 pass 支持边界。单个布局的逻辑点与硬件元素槽枚举均不超过 65536，任何溢出/超限返回 Unknown 并使硬检查失败。该点数上界不是寄存器分配、spill 或 occupancy 证明；完整资源成本与调度仍属于后续任务。
+
+#### 20.5 Shared descriptor：必须证明能访问实际存储
+
+对每个 Shared 操作数分别执行两层检查：先通过 Task 18 的根容量、坐标、单射和别名一致性证明，再验证它能够由本任务支持的指令描述符方案表示。普通合法 StorageLayout 不自动等于合法 WGMMA operand。
+
+设计支持 K-major/MN-major 的无 swizzle 及 32/64/128-byte swizzle 规范模板。生成阶段每个未绑定 operand 只选一个默认 major：若按其数学角色和 transpose 解释后，原二维类型的最后一维是 K，则选 K-major，否则选 MN-major；在该 major 下最多提供四种 swizzle 模板。显式另一 major 的布局仍可被精确核验，不强制改回默认值。
+
+描述符方案包含：major、swizzle 模式、leading/stride byte offset，以及该操作数各原子调用所需的 root-relative 起点和 swizzle phase。物化的是与 runtime root pointer 组合的**静态描述符方案**，不是假装知道运行时 shared pointer 的完整 64-bit descriptor。
+
+必须满足：
+
+1. 所有实际原子的起点和描述符偏移可编码、对齐、无截断和溢出；不能通过掩去高位把不合法偏移变合法。
+2. 对每个原子实际访问的逻辑坐标，按描述符规则重建的地址与所选 StorageLayout 的 root-relative bit 地址相等，且不越出根可访问范围。
+3. 静态切片的偏移、步长和 K-panel 间距来自实际布局/根坐标关系。不能根据切片自身的 M/N extent 猜测它在更大父 buffer 中的 panel stride。
+4. 不重复叠加 descriptor offset；基址非零时同样逐点核验。数学 transpose 只改变逻辑坐标解释，不直接修改已有存储。
+5. 无 swizzle 需要根及原子起点满足 16-byte 对齐。为使首版静态 swizzle phase 可证明，32/64/128-byte swizzle 分别要求根具有 256/512/1024-byte 对齐保证，再根据原子 root-relative 偏移计算 phase；这是 Frisk 的保守支持边界，不是声称硬件要求所有根都如此对齐。
+6. 根对齐证据沿用 Task 18：allocation/global 属性或完整根 layout_view 的显式前置契约。生成候选、子视图要求和 MMA 指令需求不得自行增强根保证；没有足够证据时丢弃该建议，显式 binding 则报错。
+
+显式任意地址 map 只有被上述模板和有界逐点证明共同覆盖时才能通过。对于数学上合法但当前无法解码的 layout，明确报告 unsupported，不宣称它在硬件上必然不合法，也不自动新建 shared buffer 搬运。
+
+A/B 都是只读输入，可以重叠；若有共同 root，依然执行 AliasLayout 一致性检查，但不错误套用 Copy 的非恒等读写重叠禁止规则。
+
+#### 20.6 图中的角色、真正的联合约束与有限候选
+
+每个 MMA 的联合端点按固定角色排序为 `[A-slot, B-slot, init-use, result]`：SS 的 A/B slot 为 Storage var；RS 的 A-slot 为 Distributed use var、B-slot 为 Storage var；init-use/result 为 Distributed var。
+
+关系如下：
+
+- Tensor A 的生产者 → A 消费槽：Convertible，必要时在 MMA 的真实 operand 上插转换。
+- init 生产者 → init 消费槽：Convertible。
+- init 消费槽 ↔ result：SameLayout，不要求 init 的所有外部使用者都变成该编码。
+- 四个角色共同关联一个 InstructionContract；Distributed 角色同时受真实 ResourceLimit 约束。
+- Shared A/B 的访问维度与 result 不同，不得用 Task 19 的同 shape StorageAccess 直接连接。它们的 Read effect 和访问证明属于 MMA 的角色化联合契约。
+
+InstructionContract 不是四条独立的 RequireEncoding。候选准备阶段形成经过目标纯证明核验的有限合法 tuple 表；一条 tuple 同时包含四个角色的编码及对应指令方案。只有**同一 tuple**能够支持当前各角色选择时才成立。
+
+候选流程必须区分生成和删除：
+
+1. 收集显式 encoding/storage binding、操作数学属性和目标/线程环境，创建稳定角色身份；显式项是硬要求。
+2. 按所选 policy/原子组织准备 MMA 专用 canonical accumulator/A-fragment 和有限 shared 建议，复用 Task 18/19 的有限 alias/Copy origin 传播；不能给 MMA 结果继续填充无关的通用 SIMT 默认布局，也不能把 target 专用建议当作用户 RequireEncoding。
+3. 不沿 InstructionContract 做无界“正反向生新布局”。专用建议各生成一次，通用候选准备收敛后冻结全部域；若同一存储参与多个 MMA，收集全部已允许的有限来源，而不是按访问先后覆盖。
+4. 保留每 component 8 vars、每域 4 candidates 的 bootstrap 上限。超限明确报错，不截断前四项，不移除变量来绕过限制。每个四端点契约最多检查 `4^4=256` 个编码组合；重复端点必须使用同一 assignment。
+5. 每个编码组合通过确定性的 descriptor 解码获得至多一个规范指令方案；有多个等价解码时采用固定键序，不额外引入没有上界的隐藏选择。已显式绑定方案时，只核验该方案。
+6. Strict/Common 在原有队列上增加 hyperedge 支持检查：某个候选若没有任何与其余当前域同时相容的 tuple，就删除；InstructionContract 即使没有 singleton 也必须执行。domain 删除会重排所有相关 unary/binary/hyperedge，旧统计公式按真实邻接关系计数。
+7. Solver 对部分 assignment 检查是否仍有合法 tuple 扩展，对完整 assignment 要求整条 tuple 成立；不能沿用把所有关系拆成首端点与其他端点两两检查的循环。
+
+合法 tuple 表、proof cache 和 provenance 只在当前 graph 生命周期内有效；finalize 重排后所有角色 ID/constraint ID 正确 remap。稳定键按 IR 位置和角色，不按指针。图不变量检查角色数量、类型、source-op、重复端点一致性和 binding 归属。
+
+仍采用现有 bootstrap 的最少显式转换数＋稳定排序选择，不调用未完成的完整 CostVector 性能优化。policy、原子宽度和 swizzle 排序只能称确定性策略。
+
+#### 20.7 实际 IR 上的指令绑定与分层接口
+
+新操作的数学属性不存 PTX 字符串；所选目标实现写入独立的类型化属性：
+
+```text
+frisk.mma_contract : MmaInstructionContractAttr
+frisk.execution_threads : signless i64
+```
+
+`MmaInstructionContractAttr` 的 v1 必需字段是：schema version、target feature、SS/RS form、输入/累加类型、原子 `[64,n_atom,16]`、warp-group grid、M/N/K repeat counts、A packing 规则，以及 SS 的 A/B 或 RS 的 B descriptor plan。每个 plan 保存 major、swizzle、leading/stride offsets，和以操作数原子坐标为键的 root-relative start/phase 表。表规模受上述 tile/枚举预算约束，禁止含 pointer、SSA 地址或仅在内存中存在的缓存 ID。
+
+Tensor result/消费位置仍使用 `DistributedEncodingAttr`，Shared 仍使用 `StorageLayoutAttr`。本任务将原提纲的“Mma/DotOperand”落实为**指令角色＋可展开的通用 encoding＋操作契约**，不新增另一套 Tensor encoding 子类型；不宣称总体设计中的 `MmaEncodingAttr`、`DotOperandEncodingAttr` 类已经实现。这一选择避免无关地重写全部 M3 Tensor 类型转换，但不省略专用 fragment/packing 证明。
+
+显式 mma_contract 是完整硬绑定，不接受随意缺字段的“部分契约”；推断不能覆盖它。未指定时可由求解生成；actual-only 验证时两项属性必须齐全，不允许补默认值或重新选择方案。
+
+新增职责与 API 契约：
+
+- Analysis 的 `MmaLayoutConstraints` 只负责操作角色、SSA use、数学上下文和图关系。
+- `LayoutTarget` 增加独立的指令候选准备入口和纯 `verifyInstructionContract` 入口；默认实现拒绝未知 contract，不通过抽象层直接调用 SM90 函数。
+- `SM90GemmConstraints` 提供候选建议、规范方案构造；`SM90MmaLayoutProof` 提供按确定方案验证 fragment/descriptor 的纯函数。这两者不得修改 IR。
+- graph 内的 `InstructionLayoutContract` payload 记录角色、实际操作 binding 和有界 tuple 证据；`LayoutSolution` 增加以稳定 constraint ID 为键的 selected instruction binding。合法方案不是普通 Storage/Distributed 变量，不伪装成 Tensor shape。
+- propagation/solver 只做通用有限 tuple 支持检查，不识别 `sm_90a` 字符串或直接构造 WGMMA map；最终 verifier 通过传入的 target 重新验证实际绑定。
+- RelationsOnly 模式在候选生成和 tuple 枚举之前返回结构图；读取实际 IR 的 singleton assignments 和实际 mma_contract，调用纯证明。不得调用 target enumeration/方案搜索，也不得复用上次求解的合法 tuple 表。
+- 未识别的指令类别依旧 fail-closed；原 `RejectsUnsupportedHardConstraint` 测试改为未知指令类别负例，不能因 InstructionContract 被接入就默认所有类别合法。
+
+#### 20.8 物化、独立核验和失败诊断
+
+物化在 detached module 中完成：写 Tensor encoding、插入实际 use 转换、绑定 storage layout、写 mma_contract/threads，随后进行 MLIR verifier 和 actual-only 指令/布局证明，成功后才替换原 module body。
+
+独立验证从实际类型和操作属性重建 A/B/init/result，检查目标 feature、线程 scope、数学 transpose、policy、packing、descriptor plan 与 map 一致性。不能把自报“正确”的 descriptor 属性当成地址证明；即使 descriptor 和某一个 operand 都各自合法，也要检查它们属于同一操作、同一 shape 和同一 warp-group 分组。
+
+诊断使用稳定规则名，例如 `mma-shape`、`sm90-mma-target`、`sm90-mma-thread-group`、`sm90-mma-fragment`、`sm90-mma-descriptor`、`mma-joint-contract`；注明 A/B/init/result 角色及 relevant dtype/shape，地址或持有者失败尽可能给出逻辑/硬件坐标。Unknown 单列为无法证明，不冒充数学反例。
+
+任何失败保持原 IR 不变；同一输入两次推断及打印/解析后再次推断必须稳定。当前不声称发现任意语义篡改：例如用户同时合法修改数学属性与完整布局/契约，得到的是另一个合法程序；测试要篡改为确实违反当前契约的组合。
+
+#### 20.9 测试分组与完成标准
+
+实施采用先红后绿及独立复审，先逐个打通 SS/RS vertical slice，再扩展合法模板；不能仅新增 Op 并打印一个 contract 就标记完成。
+
+- [x] **A：数学 IR 与副作用。** rank/正 shape、M/N/K、矩形 transpose、f16/bf16→f32、init/result 关系、MemRef Read/no Write、零 Tensor 初始化，printer/parser。
+- [x] **B：独立硬件坐标 oracle。** 固定原子的 A packed halves、accumulator 坐标、不同 lane/warp/寄存器顺序；多原子 M/K 拼接与 N-group replication。测试参考表不能调用待测候选生成器构造“期望值”。
+- [x] **C：SS/RS 与 descriptor。** 两种输入 dtype、所有数学 transpose 组合、K/MN major、四种 swizzle；合法及不满足支持边界的组合分类测试。覆盖父 buffer 切片的 K-panel stride、非零起点、根对齐不足、phase 错误、地址区间越界；B Tensor/Local MemRef 明确拒绝。
+- [x] **D：线程与 policy。** 128/256/512/1024、group 连续性、FullRow/FullCol/Square、无合法分组、显式 threads 与 Parallel 冲突；`sm_90a` 成功、缺失 target/`sm_90`/SM80 新路径拒绝。
+- [x] **E：联合关系与收敛。** 构造“每对看似都有支持，但不存在完整合法 tuple”的反例；重复端点、稳定 remap、多 MMA 共用 storage、显式绑定冲突、8 vars/4 candidates 边界及超限、最多 256 个组合和点数预算。256 是四个合法候选域的组合上界，不人为制造域合法却有更多组合的假场景；损坏或重复的 tuple payload 单独按图不变量拒绝。统计证明冻结后只删不增。
+- [x] **F：实际物化。** 外部 init/A encoding 保持不变，在 MMA 消费处转换；零拷贝 shared binding；删除 contract/threads、篡改 fragment/packing/descriptor/分组后拒绝；target 生成及 tuple 枚举计数均为 0；失败 IR 逐字不变、二次推断逐字一致。
+- [x] **G：legacy 分类差分。** 用旧 adapter 比较适用子集的逻辑持有关系与地址，不比较 Attribute 字面相等；旧 FP16 accumulator 用例只能作为旧行为回归，不能冒充本次 FP32 accumulator 的数值等价测试。SM80、B-local、错误 group 组织、过时 ABI 分类记录；不保留已知错误求一致。
+- [x] **H：全量 Gate、独立复审和文档。** 新单元 `GemmConstraintTest.cpp`、`SM90MmaLayoutProofTest.cpp`；新增 `infer-gemm-layout.mlir`、错误/回放 lit 与必要 IR verifier 测试；同步本文和比较文档的实际实现/差异/计数。
+
+验收至少包含 `128×128×64` 的 SS/RS f16/bf16→f32 例子及 `64×64×16` 原子例子；它们必须在未放宽既有 solver 限制的真实 pass 中成功，不只通过独立 helper。
+
+```bash
+cmake --build build --target FriskLayoutUnitTests check-frisk \
+  frisk_attr_test frisk_reduce_layout_test frisk_layout_pass_test \
+  frisk_memory_effect_test --parallel 16
+./build/unittests/Dialect/Frisk/FriskLayoutUnitTests --gtest_brief=1
+ctest --test-dir build --output-on-failure
+git diff --check
+```
+
+实现后记录新增测试数量、实际 Gate 和每项未支持边界；没有执行上游/GPU benchmark 时，不宣称完整数值 lowering 验证、上游全面兼容或性能领先。
+
+#### 20.10 上游核对与 Frisk 的适配原则
+
+本轮已读的固定快照证据：
+
+- TileLang [`src/op/gemm.cc`](https://github.com/tile-ai/tilelang/blob/5e149e31674658f94779c7d0c6039549a1853123/src/op/gemm.cc)：`k_pack`/`wg_wait` 在 annotations；可能读取 C 与确定 read-before-write C 对 clear 条件有不同判断；WGMMA 不随意沿用不符合指令要求的 shared layout。Frisk 用显式 init SSA 表达旧值依赖，不复制 positional ABI 或 `completed_` 调度。
+- TileLang [`src/cuda/op/gemm.cc`](https://github.com/tile-ai/tilelang/blob/5e149e31674658f94779c7d0c6039549a1853123/src/cuda/op/gemm.cc)：WGMMA 分组把 4 个 warp 视为不可拆单元。Frisk 保留这一硬边界，但用自己的显式 group grid 和稳定 policy 定义，不强求旧浮点评分结果一致。
+- TileLang [`test_tilelang_cuda_wgmma_operand_layout.py`](https://github.com/tile-ai/tilelang/blob/5e149e31674658f94779c7d0c6039549a1853123/testing/python/cuda/test_tilelang_cuda_wgmma_operand_layout.py)：K-panel stride 从实际布局提取，切片不能按自身 extent 重建父存储间距。Frisk 将其作为 descriptor/address 一致性反例输入，不宣称该正确性要求是 Frisk 独创。
+- Triton [`AccelerateMatmul.cpp`](https://github.com/triton-lang/triton/blob/42c5e89c3871e1472968c92dd8e5c02d0b3dd40c/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp)：MMA encoding、accumulator 转换和 MMAv3 的 A-register/shared、B-shared 路径已有实现。Frisk 的设计差别在于将该类选择形成有限域联合硬契约，并在物化后对实际 IR 独立核验，不是声称 Triton 没有这些 operand/转换能力。
+
+硬件规则依据为 2026-09-19 访问的 [NVIDIA PTX ISA 9.4](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html)：§9.7.17.5.1 的 WGMMA fragment 与 shared canonical layout、§9.7.17.5.1.2.2 Matrix Descriptor Format，以及 §9.7.17.5.2 指令定义。实现注释和测试按该版本章节及图像文件名定位，不依赖会随版本变化的图号；已有 A 链路报告中的旧 Figure 148 不能当作新版图号。
+
+#### 20.11 文件分工及原提纲适配
+
+实际新增 `Analysis/MmaLayoutConstraints.{h,cpp}`、`Analysis/InstructionLayoutConstraints.{h,cpp}`、`Target/SM90/SM90GemmConstraints.{h,cpp}`、`Target/SM90/SM90MmaLayoutProof.{h,cpp}`，以及硬件、通用联合约束、真实集成单元 suite 和 lit。IR 层在 `FriskLayoutOps` 定义 MmaOp，在 `FriskLayoutAttrs` 定义操作指令契约及 descriptor-plan 属性；类型化字段的结构 verifier 与目标合法性 verifier 分开。
+
+修改 `LayoutTarget`、`LayoutConstraint`、`LayoutPropagation`、`LayoutVerifier`、`DistributedLayoutConstraints`、`OperationLayoutConstraints`、`MaterializeLayouts` 和相关 CMake，接入 instruction hyperedge、解中的操作 binding 及实际 singleton 核验。原预计放进 `LayoutRelations` 的通用 tuple 准备/支持检查独立放入 `InstructionLayoutConstraints`，不把四元约束压成二元关系。保留 Analysis→IR、Target→Analysis 的依赖方向；Analysis 使用 target 抽象接口，不增加 Analysis→SM90 链接。
+
+#### 20.12 执行计划与记录（2026-09-19）
+
+**Goal:** 将 §20.1–20.11 的 MMA 布局契约接入真实推断、物化和独立验证。
+
+**Architecture:** IR 定义数学操作与类型化契约；SM90 提供有界候选和纯指令证明；Analysis 只执行通用角色图和有限 tuple。依赖保持 Target→Analysis→IR。
+
+**Tech Stack:** C++17、MLIR/TableGen、GoogleTest、lit/FileCheck、CMake。
+
+**Global constraints:** 原目录 main，保留 Task 19 修改，不 commit/push/worktree；8 variables/component、4 candidates/domain、256 编码组合、65536 枚举点；目标与 dtype、线程、SS/RS 和失败边界严格遵守 §20.3–20.8。
+
+执行使用 subagent-driven-development：独立的 IR/硬件证明子任务由专门实现者处理，主执行者负责通用图集成；分别测试和复审后执行全量 Gate。提交步骤由用户“不自动提交”要求替代为保留工作区修改。
+
+- [x] **20A：IR 和 SM90 纯证明。** 修改 `include/Dialect/Frisk/IR/FriskLayoutOps.td`、`FriskLayoutAttrs.td` 及对应 `lib/Dialect/Frisk/IR` 实现；新增 `include/Dialect/Frisk/Target/SM90/SM90GemmConstraints.h`、`SM90MmaLayoutProof.h` 和对应 cpp。先添加 `unittests/Dialect/Frisk/Layout/GemmConstraintTest.cpp`、`SM90MmaLayoutProofTest.cpp` 的数学 verifier、已知 fragment 坐标、SS/RS 地址反例并记录 RED；实现后分别 GREEN。目标桥接口是 `prepareSM90MmaCandidates(LayoutConstraintGraph &) -> LogicalResult`、`buildSM90MmaContract(const LayoutConstraintGraph &, const LayoutConstraint &, ArrayRef<Attribute>) -> FailureOr<Attribute>`、`verifySM90MmaContract(const LayoutConstraintGraph &, const LayoutConstraint &, ArrayRef<Attribute>, Attribute) -> LayoutProof`。它们不改 IR，最后一个不生成候选或搜索方案。
+- [x] **20B：通用联合图。** 修改 `LayoutConstraint.h/.cpp`、`LayoutTarget.h`、`LayoutVerifier.h/.cpp`、`LayoutPropagation.cpp`；新增 `Analysis/MmaLayoutConstraints.h/.cpp`。`InstructionLayoutContract` 保存 source、完整实际 binding 及角色顺序对应的 `{encodings,binding}` tuples；`LayoutSolution::instructionBindings` 按 constraint ID 记录方案。用手工有限域测试无 singleton 删除、两两可行但整体不可行、重复端点、未知类别和 ID 重排，先 RED 再实现。tuple 检查对每个已赋值端点要求相等，未赋值端点要求仍在当前域，完整 assignment 必须支持同一 tuple。测试命令 `cmake --build build --target FriskLayoutUnitTests --parallel 16` 后运行 `build/unittests/Dialect/Frisk/FriskLayoutUnitTests --gtest_filter='InstructionConstraintTest.*'`。
+- [x] **20C：真实 pass 和物化。** 修改 `DistributedLayoutConstraints.cpp`、`OperationLayoutConstraints.cpp`、`SM90LayoutTarget.cpp`、`MaterializeLayouts.cpp` 及 CMake 接线。target 抽象提供上述 prepare/build/verify 三个对应 virtual 方法，默认拒绝未知指令。RelationsOnly 在 prepare/build 前返回；实际 binding 读取属性并调用纯 verify。先用 `test/Transforms/infer-gemm-layout.mlir` 与错误用例触发未支持操作，再实现 A/B/init/result 角色、线程约束、独立 encoding、方案写回和原子回滚。分别核验 `64×64×16` 和 `128×128×64` SS/RS、两种 dtype、transpose/phase/线程篡改、二次运行与打印解析回放。
+- [x] **20D：复审、Gate 和文档。** 对 20A、20B/20C 做契约与代码质量复审；运行 §20.9 全部命令，记录新增测试、实际结果、限制及与原契约差异；同步比较文档。未跑的 GPU/上游测试明确标未执行。
+
+#### 20.13 实现、复审与验证记录（2026-09-19）
+
+**工作区与交付范围。** 直接在 `/home/baopeihua/frisk` 的 `main` 修改，保留进入任务前的 Task 19 未提交内容，没有新 worktree、commit、merge 或 push。本轮实现的是静态数学 MMA 的布局推断/验证闭环，不是可运行 WGMMA lowering。Task 21/22 未开始。
+
+**实际接入：**
+
+1. `MmaOp` 验证 rank/static shape、矩形 transpose、浮点输入/累加匹配和已有 encoding；MemRef 只读，init 显式 SSA。`MmaInstructionContractAttr`、`MmaDescriptorPlanAttr` 使用严格 Dictionary schema，拒绝缺字段、未知字段及不匹配的 packing/form。
+2. `SM90GemmConstraints` 生成 canonical fragment、有限 shared 建议及确定性的 descriptor 方案；`SM90MmaLayoutProof` 根据 PTX 坐标、packed 顺序和实际 root-relative 地址独立证明，不用候选缓存代替证明。Generated proposal 不增强根对齐。
+3. `InstructionLayoutConstraints` 提供冻结域的有界 tuple 准备和完整 tuple 支持检查。重复端点只枚举一次；四个 4 候选域正好至多 256 次；Strict/Common 不依赖 singleton 才触发；partial solver 必须有同一完整 tuple 扩展。
+4. `MmaLayoutConstraints` 收集四个真实角色；方案写入 `LayoutSolution::instructionBindings`。Tensor producer 与 use 分离、init-use/result SameLayout；多 MMA 共用 storage 合并有限建议来源。原 ResourceLimit 与 8 vars/4 candidates 上限保持。
+5. 事务物化写 encoding/storage/typed contract/threads，必要时仅在 Tensor 消费点插转换。actual-only 重建实际 singleton，绕过候选生成、tuple 枚举及方案构造，纯验证通过才提交。
+
+**测试覆盖与证据分层：**
+
+- 新增 36 个单元：`GemmConstraintTest.cpp` 7、`SM90MmaLayoutProofTest.cpp` 8、`InstructionConstraintTest.cpp` 9、`GemmLayoutIntegrationTest.cpp` 11，以及 legacy adapter 的 RS replication 分类 1。新增 2 份 lit：`infer-gemm-layout.mlir`、`infer-gemm-layout-errors.mlir`。
+- 真实推断覆盖 `64×64×16` 的 SS/RS × f16/bf16 × transA/transB 共 16 种组合，以及 `128×128×64` 的两种 form × 两种 dtype 共 4 种组合。大 tile 同时验证二次推断、打印/解析回放及 actual-only 无生成调用。
+- Helper 独立坐标表覆盖 A packed halves、accumulator、M/K repeat、N-group replication、全部受支持 atom N；descriptor 覆盖 K/MN × 无/32/64/128-byte swizzle 共 8 模板、父 K-panel 间距、非零 start/phase、对齐/越界反例。线程与 policy helper 覆盖 128/256/512/1024 和三种 policy；不宣称全部 descriptor × transpose × 多 warp-group 的端到端笛卡尔积已运行。
+- 实际 IR 负例覆盖缺属性、线程/target 冲突、合法 typed grid/descriptor 篡改、仍满足通用 coverage 的 fragment 位交换。错误 RS packing 在 typed checked-constructor 层拒绝；直接注入原始 Dictionary 也不能绕过 actual-only 的 typed 属性要求。测试累计检查候选枚举/准备/方案构造次数均为 0。
+- 外部 A/init 编码保留，并在消费点产生两个转换；失败事务保留原 IR 逐字不变；两个 MMA 共用存储域、未知指令、重复端点、tuple 去重/remap、256 组合与第 5 候选拒绝、逻辑/硬件点数预算均有测试。
+
+**复审与修正。** 分别进行了通用图集成和硬件/全链路独立源码复审，未发现已确立的 Critical/Important 正确性缺陷。验收覆盖缺口是实际 fragment/packing/descriptor/grid 篡改，已补测试；另修正数学 verifier 对未知 Tensor encoding 的漏检、失败角色标注，以及显式 binding 失败时丢失 Unknown/reason/坐标的诊断。早期预算失败现在明确为 Unknown；无可构造方案报告 bounded decoder 无法证明，不冒充硬件不可能的数学反例。生成 API 仍返回 `FailureOr<Attribute>`，一般解码失败只能给有界构造失败说明，不能承诺总有逐点反例。
+
+**测试先后记录。** 未注册 `frisk.mma`、未知 InstructionContract 被错误接受、未知 Tensor encoding、角色诊断、Unknown 诊断均观察到预期 RED 后修正。部分硬件 helper 用例虽先写测试，但首次可运行构建时已为 GREEN，不能宣称每个 helper 都单独完成过可执行 RED。实际 packing 负例最初误用会 assert 的 `get()`；改为 `getChecked()` 验证结构拒绝，这属于测试构造修正，不是生产路径接受了非法 packing。
+
+首次全量单元运行在新增 Parallel fixture 构造中触发空 region `front()` 断言；单测复现和带符号栈定位到测试自身。原因是现有 `ParallelOp::build` 只添加 region、不创建 block；测试现已显式构造两个 index 参数的 block 和 `EndOp` 再放入 MMA。未因此改动旧 Parallel builder 或放宽生产 verifier；该次中止不能计作全量通过，后续重新执行完整 Gate。
+
+**Legacy 分类而非机械一致：**
+
+| 历史输入/行为 | Task 20 处理与证据 |
+| --- | --- |
+| 适用的旧 SM90 SS/RS storage 与 fragment | 保留原 adapter 持有关系/地址回归；不以属性文本相等或旧 f16 accumulator 冒充新 f32 数值等价 |
+| 旧 RS A 的 replication=2 | 新增分类测试：旧候选被新指令证明拒绝；128 线程新 canonical A 为 replication=1，不能沿用旧冗余组织；B storage 地址仍可独立对照 |
+| SM80 或仅 `sm_90` target | 新 MMA 只接受显式 `sm_90a`；旧 SM80 路径仅保留 legacy 回归，不扩展本阶段 target |
+| Local A/B、Tensor B | Local MemRef 不当寄存器；RS 必须 Tensor A，B 必须 Shared。明确拒绝，生命周期 normalization 留到 Task 22 |
+| 非四 warp 分组/错误线程 scope | 按合法 grid、连续 warp-group 和实际 Parallel scope 检查；不为旧 policy 输出放宽硬件边界 |
+| 旧 positional ABI、clear/annotation 行为 | 不复制位置下标或完成标记；新 op 用显式 init SSA 表示旧值依赖，不提供隐式 clear。旧 ABI 自动转换不在本任务 |
+
+**最终 Gate：** 以下命令重新执行并通过，单元总数较 Task 19 的 129 增至 165。全量单元耗时 207207 ms，23 个 suite；其中 MMA 集成 suite 为 196996 ms，不是 GPU 性能数据。
+
+```bash
+cmake --build build --target FriskLayoutUnitTests check-frisk \
+  frisk_attr_test frisk_reduce_layout_test frisk_layout_pass_test \
+  frisk_memory_effect_test --parallel 16
+build/unittests/Dialect/Frisk/FriskLayoutUnitTests
+ctest --test-dir build --output-on-failure
+git diff --check
+```
+
+| 验证项 | 最终实际结果 |
+| --- | --- |
+| 构建及 lit | exit 0；34/34 PASS（9.46 s） |
+| 全量单元 | exit 0；165/165 PASS（207.207 s） |
+| CTest legacy executables | exit 0；4/4 PASS |
+| `git diff --check` | exit 0，无 whitespace 错误 |
+| 独立复审 | 通用图与硬件/全链路各自审阅；覆盖/诊断问题修正后复核，无剩余阻塞项 |
+
+构建观察到已有 Ninja `premature end of file; recovering` 和 CMake CMP0116 OLD 弃用提示，不宣称零警告构建。负例测试中的预期错误诊断不计为失败；最终通过以测试汇总与 exit code 为准。
+
+**未执行/不支持：** 未运行 TileLang/Triton 上游测试、GPU 数值内核或性能 benchmark；未升级固定上游 SHA。一般 Product 指令布局、动态/非二次幂/尾块、Tensor B、Local fragment、f16 accumulator、TF32/FP8/int/sparse、SM80 新路径、异步 token/同步 lowering、寄存器分配/spill/occupancy 和完整 CostVector 均未实现。本任务 65536 点是证明预算，不是寄存器性能预算；policy/swizzle 排序不代表性能最优。
+
+以下保留最初的 Task 20 迁移提纲用于追踪演进，复选框不代表当前验收进度；以上述 v1 契约和 A–H 为准。其中“DotOperand/Mma encoding”按 §20.7 落实，寄存器 B 不在 SM90a 支持集，旧 Gemm 自动 normalization 留到 Task 22。原 Step 6 不自动执行，提交和推送仍需用户另行授权。
 
 **Files:**
 

@@ -6,7 +6,9 @@
 >
 > 首次审阅：2026-08-16；本次源码审计：2026-09-12
 >
-> 状态（2026-09-16）：M0–M3 与 M4 Task 18 已实现；Task 18 独立复审和 30 lit / 104 unit / 4 CTest 通过，已按用户授权提交并合入本地 main，未推送。其余 M4 迁移尚未实施；已知限制与集成记录见实现计划 §18.9–18.10。
+> 状态（2026-09-19）：M0–M3 与 M4 Task 18–20 已完成；Task 20 按确认契约实现，独立复审与 34 lit / 165 unit / 4 CTest 全部通过，记录见实现计划 §20.13。Task 21–22 尚未实施；源目录 main 上的 Task 19/20 修改未自动提交或推送。Task 19 历史 Gate 为 32 lit / 129 unit / 4 CTest；远端同步状态不由本文推断。
+>
+> 实现更新（2026-09-19）：Task 20 的 SS＋RS 具体契约 v1 已确认并实施；实际适配、有限联合约束与验证边界见下节及实现计划 §20.13。本轮核对固定上游快照的 GEMM 源码，没有升级快照或运行上游测试。
 >
 > 关联文档：[Frisk 布局推断系统设计方案](./layout_inference_design.md)、[GF(2) 与组合布局说明](./gf2_layout_guide.md)
 
@@ -31,6 +33,54 @@
 - 本轮没有 TileLang/Triton 运行实验、GPU benchmark 或端到端性能结论。上表 27/74/4 是 M3 基线；Task 18 的新增测试结果单独记录，不能混用。
 
 ## 1. 结论摘要
+
+### Task 20 实现增量（2026-09-19）
+
+具体契约和实测记录见[实现计划 Task 20](./layout_inference_implementation_plan.md#task-20-增加内部-tensor-mma-op-并迁移-gemm-约束)。工作基线是 `ef85a0d` 加未提交的 Task 19 修改；下表记录已经接入的代码选择，测试结果单独记录，不把静态证明当作 GPU 执行证据。
+
+| 已核对的证据 | Task 20 已实现选择 | 比较边界 |
+| --- | --- | --- |
+| 旧 Frisk Gemm 使用 Local MemRef/DenseMap，verifier 同 dtype 且未按 transpose 检查形状 | 新增 Tensor accumulator/result 的 `frisk.mma`，显式表达 `result = init + A_eff × B_eff`；消费处插转换 | 不直接沿用旧 verifier，不提前实现 Task 22 的旧 Buffer 生命周期 normalization |
+| TileLang 固定快照的 GEMM 使用更新后的 annotations、clear 读依赖语义及 WGMMA shared 要求 | 用 SSA init 表达累加依赖；shared 地址按实际角色证明，不复制位置参数 ABI 或推断完成标记 | 不是声称 TileLang 没有严格指令布局检查 |
+| TileLang WGMMA partition 以四个 warp 为不可拆单元；其 operand-layout 测试检查父 buffer 的 K-panel stride | 固定合法 warp-group grid；从实际 root/layout 重建 descriptor 地址，不按切片 extent 猜 panel 间距 | 四 warp 和实际 stride 是正确性要求，不单独作为 Frisk 创新点 |
+| Triton MMAv3 已有 MMA encoding、accumulator conversion、A register/shared 与 B shared 路径 | SS＋RS 都接入同一有限域联合 InstructionContract，保留显式转换 | 不声称 Triton 缺少这些能力；差异是 Frisk 的统一约束表示及求解后核验方式 |
+| 实现前 Frisk InstructionContract 尚无执行语义，unary/binary 关系不能保证四个角色属于同一指令方案 | 增加 `[A-slot,B-slot,init-use,result]` 的有界合法 tuple，传播删除无完整支持的候选，求解选择整条方案 | 已接入 Strict/Common 与部分 assignment 检查；不是完整 CostVector 或大图全局最优求解 |
+| M3 已有通用 Distributed/Storage encoding，尚无专用 Mma/DotOperand encoding 类 | 复用通用 map，在操作上写类型化 `mma_contract`；按专用 fragment、packed 半字顺序、descriptor 证明 | 是对原计划 encoding 类层次的明确适配；不把普通元素覆盖误当成硬件指令兼容 |
+
+实现支持明确的 `sm_90a`、f16/bf16 输入和 f32 accumulator；SS 是 A/B shared，RS 是 Tensor A/shared B。只处理当前布局表示允许的静态二次幂 tile、单 CTA、128/256/512/1024 线程，以及有界规范 descriptor 模板。Tensor B、Local MemRef fragment、动态尺寸、未证明的地址方案和超出 bootstrap 预算的组件明确拒绝；不静默改变 shape、补 shared buffer 或扩大候选上限。无目标标注不为 MMA 猜测 `sm_90a`，但不改变 Task 19 普通操作的默认目标行为。
+
+物化后的纯验证只读取实际 Tensor/Storage encoding、线程环境和完整指令属性，重新证明 fragment/packing/descriptor 的联合一致性；不枚举候选，不使用上次求解 tuple 作为证明。测试覆盖事务回滚、打印解析回放、无 singleton 的联合不相容反例以及独立硬件坐标 oracle。`SameLayout` 连接 init 的实际消费槽和 result，不强迫外部 init 的全部使用者一致。
+
+源码锚点：`Analysis/InstructionLayoutConstraints.cpp` 的有限 tuple 和完整支持检查，`Analysis/MmaLayoutConstraints.cpp` 的真实角色，`Target/SM90/SM90GemmConstraints.cpp` 的有界建议/方案构造，`SM90MmaLayoutProof.cpp` 的纯 fragment/descriptor 证明，以及 `Transforms/MaterializeLayouts.cpp` 的 typed binding 与 actual-only 事务验收。通用 Analysis 不依赖 SM90 实现库。
+
+与最初设计的明确适配：不新增 `MmaEncodingAttr`/`DotOperandEncodingAttr` Tensor 子类型；Distributed 保持 BitLinear、Storage 使用既有 Affine/BitLinear，操作级两个 typed 属性使用严格 Dictionary schema。多原子重复可在当前 BitLinear fragment 中表达，但未扩展一般 Product 指令布局。生成失败/证明预算不足报告 Unknown，不因目标建议不足就声称所有硬件实现均不可能。
+
+旧规则分类差分只覆盖适用的持有关系与 storage 地址。新分类测试记录旧 RS A replication=2 与 128 线程新 canonical A replication=1 的区别；旧布局不能因为来自 baseline 就绕过新硬件证明。SM80/`sm_90`、Local B、错误四-warp 组织明确不进入新路径；旧 f16 accumulator、positional ABI/clear 不冒充新 f32/init SSA 语义等价，自动 normalization 留到 Task 22。
+
+上游证据固定为 TileLang `5e149e31674658f94779c7d0c6039549a1853123` 的 [`src/op/gemm.cc`](https://github.com/tile-ai/tilelang/blob/5e149e31674658f94779c7d0c6039549a1853123/src/op/gemm.cc)、[`src/cuda/op/gemm.cc`](https://github.com/tile-ai/tilelang/blob/5e149e31674658f94779c7d0c6039549a1853123/src/cuda/op/gemm.cc)、[`test_tilelang_cuda_wgmma_operand_layout.py`](https://github.com/tile-ai/tilelang/blob/5e149e31674658f94779c7d0c6039549a1853123/testing/python/cuda/test_tilelang_cuda_wgmma_operand_layout.py)，以及 Triton `42c5e89c3871e1472968c92dd8e5c02d0b3dd40c` 的 [`AccelerateMatmul.cpp`](https://github.com/triton-lang/triton/blob/42c5e89c3871e1472968c92dd8e5c02d0b3dd40c/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp)。硬件依据为本日访问的 [NVIDIA PTX ISA 9.4](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html)，具体章节见实现计划 §20.10。
+
+已落地的架构差异是“Storage/Distributed 双域＋有限联合硬约束＋实际 IR 独立证明”的组合；不能据此断言上游绝无相似机制，或未经实验宣称创新性/性能领先。当前不实现完整 CostVector、GPU lowering 或异步 pipeline，也没有上游运行差分、GPU 数值测试和性能优势证据；可表示静态指令契约不等于已生成可执行内核。
+
+本轮新增 36 个单元与 2 份 lit，最终 **165/165 unit、34/34 lit、4/4 CTest** 通过。实际推断覆盖 16 个小 tile SS/RS/dtype/transpose 组合和 4 个 `128×128×64` SS/RS/dtype 组合；8 类 descriptor、4 种线程数与 policy 的更广矩阵在 helper 层验证，不宣称完整端到端组合穷举。详细命令、首次全量测试 fixture 修正、Unknown 诊断修正及复审闭环见实现计划 §20.13。
+
+### Task 19 实现增量（2026-09-16）
+
+本次以 Frisk `ef85a0d` 为实现起点，先审计 Copy/Fill/Parallel 接口、确认具体契约，再按[实现计划 §19.1–19.9](./layout_inference_implementation_plan.md#task-19-迁移-copyfill-和-parallel-约束)实现与测试。下表记录已经落地的设计选择；本轮未重新获取或运行 TileLang/Triton，上游比较继续限定到 §0 的固定快照。
+
+| 实现前审计发现 | Task 19 已实现选择 | 与既定体系比较的关系 |
+| --- | --- | --- |
+| Frisk Copy/Fill 目前是 MemRef 操作，没有承载执行布局的 Tensor SSA 结果 | 将执行布局、线程环境、writer policy 和向量宽度显式物化在原操作上；内存布局仍在 layout_view 上 | 保留 Frisk 的 Storage/Distributed 双域，不把旧 Buffer 接口机械改称 Tensor encoding |
+| M2 Copy 对两端 storage map 强制相同 | 用同一逻辑坐标的读/写访问关系连接各自存储；有限候选可以双向准备，但不同存储不构成 alias 或硬布局等值 | 吸收既有审计中 TileLang 的方向性信息利用，采用图中的硬正确性关系与候选建议分离，不宣称全面复现其 dst-steering |
+| replicated 持有不等于 replicated 写入 | 区分 all-writer 与显式 first-owner，逐点核验唯一实际写入者；不假设未来 lowering 自动选 owner | 延续三方比较中的 read/write ownership 区分；不把 TileLang partial addend 当作同值副本，也不扩展 reducer epoch |
+| Ownership/ResourceLimit 枚举尚无完整求解语义；新 pass 已不调用旧 Parallel inference | 真正接入传播/求解/最终核验，线程拓扑不直接等于最终布局；增加真实旧调用隔离测试 | 可核验差异是约束、物化属性与最终 IR 的一致性，不是声称其他系统没有线程约束 |
+
+首版仍限制静态 whole-tile Copy/Fill、单 CTA 和已支持的布局表示；执行域各维必须是大于 1 的二次幂，bootstrap 的 8 variables/component、4 candidates/domain 限制不变。不扩展 Tensor 版 Copy/Fill、TMA/cp.async lowering、GEMM/Reduce 或完整成本求解。`first_owner` 是已核验并物化的显式执行契约，不等于已生成 GPU 写入谓词；未来 lowering 必须消费该契约。
+
+新增的 `CopyAccess` 只约束逻辑点的复制及已知同 root 的不重叠/恒等条件，不要求两端物理 map 相等，也不替代 `AliasLayout`。例如 `2×2xf32` 的源地址 `8i+4j` 与目的地址 `4i+8j` 可以复制；不同 MemRef 参数仍需调用者保证非重叠，不能把不同 root ID 当作 NoAlias 证明。候选准备可在两端之间重定位有限存储建议，但冻结后只删除候选，不继续生成。
+
+源码证据：`OperationLayoutConstraints` 收集实际操作绑定；`ExecutionLayoutProof` 核验规范 writer 与逐线程寄存器向量；`LayoutRelations` 统一执行 CopyAccess/Ownership/ResourceLimit；`SM90DistributedCandidates` 按线程环境生成有限候选；`MaterializeLayouts` 事务式物化四项属性并独立重建核验。纯证明放在 Analysis，避免 Analysis/Target 循环依赖。覆盖不同物理布局、双向候选、写入竞争、向量过滤、Parallel capture 转换、属性篡改、旧路径隔离和文本回放的测试及 Gate 结果见实现计划 §19.9。
+
+差异定位是“存储与执行分开建模 + 有限候选建议与硬证明分开 + 实际 IR 契约可独立重验”，不是声称 TileLang/Triton 不支持 owner 选择、别名或向量访问，也不是性能优越性的证明。未运行上游差分或 GPU benchmark。
 
 三者的核心路线可以概括为：
 
@@ -427,23 +477,29 @@ Triton 的 conversion 优化包含：
 
 ### 6.1 当前实现状态与目标架构必须分开
 
-审计起点 Frisk `b120d06` 已完成 M0–M3，原文“LayoutInfer 是空壳”已经过时。下表加入 Task 18 增量（实现提交 `9c28b67`，2026-09-16 已本地合入 main，未推送）：
+审计起点 Frisk `b120d06` 已完成 M0–M3，原文“LayoutInfer 是空壳”已经过时。下表加入 Task 18 增量（实现提交 `9c28b67`，已合入 main）及本轮尚未提交的 Task 19/20 增量：
 
 | 已有部件/功能 | 已核对实现 | 当前边界 |
 | --- | --- | --- |
 | 布局代数与属性 | GF(2) 矩阵、Affine/BitLinear/Product、LayoutProof、Distributed/Storage attrs | 代数库能力不等于所有 map/shape 已接入 pass；Unknown 不可作为硬证明 |
 | Storage 纵向切片 | layout_view、whole-tile Copy；Task 18 增加静态 cast/subview 坐标链、有限 origin 投影、全部同-root pairs 的 bit 区间证明 | 同 dtype/space、可静态证明；动态路径、reinterpret、一般 Product alias 投影保守拒绝；不引入隐藏 root assignment |
-| Distributed 纵向切片 | Tensor encoding、transpose/broadcast 等关系、tile_load/store、显式 conversion | 静态受限形状；bootstrap 每 component 至多 8 vars、每域至多 4 candidates，不是 M5 的通用全局搜索 |
+| Distributed 纵向切片 | Tensor encoding、transpose/同形 elementwise 关系、tile_load/store、显式 conversion | 静态受限形状；bootstrap 每 component 至多 8 vars、每域至多 4 candidates，不是 M5 的通用全局搜索 |
 | 结构化控制流 | if/for/while 实际 use/slot 约束与转换物化；Task 18 显式带 kind/slot 的 region edges | 保留 while I/O 两套 tuple；回边仍允许 Convertible，不为制造缩域而改为相等约束 |
-| 约束求解/物化 | stable IDs、hard constraints、provenance、确定性有限枚举；Task 18 stable FIFO 删减及真实 degree 上界统计；detached module 原子提交 | 完整 CostVector/SM90 指令路径联合优化未实现；候选有限初始化不是通用大图最优解证明 |
+| 约束求解/物化 | stable IDs、hard constraints、provenance、确定性有限枚举；Task 18 stable FIFO 删减及真实 degree 上界统计；Task 20 四角色 instruction tuple；detached module 原子提交 | 指令联合合法性已接入，完整 CostVector/指令路径性能联合优化未实现；候选有限初始化不是通用大图最优解证明 |
 | 独立核验与测试 adapter | 从实际 IR 重建关系、singleton assignment 核验；受限 conversion lowering 测试 | 不是完整 WGMMA/TMA/mbarrier lowering，没有端到端性能优越性证据 |
-| 旧 Op 规则 | FriskOps/FriskOps_Reduce 的 legacy 方法仍在，adapter 提供受限语义回归 | 新 pass 尚未通过 Op interface 全面迁移 Copy/Fill/Parallel/GEMM/Reduce；Task 19–22 待实现 |
+| Copy/Fill/Parallel 迁移 | Copy 两端分别读写；Fill 唯一写入者契约；Parallel 的真实 ResourceLimit；四项执行属性物化并独立重验 | 仅受限静态整块、单 CTA；不是完整 lowering；Reduce 尚待 Task 21 |
+| Tensor MMA/GEMM 迁移 | `frisk.mma`；SM90a SS/RS f16/bf16→f32；四角色联合约束；fragment/packing/descriptor 实际 IR 纯证明 | 静态二次幂、有界单 CTA；不含 Tensor B、Local fragment、一般 Product/尾块、异步指令 lowering 或数值 GPU 验收 |
+| 旧 Op 规则 | legacy 方法保留供 adapter 回归；真实计数验证新 pass 不调用旧 Parallel 递归路径 | 采用公共 collector 接入已迁移规则，尚未实现 Task 22 的完整 Op interface 迁移 |
 
 源码锚点：`LayoutAliasAnalysis.cpp` 的 root/坐标/bit 证明；`StorageAliasCandidates.cpp` 的有限 origins；`LayoutPropagation.cpp` 的 strict/common FIFO；`LayoutRelations.cpp` 的 AliasLayout 证明缓存；`DistributedLayoutConstraints.cpp` 的 SCF 规则；`MaterializeLayouts.cpp` 的实际值重绑和事务提交。上游证据见 §15。
 
 Task 18 对应的审计缺口已在实现分支处理：endpoint-owned 坐标 payload 随 ID remap；同-root 关系由邻接链改为全部 pairs；容量改查 root accessible bit span；RelationsOnly 在任何投影/枚举之前返回。此前 RelationsOnly seed 复制是模式契约缺口，不能倒推旧版已经发生错误验过；本次另有 actual verifier 非邻接冲突反例。
 
 审计 baseline：27 lit、74 unit、4 CTest 全通过。Task 18 新增 30 个 alias/region/integration 单元和 3 份 lit，最终 Gate 为 30/30 lit、104/104 unit、4/4 CTest；命令及边界见实现计划 §18.9。§6.2–6.5 仍是目标分解，不能整体当作现状；完整硬件 pipeline 超出当前范围。
+
+Task 19 再新增 25 个单元（16 个操作集成、9 个执行证明）及 2 份 lit，最终 Gate 为 **32/32 lit、129/129 unit、4/4 CTest**；命令、反例和设计适配见实现计划 §19.9。独立复审的 footprint/view 一致性、物理区间重叠与空 Kernel 回放问题均已修正。
+
+Task 20 再新增 36 个单元（15 个数学/硬件证明、9 个通用联合约束、11 个 MMA 集成、1 个 legacy 分类）及 2 份 lit，最终 Gate 为 **34/34 lit、165/165 unit、4/4 CTest**；命令及不支持边界见实现计划 §20.13。
 
 ### 6.2 表示层：Distributed 与 Storage 分离
 

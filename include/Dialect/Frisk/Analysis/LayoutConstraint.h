@@ -39,10 +39,18 @@ enum class ConstraintKind {
   RequireEncoding,
   InstructionContract,
   StorageAccess,
+  CopyAccess,
   AliasLayout,
   Ownership,
   ResourceLimit,
   Preference
+};
+
+/// A real operation-attribute binding, not an unmaterialized Tensor SSA value.
+struct OperationExecutionBinding {
+  int64_t threads = 32;
+  unsigned vectorBytes = 1;
+  std::string writerPolicy = "first_owner";
 };
 
 struct LayoutCandidate {
@@ -63,6 +71,11 @@ struct LayoutVar {
   OpOperand *use = nullptr;
   std::optional<unsigned> functionResult;
   std::optional<StorageAliasInfo> storageAlias;
+  std::optional<OperationExecutionBinding> operationExecution;
+  /// Candidate-generation environment; the matching ResourceLimit is hard.
+  int64_t requiredThreads = 0;
+  /// Instruction proposals replace generic SIMT defaults for this endpoint.
+  bool instructionRole = false;
 };
 
 enum class AccessKind { Read, Write };
@@ -87,6 +100,17 @@ struct LayoutProvenance {
   std::string reason;
 };
 
+struct InstructionLayoutTuple {
+  SmallVector<Attribute> encodings;
+  Attribute binding;
+};
+
+struct InstructionLayoutContract {
+  Operation *source = nullptr;
+  Attribute binding;
+  SmallVector<InstructionLayoutTuple, 0> tuples;
+};
+
 struct LayoutConstraint {
   LayoutConstraintID id = 0;
   ConstraintKind kind = ConstraintKind::SameLayout;
@@ -99,6 +123,8 @@ struct LayoutConstraint {
   OpOperand *use = nullptr;
   bool existingConversion = false;
   std::string stableUseKey;
+  int64_t requiredThreads = 0;
+  std::optional<InstructionLayoutContract> instruction;
 };
 
 enum class RegionLayoutEdgeKind {
@@ -154,6 +180,7 @@ struct LayoutCandidatePreparationStatistics {
   uint64_t projectedCandidates = 0;
   uint64_t footprintEvaluations = 0;
   uint64_t pairProofEvaluations = 0;
+  uint64_t instructionCombinations = 0;
 };
 
 class LayoutConstraintGraph {
@@ -209,7 +236,7 @@ public:
 
 private:
   SmallVector<LayoutVar, 0> variables;
-  SmallVector<LayoutConstraint> constraints;
+  SmallVector<LayoutConstraint, 0> constraints;
   SmallVector<LayoutProvenance> provenances;
   SmallVector<RegionLayoutEdge> regionEdges;
   LayoutPropagationStatistics propagationStatistics;

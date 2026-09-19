@@ -38,6 +38,25 @@ public:
         return owner->emitError("duplicate conversion consumer operand");
       list.push_back({operand, edge.sourceEncoding, edge.targetEncoding});
     }
+    for (const auto &constraint : graph.getConstraints()) {
+      if (constraint.kind != ConstraintKind::InstructionContract) continue;
+      if (!constraint.instruction || !constraint.instruction->source ||
+          !root->isAncestor(constraint.instruction->source))
+        return root->emitError("invalid instruction materialization source");
+      auto *op = constraint.instruction->source;
+      Attribute binding = solution.instructionBindings.lookup(constraint.id);
+      if (!binding) return op->emitError("missing selected instruction binding");
+      Builder b(op->getContext());
+      NamedAttrList attrs;
+      attrs.set("frisk.mma_contract", binding);
+      attrs.set("frisk.execution_threads", b.getI64IntegerAttr(
+          graph.getVariable(constraint.vars.back()).requiredThreads));
+      for (auto attr : attrs)
+        if (auto original = op->getAttr(attr.getName()))
+          if (original != attr.getValue())
+            return op->emitError("materialization would overwrite an explicit instruction contract");
+      executions[op] = attrs.getDictionary(op->getContext());
+    }
     for (const LayoutVar &var : graph.getVariables()) {
       if (var.kind == LayoutKind::Storage) {
         auto view = dyn_cast_or_null<LayoutViewOp>(var.anchor);
@@ -47,6 +66,22 @@ public:
         if (view.getLayoutAttr() && view.getLayoutAttr() != layout)
           return view.emitError("materialization would overwrite an explicit hard binding");
         storage[var.anchor] = layout;
+      } else if (var.operationExecution) {
+        const auto &binding = *var.operationExecution;
+        auto *op = var.anchor;
+        if (!op || !root->isAncestor(op))
+          return root->emitError("invalid operation execution materialization binding");
+        Builder b(op->getContext());
+        NamedAttrList attrs;
+        attrs.set("frisk.execution_layout", solution.assignments.lookup(var.id));
+        attrs.set("frisk.execution_threads", b.getI64IntegerAttr(binding.threads));
+        attrs.set("frisk.writer_policy", b.getStringAttr(binding.writerPolicy));
+        attrs.set("frisk.vector_bytes", b.getI64IntegerAttr(binding.vectorBytes));
+        for (auto attr : attrs)
+          if (auto original = op->getAttr(attr.getName()))
+            if (original != attr.getValue())
+              return op->emitError("materialization would overwrite an explicit execution contract");
+        executions[op] = attrs.getDictionary(op->getContext());
       } else if (var.value) {
         auto type = converter.convertLayoutBearingTensor(var.value);
         if (failed(type)) return failure();
@@ -157,6 +192,8 @@ private:
     mapping.map(op, copy);
     mapping.map(op->getResults(), copy->getResults());
     if (Attribute layout = storage.lookup(op)) copy->setAttr("layout", layout);
+    if (auto attrs = executions.lookup(op))
+      for (auto attr : attrs) copy->setAttr(attr.getName(), attr.getValue());
     if (op->getName().getStringRef() == "arith.constant" && !results.empty() &&
         isa<RankedTensorType>(results.front())) {
       auto value = dyn_cast_or_null<DenseElementsAttr>(op->getAttr("value"));
@@ -193,6 +230,7 @@ private:
   IRMapping mapping;
   DenseMap<Value, Type> types;
   DenseMap<Operation *, Attribute> storage;
+  DenseMap<Operation *, DictionaryAttr> executions;
   DenseMap<std::pair<Operation *, unsigned>, Type> functionResults;
   DenseMap<Operation *, SmallVector<ConversionSnapshot>> conversions;
 };
@@ -237,12 +275,25 @@ LogicalResult verifyMaterializedLayouts(Operation *root,
   auto graph = collectLayoutConstraints(root, target, LayoutCollectionMode::RelationsOnly);
   if (failed(graph)) return failure();
   LayoutSolution actual;
+  for (const auto &constraint : graph->getConstraints()) {
+    if (constraint.kind != ConstraintKind::InstructionContract) continue;
+    auto *op = constraint.instruction ? constraint.instruction->source : nullptr;
+    if (!op || !op->hasAttr("frisk.mma_contract") || !op->hasAttr("frisk.execution_threads"))
+      return root->emitError("unresolved materialized instruction contract or execution_threads");
+    actual.instructionBindings[constraint.id] = op->getAttr("frisk.mma_contract");
+  }
   for (LayoutVar &var : graph->getVariables()) {
     Attribute encoding;
     if (var.kind == LayoutKind::Storage) {
       encoding = cast<LayoutViewOp>(var.anchor).getLayoutAttr();
       if (!encoding)
         return var.anchor->emitError("unresolved storage layout for materialized view");
+    } else if (var.operationExecution) {
+      for (StringRef name : {"frisk.execution_layout", "frisk.execution_threads",
+                             "frisk.writer_policy", "frisk.vector_bytes"})
+        if (!var.anchor->hasAttr(name))
+          return var.anchor->emitError() << "unresolved materialized operation contract: " << name;
+      encoding = var.anchor->getAttr("frisk.execution_layout");
     } else {
       Type type;
       if (var.value) type = var.value.getType();

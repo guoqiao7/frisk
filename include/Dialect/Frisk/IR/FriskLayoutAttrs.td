@@ -5,6 +5,22 @@ include "Dialect/Frisk/IR/FriskDialect.td"
 include "Dialect/Frisk/IR/FriskLayoutAttrInterfaces.td"
 include "mlir/IR/AttrTypeBase.td"
 
+def MmaDescriptorPlanAttr : AttrDef<Frisk_Dialect, "MmaDescriptorPlan"> {
+  let cppNamespace = "::mlir::frisk";
+  let mnemonic = "mma_descriptor";
+  let parameters = (ins "::mlir::DictionaryAttr":$payload);
+  let assemblyFormat = "`<` $payload `>`";
+  let genVerifyDecl = 1;
+}
+
+def MmaInstructionContractAttr : AttrDef<Frisk_Dialect, "MmaInstructionContract"> {
+  let cppNamespace = "::mlir::frisk";
+  let mnemonic = "mma_contract";
+  let parameters = (ins "::mlir::DictionaryAttr":$payload);
+  let assemblyFormat = "`<` $payload `>`";
+  let genVerifyDecl = 1;
+}
+
 def BitLinearLayoutMapAttr
     : AttrDef<Frisk_Dialect, "BitLinearLayoutMap", [LayoutMapAttrInterface]> {
   let cppNamespace = "::mlir::frisk";

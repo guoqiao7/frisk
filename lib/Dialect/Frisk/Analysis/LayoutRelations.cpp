@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
+#include "Dialect/Frisk/Analysis/ExecutionLayoutProof.h"
 #include "Dialect/Frisk/IR/FriskAttributes.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/STLExtras.h"
@@ -49,8 +50,44 @@ bool isSupportedLayoutRelation(ConstraintKind kind) {
   return kind == ConstraintKind::SameLayout ||
          kind == ConstraintKind::AliasLayout ||
          kind == ConstraintKind::StorageAccess ||
+         kind == ConstraintKind::CopyAccess ||
          kind == ConstraintKind::TransformLayout ||
          kind == ConstraintKind::Convertible;
+}
+
+bool isSupportedUnaryLayoutConstraint(ConstraintKind kind) {
+  return kind == ConstraintKind::Ownership || kind == ConstraintKind::ResourceLimit;
+}
+
+bool matchesLayoutThreadCount(Attribute candidate, int64_t threads) {
+  auto encoding = dyn_cast_or_null<DistributedEncodingAttr>(candidate);
+  if (!encoding || threads <= 0) return false;
+  auto topology = encoding.getTopology();
+  if (topology.size() != 5 || topology[1] != 32 || topology[4] != 1) return false;
+  uint64_t count = 1;
+  for (unsigned i = 1; i <= 3; ++i) {
+    if (topology[i] <= 0 || uint64_t(topology[i]) > uint64_t(threads) / count)
+      return false;
+    count *= topology[i];
+  }
+  return count == uint64_t(threads);
+}
+
+LayoutProof proveUnaryLayoutConstraint(const LayoutConstraintGraph &graph,
+                                      const LayoutConstraint &constraint,
+                                      Attribute candidate) {
+  if (constraint.vars.size() != 1)
+    return {ProofStatus::Unknown, {}, "unary execution constraint requires one endpoint"};
+  const auto &var = graph.getVariable(constraint.vars.front());
+  if (constraint.kind == ConstraintKind::ResourceLimit)
+    return {matchesLayoutThreadCount(candidate, constraint.requiredThreads)
+                ? ProofStatus::Proven : ProofStatus::Disproven,
+            {}, "execution topology must match " + std::to_string(constraint.requiredThreads) + " threads in one CTA"};
+  auto layout = dyn_cast_or_null<DistributedEncodingAttr>(candidate);
+  auto type = dyn_cast<RankedTensorType>(var.shapedType);
+  if (constraint.kind != ConstraintKind::Ownership || !var.operationExecution || !layout || !type)
+    return {ProofStatus::Unknown, {}, "missing operation execution ownership contract"};
+  return proveExecutionOwnership(layout, type, var.operationExecution->writerPolicy);
 }
 
 bool layoutEncodingsEqual(Attribute lhs, Attribute rhs) {
@@ -139,6 +176,17 @@ FailureOr<Attribute> projectLayoutCandidate(
     const LayoutConstraintGraph &graph, const LayoutConstraint &relation,
     LayoutVarID source, Attribute candidate, LayoutVarID target) {
   const LayoutVar &dst = graph.getVariable(target);
+  if (dst.requiredThreads && !matchesLayoutThreadCount(candidate, dst.requiredThreads) &&
+      dst.kind == LayoutKind::Distributed)
+    return failure();
+  if (relation.kind == ConstraintKind::CopyAccess) {
+    auto encoding = dyn_cast<StorageLayoutAttr>(candidate);
+    const auto &src = graph.getVariable(source).storageAlias;
+    if (!encoding || !src || !dst.storageAlias) return failure();
+    auto projected = rebaseStorageCopyCandidate(*src, encoding, *dst.storageAlias);
+    if (failed(projected)) return failure();
+    return Attribute(*projected);
+  }
   if (relation.kind == ConstraintKind::AliasLayout) {
     auto encoding = dyn_cast<StorageLayoutAttr>(candidate);
     const auto &src = graph.getVariable(source).storageAlias;
@@ -174,6 +222,31 @@ bool layoutRelationCompatible(const LayoutConstraintGraph &graph,
                               LayoutVarID lhsID, Attribute lhs,
                               LayoutVarID rhsID, Attribute rhs) {
   const LayoutVar &a = graph.getVariable(lhsID), &b = graph.getVariable(rhsID);
+  if (relation.kind == ConstraintKind::CopyAccess) {
+    if (!sameLogicalType(a.shapedType, b.shapedType) || !a.storageAlias || !b.storageAlias)
+      return false;
+    (void)getStorageAliasFootprint(graph, lhsID, lhs);
+    (void)getStorageAliasFootprint(graph, rhsID, rhs);
+    const auto &x = getStorageAliasFootprint(graph, lhsID, lhs);
+    const auto &y = getStorageAliasFootprint(graph, rhsID, rhs);
+    if (x.proof.status != ProofStatus::Proven || y.proof.status != ProofStatus::Proven)
+      return false;
+    // Distinct identities are NOT a NoAlias proof: nonoverlap is the Copy
+    // caller precondition. A proven common root permits a stronger check.
+    if (x.root != y.root) return true;
+    bool identity = x.entries.size() == y.entries.size() &&
+        llvm::equal(x.entries, y.entries, [](const auto &p, const auto &q) {
+          return p.view == q.view && p.begin == q.begin && p.end == q.end;
+        });
+    if (identity) return true;
+    unsigned i = 0, j = 0;
+    while (i < x.entries.size() && j < y.entries.size()) {
+      const auto &p = x.entries[i], &q = y.entries[j];
+      if (p.begin < q.end && q.begin < p.end) return false;
+      if (p.end <= q.end) ++i; else ++j;
+    }
+    return true;
+  }
   if (relation.kind == ConstraintKind::AliasLayout)
     return proveAliasLayoutRelation(graph, lhsID, lhs, rhsID, rhs).status ==
            ProofStatus::Proven;
@@ -203,6 +276,16 @@ bool layoutRelationCompatible(const LayoutConstraintGraph &graph,
     auto d0 = dyn_cast<DistributedEncodingAttr>(lhs);
     auto d1 = dyn_cast<DistributedEncodingAttr>(rhs);
     if ((d0 && s1) || (s0 && d1)) {
+      const auto &execution = d0 ? a : b;
+      const auto &storage = d0 ? b : a;
+      if (execution.operationExecution) {
+        if (!sameLogicalType(a.shapedType, b.shapedType) || !storage.storageAlias)
+          return false;
+        const auto &contract = *execution.operationExecution;
+        const auto &footprint = getStorageAliasFootprint(graph, storage.id, d0 ? rhs : lhs);
+        return proveExecutionVectorAccess(d0 ? d0 : d1, *storage.storageAlias,
+            footprint, contract.vectorBytes, relation.access, contract.writerPolicy).status == ProofStatus::Proven;
+      }
       // Verified D covers the logical tile; verified S addresses that exact
       // domain. Therefore S(D(h)) is valid, independent of coalescing. Store
       // lowering elects a deterministic owner for replicated logical elements.

@@ -1,6 +1,24 @@
 #ifndef FRISK_LAYOUT_OPS
 #define FRISK_LAYOUT_OPS
 
+def Frisk_MmaOp : Frisk_Op<"mma", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "synchronous mathematical tensor matrix multiply-accumulate";
+  let arguments = (ins
+    AnyTypeOf<[AnyRankedTensor, AnyMemRef]>:$a,
+    AnyTypeOf<[AnyRankedTensor, AnyMemRef]>:$b,
+    AnyRankedTensor:$init,
+    I64Attr:$m, I64Attr:$n, I64Attr:$k,
+    DefaultValuedAttr<BoolAttr, "false">:$trans_a,
+    DefaultValuedAttr<BoolAttr, "false">:$trans_b,
+    DefaultValuedAttr<GemmWarpPolicyAttr,
+      "::mlir::frisk::attr::GemmWarpPolicy::Square">:$policy
+  );
+  let results = (outs AnyRankedTensor:$result);
+  let hasVerifier = 1;
+  let assemblyFormat = "$a `,` $b `,` $init attr-dict `:` type($a) `,` type($b) `,` type($init) `->` type($result)";
+}
+
 def Frisk_LayoutViewOp : Frisk_Op<"layout_view", [
     Pure,
     DeclareOpInterfaceMethods<ViewLikeOpInterface>

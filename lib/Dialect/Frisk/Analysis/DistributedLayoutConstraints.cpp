@@ -80,6 +80,9 @@ LogicalResult collectDistributedLayoutConstraints(
       if (failed(bind(operand))) return WalkResult::interrupt();
     for (Value value : op->getResults())
       if (failed(bind(value))) return WalkResult::interrupt();
+    // MMA uses role-specific joint constraints, not shape-preserving SIMD
+    // elementwise rules. Its operands/results are still bound above.
+    if (isa<MmaOp>(op)) return WalkResult::advance();
     for (Region &region : op->getRegions())
       for (Block &block : region)
         for (BlockArgument arg : block.getArguments())

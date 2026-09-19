@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cassert>
 #include <limits>
@@ -39,6 +40,37 @@ namespace mlir {
 namespace frisk {
 
 class GemmOp;
+
+static std::atomic<uint64_t> legacyParallelCalls{0};
+uint64_t getLegacyParallelInferenceCallCount() { return legacyParallelCalls.load(); }
+
+bool isSupportedExecutionThreadCount(int64_t threads) {
+  return threads == 32 || threads == 64 || threads == 128 ||
+         threads == 256 || threads == 512 || threads == 1024;
+}
+
+LogicalResult verifyOperationExecutionAttributes(Operation *op) {
+  if (auto raw = op->getAttr("frisk.execution_layout"))
+    if (!isa<DistributedEncodingAttr>(raw))
+      return op->emitOpError("frisk.execution_layout must be a distributed encoding");
+  if (auto raw = op->getAttr("frisk.writer_policy")) {
+    auto policy = dyn_cast<StringAttr>(raw);
+    if (!policy || (policy.getValue() != "all" && policy.getValue() != "first_owner"))
+      return op->emitOpError("frisk.writer_policy must be all or first_owner");
+  }
+  for (StringRef name : {"frisk.execution_threads", "frisk.vector_bytes"}) {
+    auto raw = op->getAttr(name);
+    if (!raw) continue;
+    auto value = dyn_cast<IntegerAttr>(raw);
+    if (!value || !value.getType().isSignlessInteger(64))
+      return op->emitOpError() << name << " must be an i64 attribute";
+    int64_t n = value.getInt();
+    if (name == "frisk.execution_threads" ? !isSupportedExecutionThreadCount(n)
+        : !(n == 1 || n == 2 || n == 4 || n == 8 || n == 16))
+      return op->emitOpError() << "unsupported " << name << " value " << n;
+  }
+  return success();
+}
 
 namespace {
 
@@ -926,12 +958,18 @@ ParseResult KernelOp::parse(OpAsmParser &parser, OperationState &result) {
     return failure();
   // 解析参数列表
   SmallVector<Type> argTypes;
-  if (parser.parseLParen() || parser.parseTypeList(argTypes) || parser.parseRParen())
+  if (parser.parseLParen())
+    return failure();
+  if (failed(parser.parseOptionalRParen()) &&
+      (parser.parseTypeList(argTypes) || parser.parseRParen()))
     return failure();
   // 解析结果类型 - 可选，如果没有结果就是空
   SmallVector<Type> resultTypes;
   if (succeeded(parser.parseOptionalArrow())) {
-    if (parser.parseLParen() || parser.parseTypeList(resultTypes) || parser.parseRParen())
+    if (parser.parseLParen())
+      return failure();
+    if (failed(parser.parseOptionalRParen()) &&
+        (parser.parseTypeList(resultTypes) || parser.parseRParen()))
       return failure();
   }
   // 创建函数类型属性
@@ -939,12 +977,8 @@ ParseResult KernelOp::parse(OpAsmParser &parser, OperationState &result) {
   result.addAttribute("function_type", TypeAttr::get(functionType));
   // 解析区域
   Region *body = result.addRegion();
-  SmallVector<OpAsmParser::Argument> args;
-  for (Type argType : argTypes) {
-    args.emplace_back();
-    args.back().type = argType;
-  }
-  if (parser.parseRegion(*body, args) || 
+  // Signature carries types; the printed entry block carries actual SSA names.
+  if (parser.parseRegion(*body) ||
       parser.parseOptionalAttrDict(result.attributes))
     return failure();
   return success();
@@ -967,7 +1001,7 @@ void KernelOp::print(OpAsmPrinter &p) {
   }
   // 打印区域
   p << " ";
-  p.printRegion(getRegion(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/false);
+  p.printRegion(getRegion(), /*printEntryBlockArgs=*/true, /*printBlockTerminators=*/true);
   // 打印属性
   p.printOptionalAttrDict((*this)->getAttrs(), {"sym_name", "function_type"});
 }
@@ -993,6 +1027,7 @@ ParseResult ParallelOp::parse(OpAsmParser &parser, OperationState &result) {
   SmallVector<OpAsmParser::Argument, 4> inductionVars;
   if (parser.parseArgumentList(inductionVars, AsmParser::Delimiter::Paren))
     return failure();
+  for (auto &arg : inductionVars) arg.type = parser.getBuilder().getIndexType();
   // 解析等号和范围: = (8, 8)
   if (parser.parseEqual() || parser.parseLParen())
     return failure();
@@ -1034,11 +1069,12 @@ void ParallelOp::print(OpAsmPrinter &p) {
   p << "), threads = " << getThreadNum();
   // 打印区域（不打印终止符）
   p << " ";
-  p.printRegion(getRegion(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/false);
+  p.printRegion(getRegion(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/true);
 }
 
 LogicalResult ParallelOp::inferLayout(OpBuilder &builder,
                                       DenseMap<Value, Attribute> &layoutMap) {
+  ++legacyParallelCalls;
   bool updated = false;
   auto targetInfo = detectTargetInfo(getOperation());
   int64_t threadCount = getThreadNum();
@@ -1089,6 +1125,18 @@ LogicalResult ParallelOp::inferLayout(OpBuilder &builder,
   if (walkResult.wasInterrupted())
     return failure();
   return success(updated);
+}
+
+LogicalResult ParallelOp::verify() {
+  if (!isSupportedExecutionThreadCount(getThreads()))
+    return emitOpError("threads must be one of 32,64,128,256,512,1024");
+  if (getRanges().empty() || llvm::any_of(getRanges(), [](int64_t n) { return n <= 0; }))
+    return emitOpError("ranges must contain positive static extents");
+  if (getRegion().empty() || getRegion().front().getNumArguments() != getRanges().size())
+    return emitOpError("range count must match the region induction arguments");
+  for (auto arg : getRegion().front().getArguments())
+    if (!arg.getType().isIndex()) return emitOpError("induction arguments must have index type");
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -1598,17 +1646,17 @@ ParseResult CopyOp::parse(OpAsmParser &parser, OperationState &result) {
   OpAsmParser::UnresolvedOperand srcMemrefInfo;
   AffineMapAttr srcMapAttr;
   SmallVector<OpAsmParser::UnresolvedOperand, 4> srcMapOperands;
-  if (parser.parseOperand(srcMemrefInfo) || parser.parseLSquare() ||
+  if (parser.parseOperand(srcMemrefInfo) ||
       parser.parseAffineMapOfSSAIds(srcMapOperands, srcMapAttr, "srcMap", result.attributes) ||
-      parser.parseRSquare() || parser.parseComma())
+      parser.parseComma())
     return failure();
   // 解析目标操作数和索引
   OpAsmParser::UnresolvedOperand dstMemrefInfo;
   AffineMapAttr dstMapAttr;
   SmallVector<OpAsmParser::UnresolvedOperand, 4> dstMapOperands;
-  if (parser.parseOperand(dstMemrefInfo) || parser.parseLSquare() ||
+  if (parser.parseOperand(dstMemrefInfo) ||
       parser.parseAffineMapOfSSAIds(dstMapOperands, dstMapAttr, "dstMap", result.attributes) ||
-      parser.parseRSquare())
+      parser.parseOptionalAttrDict(result.attributes))
     return failure();
   // 解析类型信息
   SmallVector<Type, 2> memrefTypes;
@@ -1620,9 +1668,6 @@ ParseResult CopyOp::parse(OpAsmParser &parser, OperationState &result) {
   auto dstType = dyn_cast<MemRefType>(memrefTypes[1]);
   if (!srcType || !dstType)
     return parser.emitError(parser.getNameLoc(), "expected memref types");
-  // 解析可选的属性字典，但要排除 operandSegmentSizes
-  if (parser.parseOptionalAttrDict(result.attributes))
-    return failure();
   // 解析操作数
   if (parser.resolveOperand(srcMemrefInfo, srcType, result.operands) ||
       parser.resolveOperand(dstMemrefInfo, dstType, result.operands) ||
@@ -1642,32 +1687,24 @@ ParseResult CopyOp::parse(OpAsmParser &parser, OperationState &result) {
 
 void CopyOp::print(OpAsmPrinter &p) {
   p << " " << getSrcMemRef() << "[";
-  // 打印源映射和操作数
-  if (AffineMapAttr srcMapAttr = (*this)->getAttrOfType<AffineMapAttr>("srcMap")) {
-    p.printAffineMapOfSSAIds(srcMapAttr, getSrcIndices());
-  }
+  p.printAffineMapOfSSAIds(getSrcMapAttr(), getSrcIndices());
   p << "], " << getDstMemRef() << "[";
-  // 打印目标映射和操作数
-  if (AffineMapAttr dstMapAttr = (*this)->getAttrOfType<AffineMapAttr>("dstMap")) {
-    p.printAffineMapOfSSAIds(dstMapAttr, getDstIndices());
-  }
-  auto srcExtentsAttr = getSrcExtentsAttr();
-  auto dstExtentsAttr = getDstExtentsAttr();
-  p << "] {src_extents = [";
-  llvm::interleaveComma(srcExtentsAttr.asArrayRef(), p);
-  p << "], dst_extents = [";
-  llvm::interleaveComma(dstExtentsAttr.asArrayRef(), p);
-  p << "]} ";
-  
-  // 打印属性字典，但要排除已打印的映射属性和 operandSegmentSizes
-  SmallVector<StringRef> elidedAttrs = { "srcMap", "dstMap", "srcExtents", "dstExtents",
+  p.printAffineMapOfSSAIds(getDstMapAttr(), getDstIndices());
+  p << "]";
+  // ODS properties are not necessarily in getAttrs(). Preserve both extents
+  // explicitly, using the same dictionary spelling consumed by the parser.
+  NamedAttrList attrs((*this)->getAttrs());
+  attrs.set("srcExtents", getSrcExtentsAttr());
+  attrs.set("dstExtents", getDstExtentsAttr());
+  SmallVector<StringRef> elidedAttrs = { "srcMap", "dstMap",
       CopyOp::getOperandSegmentSizesAttrName((*this)->getName()).getValue()
   };
-  p.printOptionalAttrDict((*this)->getAttrs(), elidedAttrs);
+  p.printOptionalAttrDict(attrs.getAttrs(), elidedAttrs);
   p << " : " << getSrcMemRef().getType() << ", " << getDstMemRef().getType();
 }
 
 LogicalResult CopyOp::verify() {
+  if (failed(verifyOperationExecutionAttributes(*this))) return failure();
   AffineMap srcMap = getSrcMap();
   AffineMap dstMap = getDstMap();
   // 正确：srcIndices 长度必须等于 srcMap 输入维度
@@ -1687,6 +1724,7 @@ LogicalResult CopyOp::verify() {
 // -- FillOp --
 //===----------------------------------------------------------------------===//
 LogicalResult FillOp::verify() {
+  if (failed(verifyOperationExecutionAttributes(*this))) return failure();
   auto memrefType = dyn_cast<MemRefType>(getMemref().getType());
   auto elemType = memrefType.getElementType();
   auto valueAttr = getValueAttr();

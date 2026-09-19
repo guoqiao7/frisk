@@ -7,6 +7,56 @@
 
 namespace mlir::frisk {
 
+void MmaOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  for (OpOperand &operand : getOperation()->getOpOperands())
+    if (isa<MemRefType>(operand.get().getType()))
+      effects.emplace_back(MemoryEffects::Read::get(), &operand,
+                           SideEffects::DefaultResource::get());
+}
+
+LogicalResult MmaOp::verify() {
+  if (getMAttr().getInt() <= 0 || getNAttr().getInt() <= 0 || getKAttr().getInt() <= 0)
+    return emitOpError("mma-shape: m/n/k must be positive signless i64");
+  auto a = cast<ShapedType>(getA().getType());
+  auto b = cast<ShapedType>(getB().getType());
+  auto init = cast<RankedTensorType>(getInit().getType());
+  auto result = cast<RankedTensorType>(getResult().getType());
+  for (ShapedType type : {a, b, ShapedType(init), ShapedType(result)}) {
+    if (type.getRank() != 2 || !type.hasStaticShape() ||
+        llvm::any_of(type.getShape(), [](int64_t e) { return e <= 0; }) ||
+        !isa<FloatType>(type.getElementType()))
+      return emitOpError("mma-shape: requires positive static rank-2 floating matrices");
+  }
+  if (a.getElementType() != b.getElementType() ||
+      init.getElementType() != result.getElementType() ||
+      init.getElementTypeBitWidth() < a.getElementTypeBitWidth())
+    return emitOpError("mma-shape: incompatible input/accumulator element types");
+  if (a.getDimSize(getTransA() ? 1 : 0) != getM() ||
+      a.getDimSize(getTransA() ? 0 : 1) != getK() ||
+      b.getDimSize(getTransB() ? 1 : 0) != getK() ||
+      b.getDimSize(getTransB() ? 0 : 1) != getN() ||
+      init.getShape() != ArrayRef<int64_t>({getMAttr().getInt(), getNAttr().getInt()}) ||
+      result.getShape() != init.getShape())
+    return emitOpError("mma-shape: matrix extents disagree with m/n/k and transpose");
+  for (ShapedType type : {a, b, ShapedType(init), ShapedType(result)}) {
+    auto tensor = dyn_cast<RankedTensorType>(type);
+    if (!tensor || !tensor.getEncoding()) continue;
+    auto encoding = dyn_cast<DistributedEncodingAttr>(tensor.getEncoding());
+    if (!encoding)
+      return emitOpError("mma-shape: tensor carrier encoding must be DistributedEncodingAttr");
+    if (failed(encoding.verifyForType(tensor, getLoc()))) return failure();
+  }
+  if (Attribute binding = (*this)->getAttr("frisk.mma_contract"))
+    if (!isa<MmaInstructionContractAttr>(binding))
+      return emitOpError("mma-joint-contract: expected typed complete MMA contract");
+  if (Attribute threads = (*this)->getAttr("frisk.execution_threads")) {
+    auto integer = dyn_cast<IntegerAttr>(threads);
+    if (!integer || !integer.getType().isSignlessInteger(64) || integer.getInt() <= 0)
+      return emitOpError("sm90-mma-thread-group: expected positive signless i64 threads");
+  }
+  return success();
+}
+
 namespace {
 
 bool isIdentityStorageLayout(StorageLayoutAttr layout, MemRefType type) {

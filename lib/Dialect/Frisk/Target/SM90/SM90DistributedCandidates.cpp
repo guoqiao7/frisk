@@ -23,7 +23,8 @@ void enumerateSM90DistributedCandidates(
   }
   if (logicalBits >= 58) return;
   for (unsigned family = 0; family < 4; ++family) {
-    unsigned laneBits = 5, warpBits = family == 2 ? 2 : 0;
+    unsigned laneBits = 5, warpBits = var.requiredThreads
+        ? llvm::Log2_64(var.requiredThreads / 32) : family == 2 ? 2 : 0;
     unsigned regBits = family == 3 ? logicalBits :
         (logicalBits > laneBits + warpBits ? logicalBits - laneBits - warpBits : 0);
     unsigned columns = regBits + laneBits + warpBits;

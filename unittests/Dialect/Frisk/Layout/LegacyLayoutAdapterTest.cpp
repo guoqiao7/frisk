@@ -2,6 +2,7 @@
 #include "Dialect/Frisk/IR/FriskAttributes.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
+#include "Dialect/Frisk/Target/SM90/SM90GemmConstraints.h"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -136,6 +137,33 @@ TEST_F(LegacyLayoutAdapterTest, ConvertsCurrentSm90RsBaseline) {
       baseline->b, *b, baseline->bType, loc)));
   EXPECT_TRUE(succeeded(verifyLegacyDistributedEquivalent(
       baseline->c, *c, baseline->cType, loc)));
+}
+
+TEST_F(LegacyLayoutAdapterTest, ClassifiesLegacyRsReplicationAgainstInstructionContract) {
+  auto baseline = buildSm90Layouts(attr::MemorySpace::Local);
+  ASSERT_TRUE(succeeded(baseline));
+  Location loc = UnknownLoc::get(&context);
+  auto oldA = convertLegacyDistributed(baseline->a, baseline->aType, loc);
+  ASSERT_TRUE(succeeded(oldA));
+  ASSERT_TRUE(succeeded(verifyLegacyDistributedEquivalent(
+      baseline->a, *oldA, baseline->aType, loc)));
+  // Preserve the old behavior as an oracle, but do not turn its duplicated
+  // Local-MemRef carrier into the new 128-thread RS instruction contract.
+  EXPECT_EQ(oldA->getReplication().getInt(), 2);
+  SM90MmaGeometry geometry{128, 128, 64, 128, 1, 1, 128, 2, 1, 4};
+  auto tensor = RankedTensorType::get({128, 64}, Float16Type::get(&context));
+  EXPECT_EQ(verifySM90MmaFragment(geometry, true, false, tensor, *oldA).status,
+            ProofStatus::Disproven);
+  auto current = buildSM90MmaFragment(&context, geometry, true, false);
+  ASSERT_TRUE(succeeded(current));
+  EXPECT_EQ(current->getReplication().getInt(), 1);
+  EXPECT_EQ(verifySM90MmaFragment(geometry, true, false, tensor, *current).status,
+            ProofStatus::Proven);
+  // Storage address equivalence remains independently checked, not Attr==.
+  auto oldB = convertLegacyStorage(baseline->b, baseline->bType, loc);
+  ASSERT_TRUE(succeeded(oldB));
+  EXPECT_TRUE(succeeded(verifyLegacyStorageEquivalent(
+      baseline->b, *oldB, baseline->bType, loc)));
 }
 
 TEST_F(LegacyLayoutAdapterTest, RejectsUnsupportedLegacyLayouts) {

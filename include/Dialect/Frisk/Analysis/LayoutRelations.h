@@ -3,6 +3,11 @@
 #include "Dialect/Frisk/Analysis/LayoutConstraint.h"
 namespace mlir::frisk {
 bool isSupportedLayoutRelation(ConstraintKind kind);
+bool isSupportedUnaryLayoutConstraint(ConstraintKind kind);
+LayoutProof proveUnaryLayoutConstraint(const LayoutConstraintGraph &graph,
+                                      const LayoutConstraint &constraint,
+                                      Attribute candidate);
+bool matchesLayoutThreadCount(Attribute encoding, int64_t threads);
 bool layoutEncodingsEqual(Attribute lhs, Attribute rhs);
 bool layoutRelationCompatible(const LayoutConstraintGraph &graph,
                               const LayoutConstraint &relation,

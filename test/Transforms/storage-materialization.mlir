@@ -167,11 +167,14 @@ module {
 // CHECK: frisk.copy
 // CHECK-LABEL: func.func @materialize_non_default_copy
 // CHECK: memory_space = #frisk<memory_space Global>
-// CHECK: output_extents = [16, 8]{{.*}}memory_space = #frisk<memory_space Shared>
+// Rebased Copy proposals use the destination descriptor's proven capacity:
+// offsets 0,4,8,12 with 2-byte elements require a 14-byte accessible span.
+// CHECK: output_extents = [14, 8]{{.*}}memory_space = #frisk<memory_space Shared>
 // CHECK: frisk.copy
 // CHECK-LABEL: func.func @materialize_arbitrary_2d_seed
 // CHECK: memory_space = #frisk<memory_space Global>
-// CHECK: output_extents = [160, 8]{{.*}}memory_space = #frisk<memory_space Shared>
+// The 4x4 destination's last element is at byte 132 (2 bytes), not a new 160-byte allocation.
+// CHECK: output_extents = [134, 8]{{.*}}memory_space = #frisk<memory_space Shared>
 // CHECK: frisk.copy
 // CHECK: module @left
 // CHECK: func.func @same

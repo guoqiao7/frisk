@@ -53,6 +53,8 @@ StringRef stringifyConstraintKind(ConstraintKind kind) {
     return "instruction-contract";
   case ConstraintKind::StorageAccess:
     return "storage-access";
+  case ConstraintKind::CopyAccess:
+    return "copy-access";
   case ConstraintKind::AliasLayout:
     return "alias-layout";
   case ConstraintKind::Ownership:
@@ -203,6 +205,18 @@ LogicalResult LayoutConstraintGraph::verifyInvariants(Location loc) const {
     if (!var.shapedType || !isa<ShapedType>(var.shapedType))
       return emitError(loc) << "layout variable '" << var.stableName
                             << "' does not have a shaped type";
+    if (var.operationExecution) {
+      const auto &binding = *var.operationExecution;
+      auto name = var.anchor ? var.anchor->getName().getStringRef() : StringRef();
+      if (var.kind != LayoutKind::Distributed || !isa<RankedTensorType>(var.shapedType) ||
+          var.value || var.use || var.functionResult ||
+          (name != "frisk.copy" && name != "frisk.fill") ||
+          binding.threads != var.requiredThreads ||
+          (binding.writerPolicy != "all" && binding.writerPolicy != "first_owner") ||
+          !(binding.vectorBytes == 1 || binding.vectorBytes == 2 || binding.vectorBytes == 4 ||
+            binding.vectorBytes == 8 || binding.vectorBytes == 16))
+        return emitError(loc) << "invalid operation execution binding";
+    }
     if (var.storageAlias) {
       const auto &alias = *var.storageAlias;
       if (var.kind != LayoutKind::Storage || !alias.root || !alias.rootType ||
@@ -221,6 +235,7 @@ LogicalResult LayoutConstraintGraph::verifyInvariants(Location loc) const {
     if ((constraint.kind == ConstraintKind::Convertible ||
          constraint.kind == ConstraintKind::TransformLayout ||
          constraint.kind == ConstraintKind::StorageAccess ||
+         constraint.kind == ConstraintKind::CopyAccess ||
          constraint.kind == ConstraintKind::AliasLayout) &&
         constraint.vars.size() != 2)
       return emitError(loc) << "binary layout relation requires two endpoints";
@@ -241,6 +256,62 @@ LogicalResult LayoutConstraintGraph::verifyInvariants(Location loc) const {
                               << id;
     if (constraint.provenance >= provenances.size())
       return emitError(loc) << "layout constraint has invalid provenance";
+    if (constraint.instruction) {
+      const auto &instruction = *constraint.instruction;
+      if (constraint.kind != ConstraintKind::InstructionContract ||
+          constraint.vars.size() != 4 || !instruction.source ||
+          provenances[constraint.provenance].source != instruction.source ||
+          instruction.tuples.size() > 256)
+        return emitError(loc) << "invalid instruction role count, source or tuple budget";
+      SmallVector<SmallVector<Attribute>> seen;
+      for (const auto &tuple : instruction.tuples) {
+        if (tuple.encodings.size() != constraint.vars.size() || !tuple.binding ||
+            llvm::is_contained(tuple.encodings, Attribute()) ||
+            (instruction.binding && instruction.binding != tuple.binding) ||
+            llvm::is_contained(seen, tuple.encodings))
+          return emitError(loc) << "invalid or duplicate instruction tuple binding";
+        seen.push_back(tuple.encodings);
+        for (unsigned i = 0; i < constraint.vars.size(); ++i)
+          for (unsigned j = 0; j < i; ++j)
+            if (constraint.vars[i] == constraint.vars[j] &&
+                tuple.encodings[i] != tuple.encodings[j])
+              return emitError(loc) << "instruction repeated endpoint has inconsistent encodings";
+      }
+      // The concrete MMA roles refer to actual operands/results, not synthetic
+      // independent values. Avoid an Analysis -> FriskIR library dependency.
+      Operation *op = instruction.source;
+      if (op->getName().getStringRef() == "frisk.mma") {
+        if (op->getNumOperands() != 3 || op->getNumResults() != 1)
+          return emitError(loc) << "invalid MMA operation arity";
+        for (unsigned role = 0; role < 4; ++role) {
+          const auto &var = variables[constraint.vars[role]];
+          Value value = role == 3 ? op->getResult(0) : op->getOperand(role);
+          bool tensor = isa<RankedTensorType>(value.getType());
+          bool use = tensor && role < 3;
+          if (var.kind != (tensor ? LayoutKind::Distributed : LayoutKind::Storage) ||
+              var.shapedType != value.getType() || !var.instructionRole ||
+              (use ? var.use != &op->getOpOperand(role) : var.value != value))
+            return emitError(loc) << "MMA instruction role does not match its actual SSA binding";
+        }
+        if (instruction.binding != op->getAttr("frisk.mma_contract"))
+          return emitError(loc) << "MMA instruction binding differs from actual operation attribute";
+      }
+    }
+    if (constraint.kind == ConstraintKind::Ownership || constraint.kind == ConstraintKind::ResourceLimit) {
+      if (constraint.vars.size() != 1 || variables[constraint.vars[0]].kind != LayoutKind::Distributed)
+        return emitError(loc) << "execution unary constraint requires one distributed endpoint";
+      const auto &var = variables[constraint.vars[0]];
+      if (constraint.kind == ConstraintKind::Ownership && !var.operationExecution)
+        return emitError(loc) << "ownership requires an actual operation binding";
+      int64_t threads = constraint.requiredThreads;
+      if (constraint.kind == ConstraintKind::ResourceLimit &&
+          (threads < 32 || threads > 1024 || (threads & (threads - 1)) || var.requiredThreads != threads))
+        return emitError(loc) << "invalid resource thread count or variable environment";
+    }
+    if (constraint.kind == ConstraintKind::CopyAccess &&
+        (variables[constraint.vars[0]].kind != LayoutKind::Storage ||
+         variables[constraint.vars[1]].kind != LayoutKind::Storage))
+      return emitError(loc) << "copy-access requires two storage endpoints";
     if (constraint.kind == ConstraintKind::AliasLayout) {
       const auto &lhs = variables[constraint.vars[0]];
       const auto &rhs = variables[constraint.vars[1]];
@@ -396,6 +467,10 @@ LayoutConstraintGraph::lookupVariable(Value value) const {
 void LayoutConstraintGraph::print(raw_ostream &os) const {
   for (const LayoutVar &var : variables) {
     os << "var " << var.id << " " << var.stableName << "\n";
+    if (var.operationExecution)
+      os << "operation-execution " << var.id << " threads=" << var.operationExecution->threads
+         << " writer=" << var.operationExecution->writerPolicy
+         << " vector-bytes=" << var.operationExecution->vectorBytes << "\n";
     if (var.storageAlias)
       os << "alias-endpoint " << var.id << " root=" << var.storageAlias->rootKey
          << " transform=" << var.storageAlias->viewToRoot << " bits=["

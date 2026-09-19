@@ -23,6 +23,22 @@ public:
                                         Location loc) const = 0;
   virtual FailureOr<CostVector>
   evaluate(const CandidateAssignment &assignment) const = 0;
+
+  virtual LogicalResult
+  prepareInstructionCandidates(LayoutConstraintGraph &graph) const {
+    for (const auto &constraint : graph.getConstraints())
+      if (constraint.kind == ConstraintKind::InstructionContract)
+        return failure();
+    return success();
+  }
+  virtual FailureOr<Attribute> buildInstructionContract(
+      const LayoutConstraintGraph &, const LayoutConstraint &,
+      ArrayRef<Attribute>) const { return failure(); }
+  virtual LayoutProof verifyInstructionContract(
+      const LayoutConstraintGraph &, const LayoutConstraint &,
+      ArrayRef<Attribute>, Attribute) const {
+    return {ProofStatus::Unknown, {}, "unsupported instruction contract"};
+  }
 };
 
 } // namespace mlir::frisk

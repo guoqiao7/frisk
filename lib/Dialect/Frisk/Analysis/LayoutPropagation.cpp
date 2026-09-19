@@ -1,5 +1,8 @@
 #include "Dialect/Frisk/Analysis/LayoutSolver.h"
+#include "Dialect/Frisk/Analysis/OperationLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
+#include "Dialect/Frisk/Analysis/InstructionLayoutConstraints.h"
+#include "Dialect/Frisk/Analysis/MmaLayoutConstraints.h"
 
 #include <functional>
 #include <deque>
@@ -107,22 +110,6 @@ LogicalResult applyEqualityConstraint(LayoutConstraintGraph &graph,
 bool isEqualityConstraint(ConstraintKind kind) {
   return isSupportedLayoutRelation(kind);
 }
-
-bool isWholeTileStaticCopy(CopyOp copy) {
-  MemRefType srcType = copy.getSrcMemRefType();
-  MemRefType dstType = copy.getDstMemRefType();
-  return srcType.hasStaticShape() && dstType.hasStaticShape() &&
-         srcType.getShape() == copy.getSrcExtents() &&
-         dstType.getShape() == copy.getDstExtents() &&
-         srcType.getShape() == dstType.getShape() &&
-         srcType.getElementType() == dstType.getElementType() &&
-         copy.getSrcIndices().empty() && copy.getDstIndices().empty() &&
-         copy.getSrcMap().getNumInputs() == 0 &&
-         copy.getDstMap().getNumInputs() == 0 &&
-         copy.getSrcMap().getNumResults() == 0 &&
-         copy.getDstMap().getNumResults() == 0;
-}
-
 
 } // namespace
 
@@ -270,6 +257,18 @@ LayoutVarID LayoutConstraintBuilder::getOrCreateDistributedUse(OpOperand &use) {
   return dst;
 }
 
+LayoutVarID LayoutConstraintBuilder::createOperationExecutionVar(
+    Operation *op, RankedTensorType type, OperationExecutionBinding binding) {
+  // Copy/Fill always have a memory operand; use its actual operation position
+  // but a distinct role, never an invented Tensor Value.
+  auto id = graph.addVariable(LayoutKind::Distributed, type,
+      getStableUseKey(op->getOpOperand(0)) + "/execution", op);
+  auto &var = graph.getVariable(id);
+  var.operationExecution = std::move(binding);
+  var.requiredThreads = var.operationExecution->threads;
+  return id;
+}
+
 LogicalResult LayoutConstraintBuilder::convertible(
     LayoutVarID src, LayoutVarID dst, OpOperand &use, bool existing) {
   auto id = graph.addConstraint(ConstraintKind::Convertible,
@@ -398,39 +397,19 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
                 graph.getVariable(ids[i]).storageAlias->rootKey);
   }
 
-  root->walk([&](CopyOp copy) {
-    if (!isWholeTileStaticCopy(copy)) {
-      copy.emitOpError(
-          "unsupported storage layout inference for non-whole-tile or "
-          "dynamic copy");
-      failedCollection = true;
-      return;
-    }
-    if (!copy.getSrc().getDefiningOp<LayoutViewOp>() ||
-        !copy.getDst().getDefiningOp<LayoutViewOp>()) {
-      copy.emitOpError(
-          "M2 storage layout inference requires whole-tile copy operands "
-          "to be layout_view results");
-      failedCollection = true;
-      return;
-    }
-    LayoutVarID src = builder.getOrCreateStorageVar(copy.getSrc());
-    LayoutVarID dst = builder.getOrCreateStorageVar(copy.getDst());
-    graph.addConstraint(ConstraintKind::StorageAccess,
-                        ConstraintStrength::Hard, {src, dst}, copy,
-                        "whole-tile-copy",
-                        "source and destination storage maps must agree");
-    graph.addConstraint(ConstraintKind::Preference,
-                        ConstraintStrength::Soft, {src, dst}, copy,
-                        "coalesced-copy", "prefer coalesced storage access");
-  });
+  failedCollection |= failed(collectOperationLayoutConstraints(root, graph, builder));
   failedCollection |= failed(collectDistributedLayoutConstraints(root, graph, builder));
+  failedCollection |= failed(collectMmaLayoutConstraints(root, graph, builder));
+  failedCollection |= failed(collectParallelResourceConstraints(graph));
   if (failedCollection)
     return failure();
   if (failed(graph.finalize(root->getLoc())))
     return failure();
   if (mode == LayoutCollectionMode::RelationsOnly)
     return graph;
+
+  if (failed(target.prepareInstructionCandidates(graph)))
+    return failure();
 
   if (failed(initializeStorageAliasCandidates(root, graph, target)))
     return failure();
@@ -489,7 +468,7 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
   // from spuriously overflowing the bootstrap domain limit.
   projectCandidatesToFixedPoint();
   for (LayoutVar &var : graph.getVariables()) {
-    if (!var.candidates.empty() || var.kind == LayoutKind::Storage)
+    if (!var.candidates.empty() || var.kind == LayoutKind::Storage || var.instructionRole)
       continue;
     SmallVector<LayoutCandidate> candidates;
     target.enumerateCandidates(var, candidates);
@@ -527,6 +506,8 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
       return failure();
     }
   }
+  if (failed(prepareInstructionTuples(graph, target, root->getLoc())))
+    return failure();
   return graph;
 }
 
@@ -549,7 +530,8 @@ static LogicalResult runPropagationWorklist(LayoutConstraintGraph &graph,
   };
   for (const auto &relation : graph.getConstraints()) {
     if (relation.strength != ConstraintStrength::Hard ||
-        !(isEqualityConstraint(relation.kind) ||
+        !(isEqualityConstraint(relation.kind) || isSupportedUnaryLayoutConstraint(relation.kind) ||
+          relation.kind == ConstraintKind::InstructionContract ||
           (strict && relation.kind == ConstraintKind::RequireEncoding)))
       continue;
     enqueue(relation.id);
@@ -571,7 +553,9 @@ static LogicalResult runPropagationWorklist(LayoutConstraintGraph &graph,
     ++stats.queuePops;
     const auto &relation = graph.getConstraint(id);
     bool require = relation.kind == ConstraintKind::RequireEncoding;
-    if (strict && !require &&
+    bool unary = isSupportedUnaryLayoutConstraint(relation.kind);
+    bool instruction = relation.kind == ConstraintKind::InstructionContract;
+    if (strict && !require && !unary && !instruction &&
         llvm::none_of(relation.vars, [&](LayoutVarID var) {
           return graph.getVariable(var).candidates.size() == 1;
         }))
@@ -581,14 +565,32 @@ static LogicalResult runPropagationWorklist(LayoutConstraintGraph &graph,
       if (llvm::none_of(before, [&](auto entry) { return entry.first == var; }))
         before.emplace_back(var, graph.getVariable(var).candidates.size());
     LogicalResult result = success();
-    if (require) {
+    if (instruction) {
+      for (auto [varID, unusedSize] : before) {
+        auto &var = graph.getVariable(varID);
+        llvm::erase_if(var.candidates, [&](const auto &candidate) {
+          DenseMap<LayoutVarID, Attribute> assignment;
+          assignment[varID] = candidate.value;
+          return !findInstructionSupport(graph, relation, assignment);
+        });
+        updateState(var);
+        if (var.state == LayoutState::Conflict) result = failure();
+      }
+      if (failed(result)) result = emitConflict(graph, relation);
+    } else if (require || unary) {
       auto &var = graph.getVariable(relation.vars.front());
+      std::string reason;
       llvm::erase_if(var.candidates, [&](const auto &candidate) {
-        return candidate.value != relation.requiredEncoding;
+        if (require) return candidate.value != relation.requiredEncoding;
+        auto proof = proveUnaryLayoutConstraint(graph, relation, candidate.value);
+        if (proof.status != ProofStatus::Proven) reason = proof.reason;
+        return proof.status != ProofStatus::Proven;
       });
       updateState(var);
-      if (var.state == LayoutState::Conflict)
+      if (var.state == LayoutState::Conflict) {
+        if (!reason.empty() && var.anchor) var.anchor->emitRemark() << reason;
         result = emitConflict(graph, relation);
+      }
     } else {
       bool changed = false;
       result = applyEqualityConstraint(graph, relation, changed);

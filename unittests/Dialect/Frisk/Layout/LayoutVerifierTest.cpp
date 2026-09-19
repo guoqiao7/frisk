@@ -91,9 +91,9 @@ TEST_F(LayoutVerifierTest, RejectsUnsupportedHardConstraint) {
   LayoutVarID id = graph.addVariable(LayoutKind::Storage, type, "only");
   graph.getVariable(id).candidates = {{a, kInvalidProvenanceID, 0}};
   graph.getVariable(id).state = LayoutState::Resolved;
-  graph.addConstraint(ConstraintKind::ResourceLimit,
+  graph.addConstraint(ConstraintKind::InstructionContract,
                       ConstraintStrength::Hard, {id}, nullptr, "capacity",
-                      "unsupported bootstrap resource limit");
+                      "unsupported bootstrap instruction contract");
   ASSERT_TRUE(succeeded(graph.finalize(loc)));
 
   EXPECT_TRUE(failed(solveBootstrapLayoutGraph(graph, target)));

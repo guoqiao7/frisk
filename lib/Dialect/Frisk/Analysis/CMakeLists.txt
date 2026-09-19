@@ -19,12 +19,16 @@ add_frisk_library(FriskLegacyLayoutAdapter
 )
 
 add_frisk_library(FriskLayoutAnalysis
+  InstructionLayoutConstraints.cpp
+  MmaLayoutConstraints.cpp
+  ExecutionLayoutProof.cpp
   LayoutAliasAnalysis.cpp
   StorageAliasCandidates.cpp
   LayoutPropagation.cpp
   LayoutVerifier.cpp
   LayoutRelations.cpp
   DistributedLayoutConstraints.cpp
+  OperationLayoutConstraints.cpp
 
   LINK_LIBS PUBLIC
   FriskAnalysis

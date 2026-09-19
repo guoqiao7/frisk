@@ -42,6 +42,9 @@ LayoutProof proveStorageAliasFootprints(const StorageAliasFootprint &a,
                                         const StorageAliasFootprint &b);
 
 FailureOr<StorageAliasInfo> analyzeStorageAlias(Value endpoint);
+/// Checked coordinate evaluation shared by alias and execution proofs.
+FailureOr<SmallVector<int64_t>> evaluateStorageViewCoordinates(
+    const StorageAliasInfo &info, ArrayRef<int64_t> point);
 LayoutProof verifyStorageAliasCandidate(const StorageAliasInfo &info,
                                         StorageLayoutAttr candidate);
 LayoutProof proveStorageAliasCompatible(const StorageAliasInfo &a,
@@ -54,5 +57,10 @@ FailureOr<StorageLayoutAttr> projectStorageAliasCandidate(
     const StorageAliasInfo &destination);
 FailureOr<StorageLayoutAttr>
 buildRootLinearStorageCandidate(const StorageAliasInfo &rootInfo);
+/// Finite Copy suggestion, rebased to the destination descriptor origin.
+/// This is not an alias proof or a hard equality between independent roots.
+FailureOr<StorageLayoutAttr> rebaseStorageCopyCandidate(
+    const StorageAliasInfo &source, StorageLayoutAttr candidate,
+    const StorageAliasInfo &destination);
 } // namespace mlir::frisk
 #endif

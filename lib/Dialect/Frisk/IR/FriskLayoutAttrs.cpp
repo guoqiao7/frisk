@@ -13,6 +13,78 @@
 #include "mlir/IR/DialectImplementation.h"
 
 namespace mlir::frisk {
+LogicalResult MmaDescriptorPlanAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, DictionaryAttr p) {
+  if (!p || p.size() != 5)
+    return emitError() << "mma descriptor requires exactly major/swizzle/leading/stride/entries";
+  auto major = p.getAs<StringAttr>("major");
+  auto swizzle = p.getAs<IntegerAttr>("swizzle");
+  auto leading = p.getAs<IntegerAttr>("leading");
+  auto stride = p.getAs<IntegerAttr>("stride");
+  auto entries = p.getAs<DenseI64ArrayAttr>("entries");
+  if (!major || (major.getValue() != "k" && major.getValue() != "mn") ||
+      !swizzle || !leading || !stride || !entries ||
+      !swizzle.getType().isSignlessInteger(64) ||
+      !leading.getType().isSignlessInteger(64) || !stride.getType().isSignlessInteger(64))
+    return emitError() << "mma descriptor has invalid field types or major";
+  int64_t sw = swizzle.getInt();
+  if (sw != 0 && sw != 32 && sw != 64 && sw != 128)
+    return emitError() << "mma descriptor swizzle must be 0/32/64/128 bytes";
+  for (int64_t offset : {leading.getInt(), stride.getInt()})
+    if (offset < 0 || offset >= 262144 || offset % 16)
+      return emitError() << "mma descriptor offset is not 16-byte encodable";
+  if (entries.empty() || entries.size() % 4 || entries.size() > 65536)
+    return emitError() << "mma descriptor entries must be bounded (mn,k,start,phase) tuples";
+  std::pair<int64_t, int64_t> previous{-1, -1};
+  auto values = entries.asArrayRef();
+  for (size_t i = 0; i < values.size(); i += 4) {
+    std::pair<int64_t, int64_t> key{values[i], values[i+1]};
+    if (key.first < 0 || key.second < 0 || key <= previous ||
+        values[i+2] < 0 || values[i+2] >= 262144 || values[i+2] % 16 ||
+        values[i+3] < 0 || values[i+3] > 7 || (!sw && values[i+3]))
+      return emitError() << "mma descriptor entries must be ordered, unique and encodable";
+    previous = key;
+  }
+  return success();
+}
+
+LogicalResult MmaInstructionContractAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, DictionaryAttr p) {
+  if (!p) return emitError() << "mma contract requires a dictionary";
+  auto version = p.getAs<IntegerAttr>("version");
+  auto target = p.getAs<StringAttr>("target");
+  auto form = p.getAs<StringAttr>("form");
+  auto input = p.getAs<TypeAttr>("input_type");
+  auto accum = p.getAs<TypeAttr>("accumulator_type");
+  auto atom = p.getAs<DenseI64ArrayAttr>("atom");
+  auto grid = p.getAs<DenseI64ArrayAttr>("grid");
+  auto repeats = p.getAs<DenseI64ArrayAttr>("repeats");
+  auto packing = p.getAs<StringAttr>("packing");
+  auto b = p.getAs<MmaDescriptorPlanAttr>("b_descriptor");
+  bool ss = form && form.getValue() == "ss";
+  if (!version || !version.getType().isSignlessInteger(64) || version.getInt() != 1 ||
+      !target || target.getValue().empty() || !form ||
+      (!ss && form.getValue() != "rs") || !input || !accum ||
+      !isa<FloatType>(input.getValue()) || !isa<FloatType>(accum.getValue()) ||
+      !atom || atom.size() != 3 || !grid || grid.size() != 2 ||
+      !repeats || repeats.size() != 3 || !packing || !b ||
+      p.size() != (ss ? 11u : 10u) ||
+      (ss && !p.getAs<MmaDescriptorPlanAttr>("a_descriptor")))
+    return emitError() << "mma contract requires complete v1 typed schema";
+  for (DenseI64ArrayAttr values : {atom, grid, repeats})
+    if (llvm::any_of(values.asArrayRef(), [](int64_t v) { return v <= 0; }))
+      return emitError() << "mma contract dimensions must be positive";
+  if ((ss && packing.getValue() != "none") ||
+      (!ss && packing.getValue() != "f16x2-low-high"))
+    return emitError() << "mma contract packing disagrees with form";
+  if (failed(MmaDescriptorPlanAttr::verify(emitError, b.getPayload())))
+    return failure();
+  if (ss && failed(MmaDescriptorPlanAttr::verify(emitError,
+                 p.getAs<MmaDescriptorPlanAttr>("a_descriptor").getPayload())))
+    return failure();
+  return success();
+}
+
 namespace {
 
 ParseResult parseI64List(AsmParser &parser, DenseI64ArrayAttr &result) {

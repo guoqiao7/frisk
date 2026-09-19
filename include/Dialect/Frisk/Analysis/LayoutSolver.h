@@ -22,6 +22,8 @@ public:
   LogicalResult same(LayoutVarID lhs, LayoutVarID rhs, Operation *source,
                      StringRef rule);
   LayoutVarID getOrCreateDistributedUse(OpOperand &use);
+  LayoutVarID createOperationExecutionVar(Operation *op, RankedTensorType type,
+                                          OperationExecutionBinding binding);
   LogicalResult transform(LayoutVarID src, LayoutVarID dst,
                           Attribute coordinateTransform, Operation *source,
                           StringRef rule);

@@ -1,5 +1,6 @@
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
+#include "Dialect/Frisk/Analysis/InstructionLayoutConstraints.h"
 
 #include <functional>
 
@@ -15,6 +16,8 @@ namespace {
 
 bool isSupportedBootstrapHardConstraint(ConstraintKind kind) {
   return kind == ConstraintKind::RequireEncoding ||
+         kind == ConstraintKind::InstructionContract ||
+         isSupportedUnaryLayoutConstraint(kind) ||
          isSupportedLayoutRelation(kind);
 }
 
@@ -24,6 +27,12 @@ bool satisfiesConstraint(const LayoutConstraintGraph &graph,
                          bool requireComplete) {
   if (constraint.strength != ConstraintStrength::Hard)
     return true;
+  if (constraint.kind == ConstraintKind::InstructionContract) {
+    if (requireComplete && llvm::any_of(constraint.vars, [&](auto id) {
+          return !assignment.count(id);
+        })) return false;
+    return findInstructionSupport(graph, constraint, assignment);
+  }
   for (LayoutVarID id : constraint.vars)
     if (!assignment.count(id))
       return !requireComplete;
@@ -33,6 +42,9 @@ bool satisfiesConstraint(const LayoutConstraintGraph &graph,
            constraint.requiredEncoding;
   if (!isSupportedBootstrapHardConstraint(constraint.kind))
     return false;
+  if (isSupportedUnaryLayoutConstraint(constraint.kind))
+    return proveUnaryLayoutConstraint(graph, constraint,
+        assignment.lookup(constraint.vars.front())).status == ProofStatus::Proven;
   for (size_t index = 1; index < constraint.vars.size(); ++index)
     if (!layoutRelationCompatible(graph, constraint,
             constraint.vars.front(), assignment.lookup(constraint.vars.front()),
@@ -127,7 +139,8 @@ solveBootstrapLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &,
                           BootstrapSolverLimits limits) {
   for (const LayoutConstraint &constraint : graph.getConstraints()) {
     if (constraint.strength != ConstraintStrength::Hard ||
-        isSupportedBootstrapHardConstraint(constraint.kind))
+        (isSupportedBootstrapHardConstraint(constraint.kind) &&
+         (constraint.kind != ConstraintKind::InstructionContract || constraint.instruction)))
       continue;
     const LayoutProvenance &provenance =
         graph.getProvenances()[constraint.provenance];
@@ -245,12 +258,23 @@ solveBootstrapLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &,
     return graph.getConstraint(lhs.constraint).stableUseKey <
            graph.getConstraint(rhs.constraint).stableUseKey;
   });
+  for (const auto &constraint : graph.getConstraints()) {
+    if (constraint.kind != ConstraintKind::InstructionContract) continue;
+    const auto *tuple = findInstructionSupport(graph, constraint, solution.assignments);
+    if (!tuple) return failure();
+    solution.instructionBindings[constraint.id] = tuple->binding;
+  }
   return solution;
 }
 
 LogicalResult verifySolvedLayoutGraph(const LayoutConstraintGraph &graph,
                                       const LayoutSolution &solution,
                                       LayoutTarget &target, Location loc) {
+  if (failed(graph.verifyInvariants(loc))) return failure();
+  for (const auto &entry : solution.instructionBindings)
+    if (entry.first >= graph.getConstraints().size() ||
+        graph.getConstraint(entry.first).kind != ConstraintKind::InstructionContract)
+      return emitError(loc) << "instruction binding does not identify an authorized graph constraint";
   llvm::SmallDenseSet<LayoutConstraintID> converted;
   for (const LayoutConversionEdge &edge : solution.conversions) {
     if (edge.constraint >= graph.getConstraints().size())
@@ -286,6 +310,19 @@ LogicalResult verifySolvedLayoutGraph(const LayoutConstraintGraph &graph,
       return failure();
   }
   for (const LayoutConstraint &constraint : graph.getConstraints()) {
+    if (constraint.kind == ConstraintKind::InstructionContract) {
+      Attribute binding = solution.instructionBindings.lookup(constraint.id);
+      if (!constraint.instruction || !binding ||
+          (constraint.instruction->binding && binding != constraint.instruction->binding))
+        return emitError(loc) << "missing or conflicting instruction binding";
+      SmallVector<Attribute> encodings;
+      for (auto id : constraint.vars) encodings.push_back(solution.assignments.lookup(id));
+      auto proof = target.verifyInstructionContract(graph, constraint, encodings, binding);
+      if (proof.status != ProofStatus::Proven)
+        return emitError(loc) << "mma-joint-contract: "
+            << (proof.status == ProofStatus::Unknown ? "unknown proof: " : "") << proof.reason;
+      continue;
+    }
     if (constraint.kind == ConstraintKind::Convertible && !constraint.existingConversion &&
         !layoutEncodingsEqual(solution.assignments.lookup(constraint.vars[0]),
                               solution.assignments.lookup(constraint.vars[1])) &&

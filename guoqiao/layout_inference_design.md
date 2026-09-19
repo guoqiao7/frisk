@@ -4,7 +4,7 @@
 > 日期：2026-08-16
 > 范围：NVIDIA SM90/SM90a；布局推断、布局验证与布局物化
 > 核心选择：Local/Register Tile 使用 `RankedTensorType + EncodingAttr`，Shared/Global 保持 MemRef，由统一约束系统连接分布式布局与存储布局
-> 实施状态（2026-09-16）：M0–M3 及 M4 Task 18 的坐标 alias、显式 region edges 与单调 worklist 已实现；Task 18 独立复审与 30 lit / 104 unit / 4 CTest 通过，已按用户授权提交并合入本地 main，未推送。其余 M4 Op 迁移尚未实施，可执行 GPU 运行验收仍属 M6。实测、已知边界及集成记录见实现计划 §18.9–18.10。
+> 实施状态（2026-09-19）：M0–M3、M4 Task 18–20 已完成；Task 20 的 Tensor MMA、有限联合指令契约及实际 IR 证明通过独立复审与 165 unit / 34 lit / 4 CTest，验收记录见实现计划 §20.13。Task 21 Reduce 和 Task 22 legacy normalization 尚未实施；可执行 GPU 验收仍属后续阶段。Task 19/20 直接修改源目录，未自动提交或推送。
 
 ## 1. 结论先行
 
@@ -15,11 +15,11 @@ Frisk 应采用已经确认的 MLIR-native 双域 IR 架构，并进行以下重
 3. 不再用当前单一 `LayoutAttr` 同时表达线程分布和内存排布，而是明确分为：
    - `DistributedEncodingAttr`：描述寄存器值如何分布到 `register/lane/warp/warp-group/CTA`；
    - `StorageLayoutAttr`：描述逻辑坐标到 global/shared 物理地址的映射；
-   - `MmaEncodingAttr`、`DotOperandEncodingAttr`：描述 WGMMA 的指令契约。
+   - 指令契约：原设想为 `MmaEncodingAttr`、`DotOperandEncodingAttr`；Task 20 实际采用操作级 `MmaInstructionContractAttr` 与 `MmaDescriptorPlanAttr`，Tensor 保留通用 Distributed encoding（见 §19）。
 4. 推断器采用“硬约束传播 + 候选生成 + 全局代价选择 + 显式转换物化”，而不是每个 Op 直接修改一个 `DenseMap<Value, Attribute>`。
 5. 布局代数采用“仿射外层 × GF(2) 位线性内层”的组合表示：外层处理切块、动态边界、padding 和非 2 次幂；内层处理 lane/register 分布和 XOR swizzle。这是本方案区别于机械迁移 TileLang、也区别于只复制 Triton encoding 类层次的主要创新点。
 6. TileLang 应使用最新代码作为语义参考，但必须固定到经过审计的 commit，不能依赖浮动的 `main`，也不能继续以当前旧版本作为实现依据。建议：
-   - 设计与差分测试参考快照：`6623b12d232b343648a5ba99992e3e6f0d6376d2`；
+   - 当前设计审计快照：`5e149e31674658f94779c7d0c6039549a1853123`；`6623b12d232b343648a5ba99992e3e6f0d6376d2` 仅保留作历史参考；
    - 稳定回归基线：`v0.1.13`（`8001cc4ccf6149382d2019654a19f59c1d4d0482`）；
    - Frisk 不链接、不 vendor TileLang，仅移植语义、测试思想和硬件规则。
 
@@ -255,6 +255,8 @@ Encoding 展开不接收隐式 target 上下文：Distributed/Storage encoding �
 `LayoutMapAttrInterface`。
 
 `MmaEncodingAttr` 和 `DotOperandEncodingAttr` 是指令契约，而不是另一套独立数学系统；它们必须可展开成 canonical layout map。这样 target-specific 属性不会污染通用 compose/equality/verifier。
+
+上述专用 encoding 类是原设计而非已实现 API。Task 20 的适配使用通用 Distributed/Storage map 加操作级类型化契约；具体字段、四端点关系和纯证明接口见 §19 及实现计划 §20.6–20.8。此适配不省略硬件 fragment/packing 验证，也不把 instruction plan 伪装成 Tensor LayoutVar。
 
 M1 固化的通用 encoding 文本与单位如下：
 
@@ -739,6 +741,8 @@ TMA 是候选，不是默认假设。SM90 上 TMA 适合多维 global/shared til
 
 ### 9.7 GEMM/WGMMA
 
+以下为长期目标；Task 20 已实现的受限静态 SS/RS 子集以 §19 为准。尤其专用 Mma encoding 类、一般 Product 大 tile、尾块策略及性能寄存器预算均未随本任务实现。
+
 GEMM 是最强 layout anchor。SM90 规则库根据 dtype、M/N/K、transpose/major mode 和 source memory space 枚举合法 instruction contract：
 
 - C/D accumulator 的 `MmaEncodingAttr` 是 hard seed；
@@ -1145,3 +1149,18 @@ diagnostics，不宣称已完成 GPU runtime correctness 或性能验证。动�
 tensor 和缺 coverage map 已被 M1 verifier 先拒绝；planner 的 programmatic
 negative tests 独立覆盖其拒绝边界。详细接口及命令见
 [Task 17 implementation](m3_task17_conversions.md)。
+
+## 19. M4 Task 20：Tensor MMA 与联合指令契约
+
+用户确认的 v1 契约及验收记录见[实现计划 §20.1–20.13](layout_inference_implementation_plan.md#task-20-增加内部-tensor-mma-op-并迁移-gemm-约束)。本节记录原设计的实际适配，不代表整个 M4 已完成。
+
+- `frisk.mma(A, B, init) -> result` 表达同步数学值 `init + A_eff × B_eff`。数学 transpose 按真实 operand shape 验证；MemRef 输入仅 Read，没有隐藏清零、写回或异步完成语义。
+- 当前目标要求显式 `sm_90a`，f16/bf16 输入、f32 累加。SS 使用 Shared A/B；RS 使用 Tensor A、Shared B；init/result 为 Tensor。Shared 必须是直接 `layout_view`，不把 Local MemRef 冒充寄存器片段。
+- 角色按 `[A-slot, B-slot, init-use, result]` 构成一条 `InstructionContract`。Tensor producer 到 use 是 Convertible，init-use 到 result 是 SameLayout；外部 producer 编码不被消费规则覆盖。
+- `InstructionLayoutTuple` 同时保存四角色 encoding 和一个 typed binding。Strict/Common 删除没有完整 tuple 支持的候选；部分求解必须能扩展到同一 tuple。保留 8 vars/component、4 candidates/domain、每契约至多 256 个编码组合的 bootstrap 边界。
+- 实际 IR 保存 `frisk.mma_contract : MmaInstructionContractAttr` 和 `frisk.execution_threads : i64`。前者含严格 Dictionary schema：版本、target/form/dtype、atom/grid/repeats、packing 和 SS 的 A/B 或 RS 的 B descriptor。Descriptor 使用 `MmaDescriptorPlanAttr`，保存 major/swizzle/leading/stride 与原子 root-relative start/phase；不保存缓存 ID 或运行时指针。
+- Target 分离候选准备、方案构造与纯证明。SM90 fragment 逐硬件坐标校验 packed half 顺序，descriptor 逐点比较实际 storage 地址；静态 alias 的父 buffer 间距和对齐证据不得根据切片 extent 猜测或增强。
+- 物化在 detached module 中完成，MLIR verifier 与 actual-only 证明通过后提交。actual-only 只读实际 encoding、线程和契约，不枚举候选或重选方案；无证明和超预算不当作合法结果。
+- 已接入的表示仍为 Distributed BitLinear、Storage Affine/BitLinear；逻辑及硬件枚举预算为 65536。线程支持 128/256/512/1024、完整四 warp 分组，policy 是确定性策略，不是性能最优证明。
+
+本任务不包含 Reduce、新的 legacy normalization、一般 Product 指令布局、非二次幂/尾块、Tensor B、FP16 accumulator、TF32/FP8/int/sparse、SM80 新路径、完整 CostVector、异步 lowering、GPU 数值或性能验收。旧 Buffer Gemm 仍保留供 legacy 回归，自动迁移留到 Task 22。

@@ -257,6 +257,12 @@ FailureOr<Normalized> normalize(Value value, std::string &reason, unsigned depth
   if (auto argument = dyn_cast<BlockArgument>(value)) {
     auto function = dyn_cast_or_null<func::FuncOp>(argument.getOwner()->getParentOp());
     root = function && !function.empty() && argument.getOwner() == &function.front();
+    if (auto kernel = dyn_cast_or_null<KernelOp>(argument.getOwner()->getParentOp())) {
+      auto signature = dyn_cast<FunctionType>(kernel.getFunctionType());
+      root = !kernel.getRegion().empty() && argument.getOwner() == &kernel.getRegion().front() &&
+             signature && argument.getArgNumber() < signature.getNumInputs() &&
+             signature.getInput(argument.getArgNumber()) == type;
+    }
   }
   if (!root) return reject("unknown alias semantics or region-carried root (only alloc/alloca/global/function-entry roots supported)");
   if (!type.hasStaticShape()) return reject("root has dynamic shape; static child type cannot establish its live domain");
@@ -518,6 +524,23 @@ FailureOr<StorageLayoutAttr> mlir::frisk::buildRootLinearStorageCandidate(
                     {address.floorDiv(8), address%8}, ctx), info.rootAlignment, 1);
 }
 
+FailureOr<SmallVector<int64_t>> mlir::frisk::evaluateStorageViewCoordinates(
+    const StorageAliasInfo &info, ArrayRef<int64_t> point) {
+  if (!info.viewType || !info.rootType || !info.viewToRoot ||
+      !info.viewType.hasStaticShape() || !info.rootType.hasStaticShape() ||
+      point.size() != unsigned(info.viewType.getRank()) ||
+      info.viewToRoot.getNumDims() != point.size() || info.viewToRoot.getNumSymbols() ||
+      info.viewToRoot.getNumResults() != unsigned(info.rootType.getRank()))
+    return failure();
+  for (auto [coordinate, extent] : llvm::zip_equal(point, info.viewType.getShape()))
+    if (coordinate < 0 || coordinate >= extent) return failure();
+  auto result = evalMap(info.viewToRoot, point);
+  if (failed(result)) return failure();
+  for (auto [coordinate, extent] : llvm::zip_equal(*result, info.rootType.getShape()))
+    if (coordinate < 0 || coordinate >= extent) return failure();
+  return *result;
+}
+
 FailureOr<StorageLayoutAttr> mlir::frisk::projectStorageAliasCandidate(
     const StorageAliasInfo &source, StorageLayoutAttr candidate,
     const StorageAliasInfo &destination) {
@@ -581,4 +604,38 @@ FailureOr<StorageLayoutAttr> mlir::frisk::projectStorageAliasCandidate(
       return projected;
   }
   return failure();
+}
+
+FailureOr<StorageLayoutAttr> mlir::frisk::rebaseStorageCopyCandidate(
+    const StorageAliasInfo &source, StorageLayoutAttr candidate,
+    const StorageAliasInfo &destination) {
+  if (source.viewType.getShape() != destination.viewType.getShape() ||
+      source.viewType.getElementType() != destination.viewType.getElementType())
+    return failure();
+  auto footprint = buildStorageAliasFootprint(source, candidate);
+  if (footprint.proof.status != ProofStatus::Proven || footprint.entries.empty())
+    return failure();
+  auto map = asAffine(candidate.getMap());
+  if (failed(map)) return failure();
+  SmallVector<int64_t> zero(destination.viewType.getRank(), 0), strides;
+  auto rootPoint = evalMap(destination.viewToRoot, zero);
+  int64_t offset;
+  auto rootType = destination.rootType;
+  if (failed(rootPoint) ||
+      failed(rootType.getStridesAndOffset(strides, offset)))
+    return failure();
+  __int128 address = offset;
+  for (auto [coordinate, stride] : llvm::zip_equal(*rootPoint, strides))
+    address += __int128(coordinate) * stride;
+  address *= destination.viewType.getElementTypeBitWidth();
+  auto delta = narrow(address - footprint.entries.front().begin);
+  if (failed(delta)) return failure();
+  AffineExpr bits = map->getResult(0) * 8 + map->getResult(1) + *delta;
+  auto result = makeLayout(destination,
+      AffineMap::get(destination.viewType.getRank(), 0,
+                    {bits.floorDiv(8), bits % 8}, destination.viewType.getContext()),
+      std::min<uint64_t>(candidate.getAlignment().getInt(), destination.rootAlignment), 1);
+  if (verifyStorageAliasCandidate(destination, result).status != ProofStatus::Proven)
+    return failure();
+  return result;
 }

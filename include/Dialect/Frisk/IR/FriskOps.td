@@ -141,7 +141,7 @@ def Frisk_ParallelOp : Frisk_Op<"parallel", [RecursiveMemoryEffects,
                                       llvm::DenseMap<::mlir::Value, ::mlir::Attribute> &layoutMap);
   }];
 
-  let hasVerifier = 0;
+  let hasVerifier = 1;
   let hasCustomAssemblyFormat = 1;
 }
 
@@ -356,7 +356,12 @@ def Frisk_AllocBufferOp: Frisk_Op<"alloc_buffer"> {
 def Frisk_CopyOp: Frisk_Op<"copy", [AttrSizedOperandSegments]> {
   let summary = "copy";
   let description = [{ 
-    copy
+    Pointwise whole-tile copy in layout inference. Source and destination may
+    have different physical layouts. Distinct underlying arguments have a
+    nonoverlap caller precondition; known-root nonidentity overlap is rejected.
+    Optional discardable frisk.execution_layout, frisk.execution_threads,
+    frisk.writer_policy and frisk.vector_bytes attributes are hard execution
+    contracts. Inference materializes all four; lowering must honor them.
   }];
 
   let arguments = (ins 
@@ -400,7 +405,11 @@ def Frisk_CopyOp: Frisk_Op<"copy", [AttrSizedOperandSegments]> {
 def Frisk_FillOp: Frisk_Op<"fill"> {
   let summary = "fill";
   let description = [{ 
-    fill
+    Fill a memory tile with a scalar constant. Task 19 execution contracts use
+    frisk.execution_layout, frisk.execution_threads, frisk.writer_policy and
+    frisk.vector_bytes. all writes every holder; first_owner writes only the
+    lexicographically first (cta, warp_group, warp, lane, register) holder of
+    each logical element. These are explicit lowering obligations, not hints.
   }];
 
   let arguments = (ins 
