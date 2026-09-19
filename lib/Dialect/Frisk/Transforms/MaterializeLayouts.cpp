@@ -39,6 +39,23 @@ public:
       list.push_back({operand, edge.sourceEncoding, edge.targetEncoding});
     }
     for (const auto &constraint : graph.getConstraints()) {
+      if (constraint.kind == ConstraintKind::ReductionLayout) {
+        auto *op = constraint.reduction ? constraint.reduction->source : nullptr;
+        auto binding = solution.reductionBindings.lookup(constraint.id);
+        if (!op || !root->isAncestor(op) || !binding)
+          return root->emitError("invalid reduction materialization source or binding");
+        Builder b(op->getContext());
+        NamedAttrList attrs;
+        attrs.set("frisk.reduction_contract", binding);
+        attrs.set("frisk.execution_threads", b.getI64IntegerAttr(
+            graph.getVariable(constraint.vars.back()).requiredThreads));
+        for (auto attr : attrs)
+          if (auto original = op->getAttr(attr.getName()))
+            if (original != attr.getValue())
+              return op->emitError("materialization would overwrite an explicit reduction contract");
+        executions[op] = attrs.getDictionary(op->getContext());
+        continue;
+      }
       if (constraint.kind != ConstraintKind::InstructionContract) continue;
       if (!constraint.instruction || !constraint.instruction->source ||
           !root->isAncestor(constraint.instruction->source))
@@ -276,6 +293,14 @@ LogicalResult verifyMaterializedLayouts(Operation *root,
   if (failed(graph)) return failure();
   LayoutSolution actual;
   for (const auto &constraint : graph->getConstraints()) {
+    if (constraint.kind == ConstraintKind::ReductionLayout) {
+      auto *op = constraint.reduction ? constraint.reduction->source : nullptr;
+      if (!op || !op->hasAttr("frisk.reduction_contract") ||
+          !op->hasAttr("frisk.execution_threads"))
+        return root->emitError("unresolved materialized reduction contract or execution_threads");
+      actual.reductionBindings[constraint.id] = op->getAttr("frisk.reduction_contract");
+      continue;
+    }
     if (constraint.kind != ConstraintKind::InstructionContract) continue;
     auto *op = constraint.instruction ? constraint.instruction->source : nullptr;
     if (!op || !op->hasAttr("frisk.mma_contract") || !op->hasAttr("frisk.execution_threads"))

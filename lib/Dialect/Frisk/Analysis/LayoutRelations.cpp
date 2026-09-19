@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
+#include "Dialect/Frisk/Analysis/ReductionLayoutProof.h"
 #include "Dialect/Frisk/Analysis/ExecutionLayoutProof.h"
 #include "Dialect/Frisk/IR/FriskAttributes.h"
 #include "mlir/IR/Builders.h"
@@ -202,6 +203,17 @@ FailureOr<Attribute> projectLayoutCandidate(
     return permuteEncoding(candidate, relation.coordinateTransform,
                            cast<ShapedType>(dst.shapedType),
                            source != relation.vars.front());
+  if (relation.kind == ConstraintKind::ReductionLayout) {
+    if (!relation.reduction || source != relation.vars[0] || target != relation.vars[1])
+      return failure(); // Projection has no inverse: reverse inference filters only.
+    auto encoding = dyn_cast<DistributedEncodingAttr>(candidate);
+    if (!encoding) return failure();
+    auto result = projectReductionEncoding(encoding,
+        cast<RankedTensorType>(graph.getVariable(source).shapedType),
+        cast<RankedTensorType>(dst.shapedType), relation.reduction->axis);
+    if (failed(result)) return failure();
+    return Attribute(*result);
+  }
   if (relation.kind != ConstraintKind::StorageAccess)
     return failure();
   auto storage = dyn_cast<StorageLayoutAttr>(candidate);

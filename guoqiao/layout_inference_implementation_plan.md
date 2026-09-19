@@ -8,9 +8,11 @@
 
 **Tech Stack:** C++17、LLVM/MLIR ODS/TableGen、MLIR Pass/Dialect Conversion、Affine/Presburger、SCF、MemRef、Tensor、GPU/NVGPU/NVVM、LLVM ADT/APInt、CMake/Ninja、llvm-lit/FileCheck、CTest、CUDA/Nsight 性能工具。
 
-> **执行状态（2026-09-19）：M0–M3 与 M4 Task 18–20 已完成。Task 20 按用户确认契约实现，独立复审与 34 lit / 165 unit / 4 CTest 全部通过，记录见 §20.13。Task 21–22 尚未实施，不把 Task 20 等同于整个 M4 完成。Task 19 历史 Gate 为 32 lit / 129 unit / 4 CTest；Task 19/20 修改保留在源目录 main，未自动提交或推送。**
+> **执行状态（2026-09-19）：M0–M3 与 M4 Task 18–20 已完成。Task 21 已按确认契约完成受限 Reduce 实现、独立复审与 197 unit / 36 lit / 4 CTest 回归；完整 MMA→Reduce→tile_store 的成功验收仍因 9 变量超过保留的 8 变量上限而未完成，详见 §21.8，不将测试全通过等同于原契约全部验收。Task 22 尚未实施。Task 19/20 已提交到源目录 main 的 `c028e82`，未 push；Task 21 未提交、未推送。**
 
 > **设计更新（2026-09-19）：Task 20 的 SS＋RS 具体契约 v1 已由用户确认；§20.1–20.11 是契约，§20.12 是执行计划，§20.13 记录实际实现、验证证据和限制。通用 encoding＋操作级指令 binding 的适配同时写入设计总文档 §19。**
+
+> **集成与后续（2026-09-19）：用户要求先提交既有修改，再进入 Task 21。Task 19/20 的代码、测试、维护文档和汇报已提交到本地 main：`c028e82`，提交前重新验证 165 unit / 34 lit / 4 CTest 全部通过；未 push。以上“未提交”描述是当时的实施记录，以本条更新为准。Task 21 的 §21.1–21.7 已由用户确认并实施；实际证据与尚未解决的完整链验收冲突见 §21.8。**
 
 > **工作区说明：M3 从 `feature/m3-distributed-layout`（`be71d91`，实现验收基线 `642c30b`）于 2026-09-11 合入 `main`，合并提交 `b120d06400a14a703a44dac1a37a0b38d8110935` 已在此前按用户要求推送至 `origin`（guoqiao7/frisk）。Task 18 历史上使用 `.worktrees/m4-task18`，集成记录见 §18.10。本轮 Task 19 遵照用户新要求直接在主源码 main 中实现，不使用 worktree，不改动独立的 `guoqiao/inference_detail/README.md`，不自动 commit/push。27 lit、74 unit、4 CTest 是 M3 基线；Task 18/19 Gate 分别见 §18.9/§19.9。**
 
@@ -2021,7 +2023,7 @@ Expected: 多 consumer IR 合法；共同布局或 conversion 由 solution 明�
 | -------- | ------ | ----------------------------------------- | ------------------------------------------------------------------- |
 | 第一阶段 | 18     | 坐标 alias、显式 region graph、可审计收敛 | 用户已确认，已编码；最终 Gate 见 §18.9                             |
 | 第二阶段 | 19     | Copy/Fill/Parallel 进入新接口与约束       | 已按确认契约实现；独立复审及 Gate 记录见 §19.9                      |
-| 第三阶段 | 20–21 | Tensor MMA/GEMM 与 Reduce 规则适配        | Task 20 已实现并通过 Gate，见 §20.13；Task 21 未开始，须复核 reducer 语境 |
+| 第三阶段 | 20–21 | Tensor MMA/GEMM 与 Reduce 规则适配        | Task 20 已通过 Gate；Task 21 受限实现与回归完成，完整链成功验收待解决，见 §21.8 |
 | 第四阶段 | 22     | normalization、旧生产逻辑退役和集成       | 未开始；依赖前三阶段 Gate                                           |
 
 审计起点结论与具体修正（以下 Frisk 缺口描述固定于 `b120d06`，实施后状态见 §18.9）：
@@ -2974,6 +2976,138 @@ git commit -m "feat: model gemm as layout constraints"
 ```
 
 ### Task 21: 增加 Tensor Reduce Op 并迁移 Reduce ownership
+
+**状态（2026-09-19）：用户已确认 §21.1–21.7；受限实现、独立复审及 197 unit / 36 lit / 4 CTest 回归已完成，完整链成功验收仍未完成（9 变量与 8 变量上限冲突，见 §21.8）。实施基线为本地 main `c028e82`，直接在源目录实施，未创建 worktree、未 commit/push。原 Step 1–6 保留为历史提纲，以已确认的具体契约及实际验收记录为准。**
+
+#### 21.1 实现审计：哪些可以复用，哪些不能直接迁移
+
+| 核对对象 | 实际发现 | 对 Task 21 的影响 |
+| --- | --- | --- |
+| `FriskOps_Reduce.cpp::ReduceOp::inferLayout` | 旧输入/输出都是 Local MemRef；依赖已有 src layout，主要进行 src→dst 的维度消除与 replication condense | 复用逻辑投影思想，不复用 Local MemRef/DenseMap 生产路径，不宣称已有一般双向推断 |
+| `FriskOps.cpp::ReduceOp::verify` | 旧 kind 为 add/mul/min/max；检查删维 shape 和同 dtype，旧操作还有目的端/clear 语义 | 新 Tensor Reduce 的 sum 命名、纯值语义与旧 add/clear 的自动映射必须分开，自动 normalization 留给 Task 22 |
+| `test_pass/reduce_layout_test.cpp` | 8 个参数用例及 GEMM→Reduce legacy 用例；case 5 注释明确指出 src map 有问题；case 7 的实际 index 为 `d1*4+d1`、thread 为 `d2`，均不编码 batch 维 d0；case 6–8 使用 16 线程 | 不能以旧测试 PASS 证明输入持有关系合法。case 7 不同 batch 会落到相同物理槽；这些用例要分类或重新构造独立 oracle，不能机械复制期望 replication |
+| `LayoutRelations.cpp::permuteEncoding` | 当前 TransformLayout 接收等 rank 的轴置换，反向用逆置换；归约删维并非双射 | 不把 Reduce 塞进现有 permutation payload，不伪造逆矩阵补回已消失的 reduction 维 |
+| Task 19 execution proof | 已能验证静态覆盖、重复持有者、first_owner 和线程数；同一元素的多个持有者默认表达同值副本 | 需要另证“每个不同逻辑输入恰好贡献一次”；普通 coverage/replication 检查不能单独证明 sum 没有多算 |
+| Task 20 instruction tuples | 四角色及 MMA source 的不变量是明确契约，不是任意 arity 的通用计算节点 | Reduce 采用有名的二端点关系和独立方案绑定；不复制端点凑成四元 MMA tuple |
+| 当前公共布局表示 | Distributed pass 支持静态非零 rank、每维大于 1 的二次幂 BitLinear；已有 8 vars / 4 candidates 和 65536 点预算 | 原提纲中的非二次幂 guarded/shared fallback 不能只加一个分支就实现，需要先扩展表示与边界证明 |
+
+固定上游证据再次核对本地审计副本的 HEAD：TileLang `5e149e31674658f94779c7d0c6039549a1853123`、Triton `42c5e89c3871e1472968c92dd8e5c02d0b3dd40c`。没有刷新浮动 main，也没有运行上游测试。GitHub 固定源码网页本轮读取返回 cache miss，源码判断来自同 SHA 本地副本，不将其他本地 TileLang 分支误当该快照。
+
+- TileLang `src/op/reduce.cc::ComputeReducerLayout/InferLayout` 仍是传统 Fragment 的源驱动投影、压缩和目的包含性检查。`src/layout/layout.h::PartialFragmentNode` 明确区分 addend lanes 与 equal-value copy groups，并禁止将 partial 当作普通 replica；这与 local.reducer epoch 是另外一层机制。
+- Triton `inferReduceOpEncoding` 使用 SliceEncoding；`ReduceOpToLLVM.cpp` 先处理寄存器内归约，再处理 warp 内归约，其余跨 warp/block 情形借助布局转换与同步。它已经具有分层归约实现，不能把 register/warp/shared 分层本身宣称为 Frisk 独创。
+- 本地 MLIR `arith.maximumf/minimumf` 与[官方 Arith 文档](https://mlir.llvm.org/docs/Dialects/ArithOps/)均明确 NaN 传播及正负零次序；新 kind 不能无说明地混用 maxnum/minnum。
+
+#### 21.2 方案取舍
+
+| 方案 | 收益 | 问题与结论 |
+| --- | --- | --- |
+| A：坐标投影＋贡献者证明＋有界通信方案（推荐） | 保持 Tensor/Storage 双域、有限候选、实际 IR 独立验证；能接上 Task 20 MMA 输出 | 首版限定现有静态 BitLinear 支持集，需要新增归约专用关系，但改动边界可控 |
+| B：只迁移旧 dst map/replication 公式 | 实现最短 | 无法证明重复输入未被多算，难以独立核验通信需求，不作为完整 Task 21 交付 |
+| C：同时引入 PartialFragment/epoch、非二次幂及 GPU lowering | 支持范围更广 | 扩展类型/语义/调度多个系统，超出当前单任务，单独规划 |
+
+推荐 A。此选择包含对原提纲的明确缩限：非二次幂 fallback 改为可测试的 unsupported 边界，待支持表示/guard 的后续任务补齐；不把 Shared 通信方案误说成已经支持 ragged shape。
+
+#### 21.3 已确认的数学操作与支持集
+
+```mlir
+// 已注册操作的未编码输入示例；布局由推断补齐。
+%result = frisk.reduce_tensor %src {kind = "sum", dim = 1}
+  : tensor<64x64xf32> -> tensor<64xf32>
+```
+
+1. 单个 RankedTensor 输入与单个 RankedTensor 结果；沿 dim 归约，结果 shape 等于删除该维后的 shape；无 keep_dims、隐式 init/clear、目的 MemRef 或写回副作用。操作是纯 Tensor 值计算，外部累加另用显式算术操作表达。
+2. 首版 kind 为 `sum/max/min`，dtype 为 f16/bf16/f32，输入与结果同 dtype；没有隐式 f32 提升。旧 `add` 不作为新 op 的第二套公开拼写，旧 `mul`、abs/bitwise、自定义 combiner、argmax/argmin 不包含在首版。
+3. `sum` 按每个不同逻辑输入恰好一次定义，允许并行重结合，选中方案固定确定性的归约树；不承诺与串行从左到右相加逐 bit 一致。这是新操作本身的显式语义选择，不为普通 arith.addf 擅自添加重结合许可。CPU 测试须按指定树核对，不能用浮点交换律假设代替证明。
+4. `max/min` 采用 maximumf/minimumf 的 NaN 传播和正负零语义，不采用“忽略 NaN”的 maxnum/minnum。NaN payload 不作为跨不同实现的逐 bit 保证。
+5. 首版输入 rank 至少 2，结果 rank 至少 1；所有 extent 为大于 1 的静态二次幂。rank-1→scalar、extent=1、动态、非二次幂明确拒绝，不伪造 shape=1 的输出绕过既有 verifier。
+6. 限单 CTA、32/64/128/256/512/1024 线程，lane=32。显式 `frisk.execution_threads` 与外层 Parallel 必须一致；没有 Parallel 时优先显式值，再继承可确定的输入编码/生产者图线程要求，否则缺省 32。例如 Task 20 的 128 线程 MMA→Reduce 默认继承 128，不强行先转成 32。多个互相冲突的来源不取任意第一个。
+7. target 按当前 SM90 target 模型处理：支持 `sm_90/sm_90a`；缺失时沿用普通操作默认 SM90，不为 Reduce 额外要求 MMA 的 `sm_90a`。但同图 MMA 仍独立要求显式 sm_90a，其他显式 target 拒绝。
+8. result 的多个持有者必须表示已经完成的同一个归约值，而不是尚未合并的 partial。只有 layout 无法证明动态 payload 相等；相等是 Distributed Tensor 的语义契约，不将任意不等的 runtime 部分和当作 replica。
+
+#### 21.4 投影与贡献者证明
+
+设 `Dsrc(h)` 为源硬件位置 h 对应的逻辑坐标，`P` 为删除 dim 的逻辑投影；输出坐标 y 的归约集合为：
+
+```text
+F(y) = {x | P(x) = y}
+```
+
+证明必须区分三个对象：F(y) 中不同的输入元素、同一个输入 x 的多个物理副本，以及完成后输出 y 的多个物理副本。只有第一类是 sum 的不同加数。
+
+推荐先由 `P∘Dsrc` 构造自然输出布局，再压缩投影后冗余的 register 位：按旧 register 位顺序选取线性独立的列，保留 lane/warp/warp_group/CTA 的组织，重新计算 register extent 和实际 replication。不能只删输出行后沿用旧 replication；不能只删除零列而忽略非零相关列。通用投影 API 可复用，但 Reduce 的删维、重命名和 register 商空间处理应有独立 helper。
+
+对每个 y，按 `(cta,warp_group,warp,lane,register)` 的字典序选出每个不同 x 的最小源持有者一次，并按此物理键排序。`canonical_fiber_tree_v1` 每层将相邻项两两合并，奇数尾项原样进入下一层，合并结果保留在左项的代表持有者；重复直到一个根，再将完成值从根分发到 Ddst 声明的所有输出持有者。证明检查输入完整、无重复贡献、各次合并的贡献集合不相交、最终集合恰为 F(y)，并检查完整结果的分发覆盖。first_owner 是本版本的确定性基线，不宣称通信量最小；不能让输出副本数量乘进求和。
+
+以每行 4 个不同值 `[1,2,3,4]`、每个值均有两个物理副本为例，行 sum 必须是 10，不能是 20；两个输出持有者应各持有 10，而不是分别持有未完成的 3 和 7。即使 max 测试对重复加数不敏感，sum 反例也必须覆盖。
+
+通信范围按实际树边及完成值分发边推导：同线程为 register，跨 lane 同 warp 为 warp，跨 warp/warp_group 为 CTA shared-tree。只记录依赖与通信要求，不生成 shuffle、shared alloc 或 barrier。含 shared-tree 的证明不能表述为已经完成可执行同步/共享容量分配验证；其含义是单 CTA 内存在该有限通信依赖，后续 lowering 必须落实资源和同步。
+
+#### 21.5 图接线、有限候选与方案绑定
+
+- 新增有名二端点 `ReductionLayout` 关系，端点固定为 `[src-use,result]`，payload 保存 source op、dim 和实际归约绑定；结构检查覆盖角色、类型、归属、ID remap。保留现有 TransformLayout 的轴置换语义，不影响 Task 20 四元不变量。
+- src producer→src-use 使用已有 Convertible；自然 result→其他消费者使用既有 use/转换关系。不能直接修改外部 producer 来满足这一次归约，也不能无条件认定所有 input/output encoding 组合可行。
+- 正向只从已允许的源候选生成自然输出布局；反向根据输出要求筛选已有源候选，不把投影当可逆映射，不凭空恢复源布局。下游消费者的不同布局要求通过消费者边转换；若 Reduce 自身结果的硬编码与所有合法源候选的自然投影均不兼容，则报冲突，不能靠消费者转换掩盖，也不能覆盖硬绑定。自然布局的逻辑维名称允许按结果轴位置作语义等价重命名，不据此接受任意结果映射。
+- 候选准备需把 Reduce 正向投影接入现有有限来源闭包，支持 reduce→reduce、transpose→reduce 和 MMA→reduce；result 不先塞无关默认候选。来源包含显式编码、前驱合法传播和既有 target 默认族，来源去重并记录 provenance。冻结后 Strict/Common 只删不增，每次删除重排相关约束；部分和完整 assignment 都检查 pair 支持。
+- 保留 8 vars/component、4 candidates/domain；每条二端点关系最多 16 对布局，不通过复制变量或截断候选绕过限制。单个输入/输出的逻辑与硬件枚举分别最多 65536 点；贡献关系按源点和目标点线性建索引，不构造 65536² 的笛卡尔积。超预算返回 Unknown。
+- 规划 `ReductionLayoutConstraints.{h,cpp}`、`ReductionLayoutProof.{h,cpp}`（Analysis）与 `SM90ReduceConstraints.{h,cpp}`（Target）。前者处理逻辑 fiber/候选关系/贡献证明，后者处理线程组织与通信方案；仍保持 Target→Analysis→IR，不在通用 solver 散布 target 字符串。
+- 规划操作属性 `frisk.reduction_contract : ReductionContractAttr` 和 `frisk.execution_threads : i64`。采用完整、严格的 v1 schema：version、target、kind、axis、dtype、输入/输出 shape、threads、算法版本 `canonical_fiber_tree_v1`、输入副本选择规则、输出完成值分发规则、通信范围。规范算法从实际编码唯一确定详细依赖，无 pointer/cache ID；无法支持的算法字段拒绝，不静默更换方案。
+- 解中以稳定 constraint ID 保存 reduction binding，物化到真实操作；显式完整属性只验证、不覆盖。最后 actual-only 从实际输入/结果类型和属性检查 shape、投影、贡献集合、通信范围与线程一致性，允许执行纯确定性证明，禁止候选准备、pair 枚举、重新搜索方案或复用旧解缓存。
+- 沿用 detached module 原子物化、打印解析与二次推断稳定性；写回前失败保持原 IR 不变。后续 tile_store 的唯一写入者检查复用既有 ownership 约定；Reduce 本身不是 MemRef 写操作。
+
+#### 21.6 验收分组与旧行为分类
+
+- [x] 数学 verifier：所有 kind/dtype、dim 越界、删维 shape、输入/结果类型不匹配、rank-0/动态/非二次幂拒绝、纯副作用及 printer/parser；sum/max/min 的语义差异和 NaN/±0 分类有独立 CPU oracle。
+- [x] 布局代数：reduce 首/中/尾轴、register 位压缩、相关列/XOR 混合、coverage、replication 重算及自定义维名；不能由待测候选生成器生成唯一“期望值”。
+- [x] 贡献证明：线程内、跨 lane、跨 warp、跨 warp-group，输入/输出副本分离；sum 漏算/重复、错误 partial、跨行混合、缺失结果分发、thread scope 和预算负例；CPU 模拟检查每个输出完整贡献集合。
+- [x] 真实推断的已通过子集：`64×64→64`、3D 删中轴、`128×128` MMA→按行 Reduce、Reduce→Global tile_store、连续两次 Reduce、外部显式编码转换、SCF/Parallel 环境；保留 bootstrap 上限。
+- [ ] 原契约完整链成功验收：Task 20 `128×128` MMA 结果→按行 Reduce→tile_store。当前只验证 9 变量超限拒绝，分段成功不替代此项；须另行确认预算或等价压缩策略。
+- [x] 传播与独立核验：输出要求反向删源候选、无支持域失败、固定点统计、稳定 ID；缺少/篡改 reduction_contract、线程/通信范围、源/结果编码均 fail-closed；actual-only 生成计数为 0，事务回滚和回放逐字稳定。
+- [x] Legacy 分类：case 1–4 作为适用候选，仍先检查完整持有关系；case 5 的不一致 replication 不迁入正确性 oracle；case 7 的 batch 丢失作为反例并另建合法 3D 样例；case 6/8 的 16 线程不伪装成新支持集，补真实 32-thread 同值复制后的独立样例。旧 add→sum、mul/clear、SM80 GEMM 来源均记录支持/延期，不以旧文本相等为验收。
+- [x] 全量回归 Gate：新增 `ReduceConstraintTest.cpp`、`ReductionLayoutProofTest.cpp`、`ReduceLayoutIntegrationTest.cpp` 和 `infer-reduce-layout{,-errors}.mlir`，197 unit / 36 lit / 4 CTest 全通过；独立复审与未完成项见 §21.8。未执行 GPU/上游实验；本项通过不消除上述完整链验收缺口。
+
+#### 21.7 确认点与实施顺序
+
+用户已确认方案 A 的支持集和语义——**sum/max/min、静态二次幂 Tensor、贡献者去重、自然投影及寄存器压缩、register/warp/CTA 通信契约和实际 IR 复验；sum 允许并行重结合，非二次幂 fallback、PartialFragment/epoch 与 GPU lowering 延后**。
+
+按四步落地：数学 IR 与独立投影/贡献 oracle → 有名二端点关系及候选闭包 → SM90 通信属性与事务物化/actual-only → MMA→Reduce 集成、legacy 分类、全量回归和文档。上述受限实现与复审修正已完成；165/34/4 是已提交基线，本轮实际回归为 197/36/4。完整链成功验收尚未完成。
+
+#### 21.8 实际实现与验收边界（实施记录）
+
+**工作区。** 基线为本地 `main c028e82`，本轮直接修改原目录；保留既有 Task 21 设计修改，不创建 worktree，不自动 commit/push，不修改独立汇报 README。
+
+**实现接线。**
+
+| 层次 | 实际代码与责任 |
+| --- | --- |
+| IR | `FriskLayoutOps.td/.cpp` 新增纯 `ReduceTensorOp`；`FriskLayoutAttrs.td/.cpp` 新增完整、严格的 `ReductionContractAttr` |
+| 基础证明 | `ExecutionLayoutProof.h/.cpp` 提取共享的有界坐标枚举；`ReductionLayoutProof.h/.cpp` 做自然投影、register 子空间基选取、规范贡献树和完整输出分发 |
+| 图关系 | `ReductionLayoutConstraints.h/.cpp` 收集 `[src-use,result]`、解析线程环境、冻结后构建最多 16 对合法编码和 binding；`LayoutConstraint` 检查实际 SSA 角色、axis、来源、pair 唯一性与稳定 ID |
+| Target | `SM90ReduceConstraints.h/.cpp` 解释 SM90/SM90a、线程与通信范围；通过 `LayoutTarget::buildReductionContract/verifyReductionContract` 接入，不把 target 字符串判断塞进通用 solver |
+| 传播和求解 | 正向生成自然输出，反向仅以已有 pair 删减；Strict/Common 重排受影响约束；部分和完整 assignment 都要求 pair 支持；`LayoutSolution::reductionBindings` 按稳定 constraint ID 保存方案 |
+| 物化与复验 | `MaterializeLayouts.cpp` 写 `frisk.reduction_contract` 和 `frisk.execution_threads`；实际 IR 路径不调用候选生成、pair 准备或 binding 搜索；失败不更新原 IR |
+
+`ReductionContractAttr` 的 v1 字典准确包含 12 个字段：`version/target/kind/axis/dtype/source_shape/result_shape/threads/algorithm/input_policy/output_policy/scope`。算法固定为 `canonical_fiber_tree_v1`，输入策略固定 `first_owner`，输出策略固定 `broadcast_complete`；scope 为 `register/warp/cta_shared_tree`。物理位置序列、相邻合并树和广播目的地由实际编码唯一重建，不存 SSA 指针或缓存编号。
+
+**明确的验收差异：完整 MMA→Reduce→store 链。** 实施时发现原 §21.6 同时要求完整链成功和保持 8 vars/component，两者在当前图模型下冲突。SS MMA 有 A/B storage、init producer/use、result 共 5 个变量；Reduce 新增 source-use/result 2 个；store 新增 use/storage 2 个，总数为 9，且处于同一连通分量。已向用户说明这是原契约遗漏，8 是 bootstrap 求解规模限制而非硬件限制。未获得放宽上限的明确授权，因此保持 8，分别验证 `128×128 MMA→Reduce`、`Reduce→Global tile_store`；完整链验证 9 个真实变量及超限拒绝，不能宣称完整链成功。后续若需完整链，应单独确认预算或等价变量压缩策略。
+
+**验证方法。** 数学、贡献证明、图集成分别由 `ReduceConstraintTest.cpp`、`ReductionLayoutProofTest.cpp`、`ReduceLayoutIntegrationTest.cpp` 覆盖；lit 正反例为 `infer-reduce-layout{,-errors}.mlir`。CPU oracle 按声明的树模拟求和/最大/最小，包含 NaN、正负零和重结合反例；这不是 GPU 数值执行。旧 case 1–4 独立反演 thread/slot 关系，case 5 错误 replication 和 case 7 batch 冲突不作为正确性 oracle，case 6/8 明确区分旧 16 线程与新 32 线程同值副本适配。
+
+**复审记录。** 基础证明首轮无 Critical/Important；按 Minor 建议增加物理顺序不同于逻辑顺序的完整树 oracle、逻辑/硬件预算边界以及 API 数值语义前置条件说明。图复审发现下游候选反向污染自然输出、线程环境越过已确定转换边界的问题；已用回归复现并修正。硬编码端点不再接受不可能的传播候选，归约自然结果不接受反向消费者建议；线程追溯在已确定的 encoding/执行环境处停止，但仍核对 SameLayout 同伴的独立冲突。最终代码复审无新增 Critical/Important 实现缺陷；完整链未成功仍是 Important 验收缺口。另有 Minor 测试建议保留：目前 fanout 回归硬绑定了 Reduce 结果，未来可增加未编码结果的下游强需求用例，独立保护仅针对 `reductionResult` 的候选屏障。
+
+**测试命令与当前证据。**
+
+```bash
+cmake --build build --target FriskLayoutUnitTests check-frisk \
+  frisk_attr_test frisk_reduce_layout_test frisk_layout_pass_test \
+  frisk_memory_effect_test --parallel 16
+build/unittests/Dialect/Frisk/FriskLayoutUnitTests
+ctest --test-dir build --output-on-failure
+git diff --check
+```
+
+本轮 build/check-frisk 返回 0，lit 36/36、CTest 4/4 通过；全量 unit 的 26 个 suite、197/197 项全部通过（262.577 秒，退出码 0）。新增单元为 4 项数学/schema、13 项投影/贡献证明、15 项图集成，共 32 项；新增 2 份 lit 文件。既有 Ninja `premature end of file; recovering` 和 CMake CMP0116 弃用提示使构建重新执行较多目标，不作为 Task 21 功能失败，也未为此改写构建缓存或策略。CPU 布局与树 oracle、打印解析和独立验证不代替 GPU 数值/性能测试；本轮未执行 GPU 或上游框架实验。
+
+以下为原始迁移提纲，实施以以上已确认的具体契约及实际记录为准；原 Step 6 不作为自动提交授权。
 
 **Files:**
 

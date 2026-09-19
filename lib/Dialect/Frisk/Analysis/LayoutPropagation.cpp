@@ -2,6 +2,7 @@
 #include "Dialect/Frisk/Analysis/OperationLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
 #include "Dialect/Frisk/Analysis/InstructionLayoutConstraints.h"
+#include "Dialect/Frisk/Analysis/ReductionLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/MmaLayoutConstraints.h"
 
 #include <functional>
@@ -400,6 +401,7 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
   failedCollection |= failed(collectOperationLayoutConstraints(root, graph, builder));
   failedCollection |= failed(collectDistributedLayoutConstraints(root, graph, builder));
   failedCollection |= failed(collectMmaLayoutConstraints(root, graph, builder));
+  failedCollection |= failed(collectReductionLayoutConstraints(root, graph, builder));
   failedCollection |= failed(collectParallelResourceConstraints(graph));
   if (failedCollection)
     return failure();
@@ -420,7 +422,8 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
       addedCandidate = false;
       for (const LayoutConstraint &constraint : graph.getConstraints()) {
         if (constraint.strength != ConstraintStrength::Hard ||
-            !isEqualityConstraint(constraint.kind))
+            !(isEqualityConstraint(constraint.kind) ||
+              constraint.kind == ConstraintKind::ReductionLayout))
           continue;
         for (LayoutVarID sourceID : constraint.vars) {
           if (graph.getVariable(sourceID).kind == LayoutKind::Storage) continue;
@@ -431,6 +434,20 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
               continue;
             LayoutVar &targetVar = graph.getVariable(targetID);
             if (targetVar.kind == LayoutKind::Storage) continue;
+            // Hard-bound domains already contain their only permitted seeds.
+            // Impossible propagated alternatives must not consume the finite
+            // candidate budget before RequireEncoding pruning runs.
+            if (llvm::any_of(graph.getConstraints(), [&](const auto &binding) {
+                  return binding.kind == ConstraintKind::RequireEncoding &&
+                         binding.strength == ConstraintStrength::Hard &&
+                         llvm::is_contained(binding.vars, targetID);
+                }))
+              continue;
+            // Consumers may convert the natural result, but cannot propose a
+            // different producer layout through the reverse Convertible edge.
+            if (targetVar.reductionResult &&
+                constraint.kind != ConstraintKind::ReductionLayout)
+              continue;
             for (const LayoutCandidate &sourceCandidate : sourceCandidates) {
               FailureOr<Attribute> projected = projectLayoutCandidate(
                   graph, constraint, sourceID, sourceCandidate.value, targetID);
@@ -468,7 +485,8 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
   // from spuriously overflowing the bootstrap domain limit.
   projectCandidatesToFixedPoint();
   for (LayoutVar &var : graph.getVariables()) {
-    if (!var.candidates.empty() || var.kind == LayoutKind::Storage || var.instructionRole)
+    if (!var.candidates.empty() || var.kind == LayoutKind::Storage ||
+        var.instructionRole || var.reductionResult)
       continue;
     SmallVector<LayoutCandidate> candidates;
     target.enumerateCandidates(var, candidates);
@@ -508,6 +526,8 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
   }
   if (failed(prepareInstructionTuples(graph, target, root->getLoc())))
     return failure();
+  if (failed(prepareReductionPairs(graph, target, root->getLoc())))
+    return failure();
   return graph;
 }
 
@@ -532,6 +552,7 @@ static LogicalResult runPropagationWorklist(LayoutConstraintGraph &graph,
     if (relation.strength != ConstraintStrength::Hard ||
         !(isEqualityConstraint(relation.kind) || isSupportedUnaryLayoutConstraint(relation.kind) ||
           relation.kind == ConstraintKind::InstructionContract ||
+          relation.kind == ConstraintKind::ReductionLayout ||
           (strict && relation.kind == ConstraintKind::RequireEncoding)))
       continue;
     enqueue(relation.id);
@@ -555,7 +576,8 @@ static LogicalResult runPropagationWorklist(LayoutConstraintGraph &graph,
     bool require = relation.kind == ConstraintKind::RequireEncoding;
     bool unary = isSupportedUnaryLayoutConstraint(relation.kind);
     bool instruction = relation.kind == ConstraintKind::InstructionContract;
-    if (strict && !require && !unary && !instruction &&
+    bool reduction = relation.kind == ConstraintKind::ReductionLayout;
+    if (strict && !require && !unary && !instruction && !reduction &&
         llvm::none_of(relation.vars, [&](LayoutVarID var) {
           return graph.getVariable(var).candidates.size() == 1;
         }))
@@ -565,13 +587,14 @@ static LogicalResult runPropagationWorklist(LayoutConstraintGraph &graph,
       if (llvm::none_of(before, [&](auto entry) { return entry.first == var; }))
         before.emplace_back(var, graph.getVariable(var).candidates.size());
     LogicalResult result = success();
-    if (instruction) {
+    if (instruction || reduction) {
       for (auto [varID, unusedSize] : before) {
         auto &var = graph.getVariable(varID);
         llvm::erase_if(var.candidates, [&](const auto &candidate) {
           DenseMap<LayoutVarID, Attribute> assignment;
           assignment[varID] = candidate.value;
-          return !findInstructionSupport(graph, relation, assignment);
+          return reduction ? !findReductionSupport(graph, relation, assignment)
+                           : !findInstructionSupport(graph, relation, assignment);
         });
         updateState(var);
         if (var.state == LayoutState::Conflict) result = failure();

@@ -36,6 +36,7 @@ enum class ConstraintKind {
   SameLayout,
   Convertible,
   TransformLayout,
+  ReductionLayout,
   RequireEncoding,
   InstructionContract,
   StorageAccess,
@@ -76,6 +77,8 @@ struct LayoutVar {
   int64_t requiredThreads = 0;
   /// Instruction proposals replace generic SIMT defaults for this endpoint.
   bool instructionRole = false;
+  /// A reduction result is seeded only by forward projection, never defaults.
+  bool reductionResult = false;
 };
 
 enum class AccessKind { Read, Write };
@@ -111,6 +114,20 @@ struct InstructionLayoutContract {
   SmallVector<InstructionLayoutTuple, 0> tuples;
 };
 
+struct ReductionLayoutPair {
+  Attribute sourceEncoding;
+  Attribute resultEncoding;
+  Attribute binding;
+};
+
+/// Named, directed two-role relation; not an invertible axis permutation.
+struct ReductionLayoutContract {
+  Operation *source = nullptr;
+  int64_t axis = 0;
+  Attribute binding;
+  SmallVector<ReductionLayoutPair, 0> pairs;
+};
+
 struct LayoutConstraint {
   LayoutConstraintID id = 0;
   ConstraintKind kind = ConstraintKind::SameLayout;
@@ -125,6 +142,7 @@ struct LayoutConstraint {
   std::string stableUseKey;
   int64_t requiredThreads = 0;
   std::optional<InstructionLayoutContract> instruction;
+  std::optional<ReductionLayoutContract> reduction;
 };
 
 enum class RegionLayoutEdgeKind {
@@ -181,6 +199,7 @@ struct LayoutCandidatePreparationStatistics {
   uint64_t footprintEvaluations = 0;
   uint64_t pairProofEvaluations = 0;
   uint64_t instructionCombinations = 0;
+  uint64_t reductionCombinations = 0;
 };
 
 class LayoutConstraintGraph {

@@ -1,5 +1,6 @@
 #include "Dialect/Frisk/Target/SM90/SM90LayoutTarget.h"
 #include "Dialect/Frisk/Target/SM90/SM90GemmConstraints.h"
+#include "Dialect/Frisk/Target/SM90/SM90ReduceConstraints.h"
 
 #include "Dialect/Frisk/IR/FriskAttributes.h"
 
@@ -162,6 +163,15 @@ StorageLayoutAttr buildXor(MemRefType type, unsigned swizzleBytes) {
 
 class SM90LayoutTarget final : public LayoutTarget {
 public:
+  FailureOr<Attribute> buildReductionContract(const LayoutConstraintGraph &graph,
+      const LayoutConstraint &constraint, Attribute source, Attribute result) const override {
+    return buildSM90ReductionContract(graph, constraint, source, result);
+  }
+  LayoutProof verifyReductionContract(const LayoutConstraintGraph &graph,
+      const LayoutConstraint &constraint, Attribute source, Attribute result,
+      Attribute binding) const override {
+    return verifySM90ReductionContract(graph, constraint, source, result, binding);
+  }
   LogicalResult prepareInstructionCandidates(LayoutConstraintGraph &graph) const override {
     return prepareSM90MmaCandidates(graph);
   }

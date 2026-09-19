@@ -47,6 +47,8 @@ StringRef stringifyConstraintKind(ConstraintKind kind) {
     return "convertible";
   case ConstraintKind::TransformLayout:
     return "transform-layout";
+  case ConstraintKind::ReductionLayout:
+    return "reduction-layout";
   case ConstraintKind::RequireEncoding:
     return "require-encoding";
   case ConstraintKind::InstructionContract:
@@ -234,6 +236,7 @@ LogicalResult LayoutConstraintGraph::verifyInvariants(Location loc) const {
       return emitError(loc) << "layout constraint ID differs from its array position";
     if ((constraint.kind == ConstraintKind::Convertible ||
          constraint.kind == ConstraintKind::TransformLayout ||
+         constraint.kind == ConstraintKind::ReductionLayout ||
          constraint.kind == ConstraintKind::StorageAccess ||
          constraint.kind == ConstraintKind::CopyAccess ||
          constraint.kind == ConstraintKind::AliasLayout) &&
@@ -256,6 +259,43 @@ LogicalResult LayoutConstraintGraph::verifyInvariants(Location loc) const {
                               << id;
     if (constraint.provenance >= provenances.size())
       return emitError(loc) << "layout constraint has invalid provenance";
+    if (constraint.kind == ConstraintKind::ReductionLayout || constraint.reduction) {
+      if (constraint.kind != ConstraintKind::ReductionLayout || !constraint.reduction ||
+          constraint.vars.size() != 2 || constraint.instruction)
+        return emitError(loc) << "invalid reduction relation payload or arity";
+      const auto &reduction = *constraint.reduction;
+      auto *op = reduction.source;
+      if (!op || op->getName().getStringRef() != "frisk.reduce_tensor" ||
+          op->getNumOperands() != 1 || op->getNumResults() != 1 ||
+          provenances[constraint.provenance].source != op || reduction.pairs.size() > 16)
+        return emitError(loc) << "invalid reduction source or pair budget";
+      auto axis = op->getAttrOfType<IntegerAttr>("dim");
+      auto srcType = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+      auto dstType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+      if (!axis || !srcType || !dstType || axis.getInt() != reduction.axis ||
+          reduction.axis < 0 || reduction.axis >= srcType.getRank() ||
+          dstType.getRank() + 1 != srcType.getRank() ||
+          reduction.binding != op->getAttr("frisk.reduction_contract"))
+        return emitError(loc) << "reduction metadata differs from actual operation";
+      const auto &src = variables[constraint.vars[0]];
+      const auto &dst = variables[constraint.vars[1]];
+      if (src.kind != LayoutKind::Distributed || dst.kind != LayoutKind::Distributed ||
+          src.use != &op->getOpOperand(0) || src.value || src.shapedType != srcType ||
+          dst.value != op->getResult(0) || dst.use || dst.shapedType != dstType ||
+          !dst.reductionResult || src.requiredThreads != dst.requiredThreads ||
+          src.requiredThreads < 32 || src.requiredThreads > 1024 ||
+          (src.requiredThreads & (src.requiredThreads - 1)))
+        return emitError(loc) << "reduction role does not match actual SSA binding";
+      SmallVector<std::pair<Attribute, Attribute>> seen;
+      for (const auto &pair : reduction.pairs) {
+        auto key = std::make_pair(pair.sourceEncoding, pair.resultEncoding);
+        if (!pair.sourceEncoding || !pair.resultEncoding || !pair.binding ||
+            (reduction.binding && reduction.binding != pair.binding) ||
+            llvm::is_contained(seen, key))
+          return emitError(loc) << "invalid or duplicate reduction pair";
+        seen.push_back(key);
+      }
+    }
     if (constraint.instruction) {
       const auto &instruction = *constraint.instruction;
       if (constraint.kind != ConstraintKind::InstructionContract ||
@@ -495,7 +535,8 @@ void LayoutConstraintGraph::print(raw_ostream &os) const {
   os << "candidate-preparation origins=" << preparationStatistics.origins
      << " projected=" << preparationStatistics.projectedCandidates
      << " footprints=" << preparationStatistics.footprintEvaluations
-     << " pair-proofs=" << preparationStatistics.pairProofEvaluations << "\n";
+     << " pair-proofs=" << preparationStatistics.pairProofEvaluations
+     << " reduction-pairs=" << preparationStatistics.reductionCombinations << "\n";
 }
 
 raw_ostream &operator<<(raw_ostream &os,

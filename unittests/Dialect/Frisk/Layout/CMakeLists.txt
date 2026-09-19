@@ -1,8 +1,11 @@
 add_unittest(FriskUnitTests FriskLayoutUnitTests
+  ReduceConstraintTest.cpp
+  ReductionLayoutProofTest.cpp
   GemmConstraintTest.cpp
   SM90MmaLayoutProofTest.cpp
   InstructionConstraintTest.cpp
   GemmLayoutIntegrationTest.cpp
+  ReduceLayoutIntegrationTest.cpp
   CopyFillConstraintTest.cpp
   AliasRegionTest.cpp
   LayoutAliasAnalysisTest.cpp

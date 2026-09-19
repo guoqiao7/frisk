@@ -39,6 +39,14 @@ public:
       ArrayRef<Attribute>, Attribute) const {
     return {ProofStatus::Unknown, {}, "unsupported instruction contract"};
   }
+  virtual FailureOr<Attribute> buildReductionContract(
+      const LayoutConstraintGraph &, const LayoutConstraint &,
+      Attribute, Attribute) const { return failure(); }
+  virtual LayoutProof verifyReductionContract(
+      const LayoutConstraintGraph &, const LayoutConstraint &,
+      Attribute, Attribute, Attribute) const {
+    return {ProofStatus::Unknown, {}, "unsupported reduction contract"};
+  }
 };
 
 } // namespace mlir::frisk

@@ -89,7 +89,7 @@ LogicalResult collectParallelResourceConstraints(LayoutConstraintGraph &graph) {
   for (auto &var : graph.getVariables()) {
     if (var.kind != LayoutKind::Distributed) continue;
     auto parallel = var.anchor ? var.anchor->getParentOfType<ParallelOp>() : ParallelOp();
-    int64_t threads = var.instructionRole ? var.requiredThreads
+    int64_t threads = var.requiredThreads ? var.requiredThreads
                       : var.operationExecution ? var.operationExecution->threads
                       : parallel ? parallel.getThreads() : 0;
     if (!threads) continue;

@@ -6,9 +6,11 @@
 >
 > 首次审阅：2026-08-16；本次源码审计：2026-09-12
 >
-> 状态（2026-09-19）：M0–M3 与 M4 Task 18–20 已完成；Task 20 按确认契约实现，独立复审与 34 lit / 165 unit / 4 CTest 全部通过，记录见实现计划 §20.13。Task 21–22 尚未实施；源目录 main 上的 Task 19/20 修改未自动提交或推送。Task 19 历史 Gate 为 32 lit / 129 unit / 4 CTest；远端同步状态不由本文推断。
+> 状态（2026-09-19）：M0–M3 与 M4 Task 18–20 已完成；Task 21 的受限 Reduce 实现、独立复审及 197 unit / 36 lit / 4 CTest 回归已完成，完整 MMA→Reduce→tile_store 成功验收仍受 9 变量与 8 变量上限冲突限制，见实现计划 §21.8。Task 22 尚未实施。Task 19/20 已提交为本地 main `c028e82`，未 push；Task 21 未提交、未推送。远端同步状态不由本文推断。
 >
 > 实现更新（2026-09-19）：Task 20 的 SS＋RS 具体契约 v1 已确认并实施；实际适配、有限联合约束与验证边界见下节及实现计划 §20.13。本轮核对固定上游快照的 GEMM 源码，没有升级快照或运行上游测试。
+
+> 后续进展（2026-09-19）：Task 19/20 既有修改已按用户要求提交到本地 main `c028e82`，提交前重跑 165 unit / 34 lit / 4 CTest 全通过；未 push。以上“未提交”为历史时点记录。Task 21 已经用户确认并实施，下面区分已验证能力与尚未完成的完整链验收，不将分段成功计作端到端成功。
 >
 > 关联文档：[Frisk 布局推断系统设计方案](./layout_inference_design.md)、[GF(2) 与组合布局说明](./gf2_layout_guide.md)
 
@@ -33,6 +35,27 @@
 - 本轮没有 TileLang/Triton 运行实验、GPU benchmark 或端到端性能结论。上表 27/74/4 是 M3 基线；Task 18 的新增测试结果单独记录，不能混用。
 
 ## 1. 结论摘要
+
+### Task 21 实现增量与验收边界（2026-09-19）
+
+详细审计、候选方案、数学语义与验收点见[实现计划 Task 21](./layout_inference_implementation_plan.md#task-21-增加-tensor-reduce-op-并迁移-reduce-ownership)的 §21.1–21.7。Frisk 基线为 `c028e82`；本轮再次核实本地审计副本的 TileLang/Triton HEAD 与 §0 的固定 SHA 一致，没有升级快照或运行上游测试。GitHub 固定源码网页读取失败时使用该本地副本核对，不据其他旧分支推断新版行为。
+
+| 本轮源码证据 | Frisk 的适配选择 | 不能据此作出的结论 |
+| --- | --- | --- |
+| 旧 Frisk Reduce 只处理 Local MemRef，依赖 src layout 投影/condense；旧 kind 为 add/mul/min/max | 新 `reduce_tensor` 使用纯 Tensor SSA、sum/max/min；旧 clear/Buffer 生命周期转换留 Task 22 | 旧接口改名不等于已完成新 solver 集成 |
+| 旧测试 case 5 标注 src map 有问题；case 7 的 register/thread 映射遗漏 batch 坐标；另有 16-thread 案例 | 先验证完整源持有关系；把错误或超支持范围样例分类，补独立贡献 oracle | legacy PASS 不代表所有旧布局都可作为正确性真值 |
+| TileLang `ComputeReducerLayout/InferLayout` 仍进行普通 Fragment 源驱动投影、condense 和目的包含性检查 | 正向生成有限自然输出，反向仅筛选已存在源候选，区分信息生成与约束删减 | 新 reducer epoch 机制不代表传统 Reduce 已全面双向化 |
+| TileLang PartialFragment 区分 addend lanes 与 equal-value copy groups，禁止 partial 走普通 replica 等价捷径 | 新证明分别建模不同逻辑输入、输入同值副本与完成输出副本；sum 每个逻辑输入恰贡献一次 | Frisk 不能声称发现了上游尚未考虑的“部分和不等于副本”问题；也不声称本轮实现 epoch |
+| Triton Reduce 结果使用 SliceEncoding；lowering 已有寄存器内、warp 内及其余布局转换/同步步骤 | 复用 Frisk 通用 BitLinear 表示，配有名二端点归约关系和操作级可验证通信契约 | 分层归约或显式转换本身不是 Frisk 独创；当前 Frisk 仍不交付对应 GPU lowering |
+| 当前 Frisk TransformLayout 只实现等 rank 置换，公共 Distributed 不支持一般 ragged/动态 tile | 不伪造 Reduce 逆变换；经用户确认，原非二次幂 fallback 延后，静态受限子集先闭环 | 不能以 Shared 通信方案或现有 Product 代数库存在推断 ragged 已支持 |
+
+用户已确认并实施的方案是“坐标 fiber 的精确贡献证明＋有限 pair 支持筛选＋实际 IR 独立复验”。自然输出删维并压缩 register 子空间，保留线程维的复制语义；源副本按 first_owner 选代表参与相邻配对确定性树，完成后分发到全部输出持有者。公共 API 不新增 PartialFragment 类型，也不借用 Task 20 的四端点 MMA tuple 假装二端点归约。实现采用通用 Distributed encoding、独立 `ReductionLayout` 关系及类型化 `ReductionContractAttr`；12 字段契约和实际代码定位见实现计划 §21.8。新增 32 项单元与 2 份 lit，全量 197 unit / 36 lit / 4 CTest 通过；不宣称性能最优、研究独创性已验证或数值 GPU 验收已完成。
+
+已确认的数值语义：sum 允许并行重结合、不保证串行 bitwise 相等；max/min 采用 NaN 传播及正负零有序的 maximumf/minimumf 语义，参考已核对的[MLIR Arith 定义](https://mlir.llvm.org/docs/Dialects/ArithOps/)。不复制 TileLang `nan_propagate` 缺省或旧 clear 行为而不说明差异。非二次幂、rank-0、一般 Product、PartialFragment/epoch、GPU lowering 与完整成本优化不在首版。
+
+**支持边界的实施发现：** 完整 SS MMA→Reduce→tile_store 在现有生产者/use 分离模型下需要 9 个连通变量，与原契约的 8 变量上限冲突。未放宽上限；将 MMA→Reduce 与 Reduce→store 分段验证，完整链保留超限拒绝证据。这不是相较上游的能力优势，不能把两个切片的成功拼成端到端成功。实际回归结果与复审修正记录见实现计划 §21.8；本轮仍未进行 GPU 或上游运行实验。
+
+固定源码锚点：[TileLang Reduce](https://github.com/tile-ai/tilelang/blob/5e149e31674658f94779c7d0c6039549a1853123/src/op/reduce.cc)、[PartialFragment](https://github.com/tile-ai/tilelang/blob/5e149e31674658f94779c7d0c6039549a1853123/src/layout/layout.h)、[Triton Reduce encoding](https://github.com/triton-lang/triton/blob/42c5e89c3871e1472968c92dd8e5c02d0b3dd40c/lib/Dialect/TritonGPU/IR/Dialect.cpp)、[Triton Reduce lowering](https://github.com/triton-lang/triton/blob/42c5e89c3871e1472968c92dd8e5c02d0b3dd40c/lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp)。
 
 ### Task 20 实现增量（2026-09-19）
 
@@ -477,7 +500,7 @@ Triton 的 conversion 优化包含：
 
 ### 6.1 当前实现状态与目标架构必须分开
 
-审计起点 Frisk `b120d06` 已完成 M0–M3，原文“LayoutInfer 是空壳”已经过时。下表加入 Task 18 增量（实现提交 `9c28b67`，已合入 main）及本轮尚未提交的 Task 19/20 增量：
+审计起点 Frisk `b120d06` 已完成 M0–M3，原文“LayoutInfer 是空壳”已经过时。下表加入 Task 18 增量（实现提交 `9c28b67`，已合入 main）及 Task 19/20 增量（本地 main 提交 `c028e82`）：
 
 | 已有部件/功能 | 已核对实现 | 当前边界 |
 | --- | --- | --- |

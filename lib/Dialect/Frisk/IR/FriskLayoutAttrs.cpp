@@ -13,6 +13,40 @@
 #include "mlir/IR/DialectImplementation.h"
 
 namespace mlir::frisk {
+LogicalResult ReductionContractAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, DictionaryAttr p) {
+  if (!p || p.size() != 12) return emitError() << "reduction contract requires complete v1 typed schema";
+  auto str = [&](StringRef key, ArrayRef<StringRef> values) {
+    auto a = p.getAs<StringAttr>(key);
+    return a && llvm::is_contained(values, a.getValue());
+  };
+  auto version = p.getAs<IntegerAttr>("version");
+  auto axis = p.getAs<IntegerAttr>("axis");
+  auto threads = p.getAs<IntegerAttr>("threads");
+  auto src = p.getAs<DenseI64ArrayAttr>("source_shape");
+  auto dst = p.getAs<DenseI64ArrayAttr>("result_shape");
+  if (!version || !axis || !threads || !src || !dst ||
+      !version.getType().isSignlessInteger(64) || version.getInt() != 1 ||
+      !axis.getType().isSignlessInteger(64) || !threads.getType().isSignlessInteger(64) ||
+      !str("target",{"sm_90","sm_90a"}) || !str("kind",{"sum","max","min"}) ||
+      !str("dtype",{"f16","bf16","f32"}) ||
+      !str("algorithm",{"canonical_fiber_tree_v1"}) ||
+      !str("input_policy",{"first_owner"}) || !str("output_policy",{"broadcast_complete"}) ||
+      !str("scope",{"register","warp","cta_shared_tree"}))
+    return emitError() << "reduction contract requires complete v1 typed schema";
+  if (src.size() < 2 || dst.size()+1 != src.size() || axis.getInt() < 0 ||
+      axis.getInt() >= int64_t(src.size()) || threads.getInt() < 32 || threads.getInt() > 1024 ||
+      !llvm::isPowerOf2_64(threads.getInt()))
+    return emitError() << "reduction contract has invalid axis, rank or threads";
+  SmallVector<int64_t> shape(src.asArrayRef());
+  if (llvm::any_of(shape, [](int64_t e) { return e <= 1 || !llvm::isPowerOf2_64(e); }))
+    return emitError() << "reduction contract requires static power-of-two extents greater than one";
+  shape.erase(shape.begin()+axis.getInt());
+  if (dst.asArrayRef() != ArrayRef<int64_t>(shape))
+    return emitError() << "reduction contract result shape must delete axis";
+  return success();
+}
+
 LogicalResult MmaDescriptorPlanAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, DictionaryAttr p) {
   if (!p || p.size() != 5)

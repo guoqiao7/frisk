@@ -1,11 +1,49 @@
 #include "Dialect/Frisk/IR/FriskOps.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/MathExtras.h"
 
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 
 namespace mlir::frisk {
+
+LogicalResult ReduceTensorOp::verify() {
+  auto src = cast<RankedTensorType>(getSource().getType());
+  auto dst = cast<RankedTensorType>(getResult().getType());
+  if (getKind() != "sum" && getKind() != "max" && getKind() != "min")
+    return emitOpError("reduce-shape: kind must be sum/max/min");
+  if (src.getRank() < 2 || dst.getRank() != src.getRank() - 1 ||
+      getDim() < 0 || getDim() >= src.getRank())
+    return emitOpError("reduce-shape: rank >= 2 and valid axis required");
+  auto dtype = src.getElementType();
+  if ((!dtype.isF16() && !dtype.isBF16() && !dtype.isF32()) || dtype != dst.getElementType())
+    return emitOpError("reduce-shape: requires matching f16/bf16/f32 element types");
+  for (auto type : {src,dst}) {
+    if (!type.hasStaticShape() || llvm::any_of(type.getShape(), [](int64_t e) {
+          return e <= 1 || !llvm::isPowerOf2_64(e); }))
+      return emitOpError("reduce-shape: requires static power-of-two extents greater than one");
+    if (auto attr = type.getEncoding()) {
+      auto encoding = dyn_cast<DistributedEncodingAttr>(attr);
+      if (!encoding) return emitOpError("reduce-shape: requires distributed tensor encoding");
+      if (failed(encoding.verifyForType(type,getLoc()))) return failure();
+    }
+  }
+  SmallVector<int64_t> shape(src.getShape());
+  shape.erase(shape.begin() + getDim());
+  if (dst.getShape() != ArrayRef<int64_t>(shape))
+    return emitOpError("reduce-shape: result must delete the reduction axis");
+  if (auto attr = (*this)->getAttr("frisk.reduction_contract"))
+    if (!isa<ReductionContractAttr>(attr))
+      return emitOpError("reduce-contract: expected complete typed reduction contract");
+  if (auto attr = (*this)->getAttr("frisk.execution_threads")) {
+    auto integer = dyn_cast<IntegerAttr>(attr);
+    if (!integer || !integer.getType().isSignlessInteger(64) || integer.getInt() < 32 ||
+        integer.getInt() > 1024 || !llvm::isPowerOf2_64(integer.getInt()))
+      return emitOpError("reduce-thread-group: requires 32/64/128/256/512/1024 threads");
+  }
+  return success();
+}
 
 void MmaOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   for (OpOperand &operand : getOperation()->getOpOperands())

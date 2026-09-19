@@ -1,6 +1,21 @@
 #ifndef FRISK_LAYOUT_OPS
 #define FRISK_LAYOUT_OPS
 
+def Frisk_ReduceTensorOp : Frisk_Op<"reduce_tensor", [Pure]> {
+  let summary = "pure, deterministic-tree tensor reduction";
+  let description = [{
+    Reduces one axis with sum/max/min in the input floating dtype. Sum permits
+    parallel reassociation using canonical_fiber_tree_v1, counting each distinct
+    input once; replicas are equal-value copies, never independent addends.
+    Max/min propagate NaN and order signed zeros as maximumf/minimumf.
+    No implicit initializer, promotion, destination or memory side effects.
+  }];
+  let arguments = (ins AnyRankedTensor:$source, StrAttr:$kind, I64Attr:$dim);
+  let results = (outs AnyRankedTensor:$result);
+  let hasVerifier = 1;
+  let assemblyFormat = "$source attr-dict `:` type($source) `->` type($result)";
+}
+
 def Frisk_MmaOp : Frisk_Op<"mma", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "synchronous mathematical tensor matrix multiply-accumulate";

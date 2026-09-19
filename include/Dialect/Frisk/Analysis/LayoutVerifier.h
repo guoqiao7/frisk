@@ -12,6 +12,7 @@ struct LayoutSolution {
   DenseMap<LayoutVarID, Attribute> assignments;
   SmallVector<LayoutConversionEdge> conversions;
   DenseMap<LayoutConstraintID, Attribute> instructionBindings;
+  DenseMap<LayoutConstraintID, Attribute> reductionBindings;
 };
 
 struct BootstrapSolverLimits {

@@ -4,7 +4,7 @@
 > 日期：2026-08-16
 > 范围：NVIDIA SM90/SM90a；布局推断、布局验证与布局物化
 > 核心选择：Local/Register Tile 使用 `RankedTensorType + EncodingAttr`，Shared/Global 保持 MemRef，由统一约束系统连接分布式布局与存储布局
-> 实施状态（2026-09-19）：M0–M3、M4 Task 18–20 已完成；Task 20 的 Tensor MMA、有限联合指令契约及实际 IR 证明通过独立复审与 165 unit / 34 lit / 4 CTest，验收记录见实现计划 §20.13。Task 21 Reduce 和 Task 22 legacy normalization 尚未实施；可执行 GPU 验收仍属后续阶段。Task 19/20 直接修改源目录，未自动提交或推送。
+> 实施状态（2026-09-19）：M0–M3、M4 Task 18–20 已完成；Task 21 Reduce 的受限实现、独立复审及 197 unit / 36 lit / 4 CTest 回归已完成，设计增量见 §20，验收记录见实现计划 §21.8。完整 MMA→Reduce→tile_store 成功验收仍因 9 变量超过保留的 8 变量上限而未完成；Task 22 legacy normalization 尚未实施，可执行 GPU 验收仍属后续阶段。Task 19/20 已按用户要求提交到源目录 main `c028e82`，未 push；Task 21 未提交、未推送。
 
 ## 1. 结论先行
 
@@ -1164,3 +1164,17 @@ negative tests 独立覆盖其拒绝边界。详细接口及命令见
 - 已接入的表示仍为 Distributed BitLinear、Storage Affine/BitLinear；逻辑及硬件枚举预算为 65536。线程支持 128/256/512/1024、完整四 warp 分组，policy 是确定性策略，不是性能最优证明。
 
 本任务不包含 Reduce、新的 legacy normalization、一般 Product 指令布局、非二次幂/尾块、Tensor B、FP16 accumulator、TF32/FP8/int/sparse、SM80 新路径、完整 CostVector、异步 lowering、GPU 数值或性能验收。旧 Buffer Gemm 仍保留供 legacy 回归，自动迁移留到 Task 22。
+
+## 20. M4 Task 21：Tensor Reduce、贡献者证明与通信契约
+
+具体契约、验收差异和运行记录见[实现计划 §21.1–21.8](layout_inference_implementation_plan.md#task-21-增加-tensor-reduce-op-并迁移-reduce-ownership)。
+
+- `frisk.reduce_tensor(source) -> result` 是纯 Tensor 值操作，沿一个轴删维归约。支持同 dtype 的 f16/bf16/f32 和 sum/max/min；sum 允许并行重结合，max/min 传播 NaN 并区分正负零。没有隐式 init/clear 或写回。
+- 独立二端点 `ReductionLayout` 固定关联 source-use 与 result；不将非可逆投影伪装为 TransformLayout，也不改动四角色 MMA 的 InstructionContract。生产者到 source-use 保留 Convertible。
+- 正向自然映射是删去归约坐标，并按原 register 位顺序保留投影后线性独立的列；删除零列和非零相关列，重新计算 register extent 与 replication。线程 carrier 不被悄悄重组。
+- 按逻辑 fiber 区分不同输入、输入同值副本和完整输出副本。每个逻辑输入选最小 `(cta,warp_group,warp,lane,register)` 持有者一次，按此顺序相邻配对合并、保留左侧代表，再将根结果广播给全部输出持有者。树和广播的通信边决定 register/warp/CTA shared-tree 范围。
+- `frisk.reduction_contract : ReductionContractAttr` 是完整 12 字段版本化 schema；`frisk.execution_threads` 是独立实际线程绑定。Target 纯验证从真实输入/结果 encoding 与属性重建唯一规范依赖，不生成候选或重新搜索算法。
+- 候选冻结后仅删减；每关系至多 16 个 pair，完整及部分 assignment 均需支持，选中 binding 按稳定约束 ID 物化。沿用 detached module 事务、实际 IR 独立验证和打印解析/二次运行稳定性。
+- 支持单 CTA、32/64/128/256/512/1024 线程、静态二次幂且每维大于 1 的输入，输入 rank 至少 2。逻辑及硬件各 65536 点预算；超预算 Unknown。保留 8 vars/component、4 candidates/domain，不提供无限全局搜索。
+
+完整 SS MMA→Reduce→tile_store 有 9 个真实图变量，超过现有上限；当前验收使用 MMA→Reduce 与 Reduce→store 两个切片，完整链作为超限拒绝用例，不宣称整链成功。静态依赖证明也不等于已分配 shared scratch、插入同步或执行 GPU 数值测试。PartialFragment/epoch、动态/ragged/标量结果、旧 Buffer Reduce normalization 和 GPU lowering 均不在本阶段。

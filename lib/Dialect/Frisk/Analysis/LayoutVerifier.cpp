@@ -1,6 +1,7 @@
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
 #include "Dialect/Frisk/Analysis/InstructionLayoutConstraints.h"
+#include "Dialect/Frisk/Analysis/ReductionLayoutConstraints.h"
 
 #include <functional>
 
@@ -17,6 +18,7 @@ namespace {
 bool isSupportedBootstrapHardConstraint(ConstraintKind kind) {
   return kind == ConstraintKind::RequireEncoding ||
          kind == ConstraintKind::InstructionContract ||
+         kind == ConstraintKind::ReductionLayout ||
          isSupportedUnaryLayoutConstraint(kind) ||
          isSupportedLayoutRelation(kind);
 }
@@ -27,6 +29,12 @@ bool satisfiesConstraint(const LayoutConstraintGraph &graph,
                          bool requireComplete) {
   if (constraint.strength != ConstraintStrength::Hard)
     return true;
+  if (constraint.kind == ConstraintKind::ReductionLayout) {
+    if (requireComplete && llvm::any_of(constraint.vars, [&](auto id) {
+          return !assignment.count(id);
+        })) return false;
+    return findReductionSupport(graph, constraint, assignment);
+  }
   if (constraint.kind == ConstraintKind::InstructionContract) {
     if (requireComplete && llvm::any_of(constraint.vars, [&](auto id) {
           return !assignment.count(id);
@@ -140,7 +148,8 @@ solveBootstrapLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &,
   for (const LayoutConstraint &constraint : graph.getConstraints()) {
     if (constraint.strength != ConstraintStrength::Hard ||
         (isSupportedBootstrapHardConstraint(constraint.kind) &&
-         (constraint.kind != ConstraintKind::InstructionContract || constraint.instruction)))
+         (constraint.kind != ConstraintKind::InstructionContract || constraint.instruction) &&
+         (constraint.kind != ConstraintKind::ReductionLayout || constraint.reduction)))
       continue;
     const LayoutProvenance &provenance =
         graph.getProvenances()[constraint.provenance];
@@ -259,6 +268,12 @@ solveBootstrapLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &,
            graph.getConstraint(rhs.constraint).stableUseKey;
   });
   for (const auto &constraint : graph.getConstraints()) {
+    if (constraint.kind == ConstraintKind::ReductionLayout) {
+      const auto *pair = findReductionSupport(graph, constraint, solution.assignments);
+      if (!pair) return failure();
+      solution.reductionBindings[constraint.id] = pair->binding;
+      continue;
+    }
     if (constraint.kind != ConstraintKind::InstructionContract) continue;
     const auto *tuple = findInstructionSupport(graph, constraint, solution.assignments);
     if (!tuple) return failure();
@@ -271,6 +286,10 @@ LogicalResult verifySolvedLayoutGraph(const LayoutConstraintGraph &graph,
                                       const LayoutSolution &solution,
                                       LayoutTarget &target, Location loc) {
   if (failed(graph.verifyInvariants(loc))) return failure();
+  for (const auto &entry : solution.reductionBindings)
+    if (entry.first >= graph.getConstraints().size() ||
+        graph.getConstraint(entry.first).kind != ConstraintKind::ReductionLayout)
+      return emitError(loc) << "reduction binding does not identify an authorized graph constraint";
   for (const auto &entry : solution.instructionBindings)
     if (entry.first >= graph.getConstraints().size() ||
         graph.getConstraint(entry.first).kind != ConstraintKind::InstructionContract)
@@ -310,6 +329,19 @@ LogicalResult verifySolvedLayoutGraph(const LayoutConstraintGraph &graph,
       return failure();
   }
   for (const LayoutConstraint &constraint : graph.getConstraints()) {
+    if (constraint.kind == ConstraintKind::ReductionLayout) {
+      Attribute binding = solution.reductionBindings.lookup(constraint.id);
+      if (!constraint.reduction || !binding ||
+          (constraint.reduction->binding && binding != constraint.reduction->binding))
+        return emitError(loc) << "missing or conflicting reduction binding";
+      auto proof = target.verifyReductionContract(graph, constraint,
+          solution.assignments.lookup(constraint.vars[0]),
+          solution.assignments.lookup(constraint.vars[1]), binding);
+      if (proof.status != ProofStatus::Proven)
+        return emitError(loc) << "reduce-contract: "
+            << (proof.status == ProofStatus::Unknown ? "unknown proof: " : "") << proof.reason;
+      continue;
+    }
     if (constraint.kind == ConstraintKind::InstructionContract) {
       Attribute binding = solution.instructionBindings.lookup(constraint.id);
       if (!constraint.instruction || !binding ||

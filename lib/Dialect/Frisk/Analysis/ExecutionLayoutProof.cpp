@@ -16,28 +16,7 @@ LayoutProof reject(StringRef reason, ArrayRef<int64_t> point = {}) {
   return {ProofStatus::Disproven, SmallVector<int64_t>(point), reason.str()};
 }
 LayoutProof proven() { return {ProofStatus::Proven, {}, "bounded execution proof"}; }
-struct Enumeration {
-  SmallVector<uint64_t> logical;
-  SmallVector<uint64_t> first;
-  SmallVector<int64_t> shape;
-  std::array<uint64_t, 5> topology;
-  SmallVector<int64_t> hardware(uint64_t id) const {
-    SmallVector<int64_t> point(5);
-    for (unsigned c = 0; c < 5; ++c) {
-      point[4-c] = id % topology[c];
-      id /= topology[c];
-    }
-    return point; // cta, warp_group, warp, lane, register.
-  }
-  SmallVector<int64_t> coordinate(uint64_t id) const {
-    SmallVector<int64_t> point(shape.size());
-    for (size_t i = shape.size(); i-- > 0;) {
-      point[i] = id % shape[i];
-      id /= shape[i];
-    }
-    return point;
-  }
-};
+using Enumeration = ExecutionEnumeration;
 LayoutProof enumerate(DistributedEncodingAttr execution, RankedTensorType type,
                       StringRef policy, Enumeration &out) {
   if (policy != "all" && policy != "first_owner")
@@ -144,6 +123,12 @@ LayoutProof enumerate(DistributedEncodingAttr execution, RankedTensorType type,
   return proven();
 }
 } // namespace
+
+LayoutProof mlir::frisk::enumerateExecutionLayout(DistributedEncodingAttr execution,
+    RankedTensorType logicalType, ExecutionEnumeration &out) {
+  out = ExecutionEnumeration{};
+  return enumerate(execution, logicalType, "first_owner", out);
+}
 
 LayoutProof mlir::frisk::proveExecutionOwnership(DistributedEncodingAttr execution,
     RankedTensorType logicalType, StringRef writerPolicy) {
