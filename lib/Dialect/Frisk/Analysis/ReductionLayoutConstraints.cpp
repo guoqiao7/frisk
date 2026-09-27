@@ -134,7 +134,7 @@ LogicalResult prepareReductionPairs(LayoutConstraintGraph &graph,
     const auto &src = graph.getVariable(constraint.vars[0]);
     const auto &dst = graph.getVariable(constraint.vars[1]);
     if (src.candidates.size() > 4 || dst.candidates.size() > 4)
-      return emitError(loc) << "bootstrap layout solver limit exceeded: reduction candidate domain is too large";
+      return emitError(loc) << "reduction proof budget exceeded: candidate domain is too large";
     std::optional<LayoutProof> firstFailure;
     {
       ScopedDiagnosticHandler quiet(loc.getContext(), [](Diagnostic &) { return success(); });

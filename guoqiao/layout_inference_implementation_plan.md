@@ -8,7 +8,11 @@
 
 **Tech Stack:** C++17、LLVM/MLIR ODS/TableGen、MLIR Pass/Dialect Conversion、Affine/Presburger、SCF、MemRef、Tensor、GPU/NVGPU/NVVM、LLVM ADT/APInt、CMake/Ninja、llvm-lit/FileCheck、CTest、CUDA/Nsight 性能工具。
 
+> **最新验收（2026-09-27）：Task 23 按确认的方案 A 与 §23.1–23.8 完成，独立复审及 272 unit / 49 lit / 4 CTest / 5 Python 测试、旧生产接口隔离扫描通过，实际记录见 §23.9。9 变量核心及 Copy/Parallel128/MMA/Reduce/Global 写回整链成功，补齐 Task 21/22 的历史集成缺口；M5 Task 24–26 尚未完成。本轮仍在源目录 main，未 commit/push。以下旧状态保留为历史记录。**
+
 > **执行状态（2026-09-19）：M0–M3 与 M4 Task 18–20 已完成。Task 21 已按确认契约完成受限 Reduce 实现、独立复审与 197 unit / 36 lit / 4 CTest 回归；完整 MMA→Reduce→tile_store 的成功验收仍因 9 变量超过保留的 8 变量上限而未完成，详见 §21.8，不将测试全通过等同于原契约全部验收。Task 22 尚未实施。Task 19/20 已提交到源目录 main 的 `c028e82`，未 push；Task 21 未提交、未推送。**
+
+> **最新进展（2026-09-20）：Task 22 方案 A 及具体契约已确认，生命周期 normalization、持久根契约、事务 pipeline 和旧 oracle 隔离已实现，已通过最终独立复审与全量验收，记录见 §22.13。此前 Task 19/20 的 `c028e82` 与 Task 21 的 `14b39e9` 已推送到 `origin/main`（guoqiao7/frisk），以上未提交/未推送为历史时点记录。本轮修改尚未提交或推送，保留独立的 Task19–21 对比报告。**
 
 > **设计更新（2026-09-19）：Task 20 的 SS＋RS 具体契约 v1 已由用户确认；§20.1–20.11 是契约，§20.12 是执行计划，§20.13 记录实际实现、验证证据和限制。通用 encoding＋操作级指令 binding 的适配同时写入设计总文档 §19。**
 
@@ -2019,12 +2023,12 @@ Expected: 多 consumer IR 合法；共同布局或 conversion 由 solution 明�
 
 本轮读 Frisk `b120d06`、TileLang `5e149e3`、Triton `42c5e89` 的源码与相关测试；完整 SHA、永久链接及比较结论见[比较文档](./layout_inference_strategy_comparison.md)。TileLang 另对照旧 `6623b12`，未改用户的 TileLang checkout。
 
-| 阶段     | Task   | 本阶段目的                                | 本轮状态                                                            |
-| -------- | ------ | ----------------------------------------- | ------------------------------------------------------------------- |
-| 第一阶段 | 18     | 坐标 alias、显式 region graph、可审计收敛 | 用户已确认，已编码；最终 Gate 见 §18.9                             |
-| 第二阶段 | 19     | Copy/Fill/Parallel 进入新接口与约束       | 已按确认契约实现；独立复审及 Gate 记录见 §19.9                      |
+| 阶段     | Task   | 本阶段目的                                | 本轮状态                                                                         |
+| -------- | ------ | ----------------------------------------- | -------------------------------------------------------------------------------- |
+| 第一阶段 | 18     | 坐标 alias、显式 region graph、可审计收敛 | 用户已确认，已编码；最终 Gate 见 §18.9                                          |
+| 第二阶段 | 19     | Copy/Fill/Parallel 进入新接口与约束       | 已按确认契约实现；独立复审及 Gate 记录见 §19.9                                  |
 | 第三阶段 | 20–21 | Tensor MMA/GEMM 与 Reduce 规则适配        | Task 20 已通过 Gate；Task 21 受限实现与回归完成，完整链成功验收待解决，见 §21.8 |
-| 第四阶段 | 22     | normalization、旧生产逻辑退役和集成       | 未开始；依赖前三阶段 Gate                                           |
+| 第四阶段 | 22     | normalization、旧生产逻辑退役和集成       | 已按方案 A 实现，最终验收见 §22.13；Task 21 完整链验收缺口仍保留                |
 
 审计起点结论与具体修正（以下 Frisk 缺口描述固定于 `b120d06`，实施后状态见 §18.9）：
 
@@ -2339,11 +2343,11 @@ git diff --check
 
 方案比较：
 
-| 方案 | 取舍 | 决定 |
-| --- | --- | --- |
-| 继续要求 Copy 两端布局相同，Fill 只检查存储单射 | 改动小，但没有表达真正的执行者，也错误限制独立存储的复制 | 不采用 |
-| 将 Copy/Fill 改为 Tensor 新算子族 | 可直接使用 Tensor encoding，但扩展前端、结果类型和旧调用迁移范围 | 本任务不采用 |
-| 保留现有 MemRef 算子，新增实际可物化的执行布局与写入者契约 | 存储与执行分布分开，能接入统一约束和独立核验 | 采用 |
+| 方案                                                       | 取舍                                                             | 决定         |
+| ---------------------------------------------------------- | ---------------------------------------------------------------- | ------------ |
+| 继续要求 Copy 两端布局相同，Fill 只检查存储单射            | 改动小，但没有表达真正的执行者，也错误限制独立存储的复制         | 不采用       |
+| 将 Copy/Fill 改为 Tensor 新算子族                          | 可直接使用 Tensor encoding，但扩展前端、结果类型和旧调用迁移范围 | 本任务不采用 |
+| 保留现有 MemRef 算子，新增实际可物化的执行布局与写入者契约 | 存储与执行分布分开，能接入统一约束和独立核验                     | 采用         |
 
 #### 19.2 公共表示：存储布局与操作执行布局分开
 
@@ -2482,12 +2486,12 @@ struct OperationExecutionBinding {
 
 使用 writing-plans、test-driven-development 和分阶段执行/复审流程；保持用户指定的源目录工作方式，不创建 worktree。先完成本设计的书面复核，再进入下面的红灯测试与实现。
 
-- [x] **A：执行绑定与 Ownership。** 在 `CopyFillConstraintTest.cpp` 先测试未物化绑定被拒绝、32 线程/4 元素的 all-writer 失败与 first-owner 成功、缺失元素覆盖失败；再实现操作级变量、Ownership 和 actual-only 属性读取。
-- [x] **B：Copy 双向与向量访问。** 先测试 src 已知/dst 未知、dst 已知/src 未知、两端合法异构存储、不同根偏移不直接复制、同 root 非恒等重叠拒绝；向量宽度测试 3 非法、16 字节未对齐失败、目的不连续失败、标量基线成功。再替换旧 Copy 收集器并实现有界证明。
-- [x] **C：Parallel。** 先测试 128 线程候选、32/128 显式编码冲突、其他合法线程数、非法线程数和 Tensor 消費边界，再接入 ResourceLimit 与目标候选环境。
-- [x] **D：独立核验与事务性。** 从合法结果分别篡改四项操作属性，测试 actual verifier 拒绝且 target enumeration 次数为 0；测试推断一次/两次输出一致，失败前后原 IR 逐字一致。
-- [x] **E：旧路径隔离与回归。** 用真实 pass 调用检查 legacy Parallel inference 的调用次数为 0，单独运行旧 adapter 测试；统计只反映实际调用，不添加永远为零的伪计数。生产新路径与 legacy 行为不要求文本一致，差异按逻辑坐标和硬契约解释。
-- [x] **F：全量 Gate 与文档。** 运行以下命令，记录实际新增测试数量、支持边界及设计偏差；同步比较文档，不以 M3/Task 18 的旧测试数代替本任务验收。
+- [X] **A：执行绑定与 Ownership。** 在 `CopyFillConstraintTest.cpp` 先测试未物化绑定被拒绝、32 线程/4 元素的 all-writer 失败与 first-owner 成功、缺失元素覆盖失败；再实现操作级变量、Ownership 和 actual-only 属性读取。
+- [X] **B：Copy 双向与向量访问。** 先测试 src 已知/dst 未知、dst 已知/src 未知、两端合法异构存储、不同根偏移不直接复制、同 root 非恒等重叠拒绝；向量宽度测试 3 非法、16 字节未对齐失败、目的不连续失败、标量基线成功。再替换旧 Copy 收集器并实现有界证明。
+- [X] **C：Parallel。** 先测试 128 线程候选、32/128 显式编码冲突、其他合法线程数、非法线程数和 Tensor 消費边界，再接入 ResourceLimit 与目标候选环境。
+- [X] **D：独立核验与事务性。** 从合法结果分别篡改四项操作属性，测试 actual verifier 拒绝且 target enumeration 次数为 0；测试推断一次/两次输出一致，失败前后原 IR 逐字一致。
+- [X] **E：旧路径隔离与回归。** 用真实 pass 调用检查 legacy Parallel inference 的调用次数为 0，单独运行旧 adapter 测试；统计只反映实际调用，不添加永远为零的伪计数。生产新路径与 legacy 行为不要求文本一致，差异按逻辑坐标和硬契约解释。
+- [X] **F：全量 Gate 与文档。** 运行以下命令，记录实际新增测试数量、支持边界及设计偏差；同步比较文档，不以 M3/Task 18 的旧测试数代替本任务验收。
 
 ```bash
 cmake --build build --target FriskLayoutUnitTests check-frisk \
@@ -2567,14 +2571,14 @@ git commit -m "feat: migrate copy fill and parallel constraints"
 
 实现起点 `ef85a0d`，在源目录 main 工作，未创建 worktree，未自动提交或推送。以下内容是 Task 19 的实际增量，不表示 M4 整体完成。
 
-| 已实现能力 | 实现位置 | 直接验证 |
-| --- | --- | --- |
-| 操作级执行变量、四项实际 IR 契约 | `OperationLayoutConstraints`、`LayoutConstraint`、`MaterializeLayouts` | Fill 推断后可读取全部属性；删除任意一项、篡改 encoding/threads/writer/vector 均拒绝；actual verifier 的目标枚举次数为 0 |
-| Copy 的读写坐标关系与有限双向建议 | `LayoutRelations` 的 CopyAccess/StorageAccess、`LayoutAliasAnalysis::rebaseStorageCopyCandidate` | 2×2 f32 的行主序源/列主序目的可复制；已知任一端可向另一端提供重定位候选；同 root 恒等和不相交成功，位移重叠失败 |
-| 实際写入者与向量访问证明 | `ExecutionLayoutProof` | all-writer replica 冲突、first_owner 规范选择、缺失覆盖、输入名字重排、寄存器向量连续性/对齐/尾部、packed 标量基线、65536 点上界 |
-| Parallel 线程环境与实际 use 转换 | `collectParallelResourceConstraints`、`SM90DistributedCandidates` | 六种合法线程数；128 线程作用域拒绝 32 线程显式属性/编码；外部 32 线程 Tensor 在内部消费边界插入转换，生产者保持原编码 |
-| 硬约束闭环和可核验统计 | Strict/Common worklist、bootstrap solver、actual verifier | Ownership/ResourceLimit 不再是未执行的枚举名；宽向量要求真实删除候选；冻结候选与 monotone stats 上界保持有效 |
-| 旧路径隔离与文本回放 | 真实 legacy 调用计数、Kernel/Parallel/Copy printer/parser | 显式调用 legacy 后计数增加；运行新 pass 后不增加；打印后重新解析、第二次推断与第一次逐字一致 |
+| 已实现能力                        | 实现位置                                                                                             | 直接验证                                                                                                                         |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| 操作级执行变量、四项实际 IR 契约  | `OperationLayoutConstraints`、`LayoutConstraint`、`MaterializeLayouts`                         | Fill 推断后可读取全部属性；删除任意一项、篡改 encoding/threads/writer/vector 均拒绝；actual verifier 的目标枚举次数为 0          |
+| Copy 的读写坐标关系与有限双向建议 | `LayoutRelations` 的 CopyAccess/StorageAccess、`LayoutAliasAnalysis::rebaseStorageCopyCandidate` | 2×2 f32 的行主序源/列主序目的可复制；已知任一端可向另一端提供重定位候选；同 root 恒等和不相交成功，位移重叠失败                 |
+| 实際写入者与向量访问证明          | `ExecutionLayoutProof`                                                                             | all-writer replica 冲突、first_owner 规范选择、缺失覆盖、输入名字重排、寄存器向量连续性/对齐/尾部、packed 标量基线、65536 点上界 |
+| Parallel 线程环境与实际 use 转换  | `collectParallelResourceConstraints`、`SM90DistributedCandidates`                                | 六种合法线程数；128 线程作用域拒绝 32 线程显式属性/编码；外部 32 线程 Tensor 在内部消费边界插入转换，生产者保持原编码            |
+| 硬约束闭环和可核验统计            | Strict/Common worklist、bootstrap solver、actual verifier                                            | Ownership/ResourceLimit 不再是未执行的枚举名；宽向量要求真实删除候选；冻结候选与 monotone stats 上界保持有效                     |
+| 旧路径隔离与文本回放              | 真实 legacy 调用计数、Kernel/Parallel/Copy printer/parser                                            | 显式调用 legacy 后计数增加；运行新 pass 后不增加；打印后重新解析、第二次推断与第一次逐字一致                                     |
 
 具体例子：在 `threads=128` 的 Parallel 中对 `memref<4xf32>` 做 Fill，默认执行布局可以让每个元素有 32 个持有者，但物化的 `writer_policy="first_owner"` 只允许每个元素的首个规范持有者写入。把属性显式设为 `all` 会因重复写入被拒绝。128 线程对应的默认 topology 是 `[register=1, lane=32, warp=4, warp_group=1, cta=1]`，不是已选择 WGMMA 指令。
 
@@ -2649,17 +2653,17 @@ B_eff[k,j] = trans_b ? B[j,k] : B[k,j]
 
 数学操作不内嵌 PTX mnemonic；目标规则按以下受限表选择契约：
 
-| 项目 | 本任务设计边界 |
-| --- | --- |
-| 目标 | 最近的 `frisk.target` 必须明确为 `"sm_90a"`；缺失、`sm_90` 基础能力或其他目标在 MMA target 校验中拒绝。不改变 Task 19 普通操作的默认目标行为 |
-| 数据类型 | A/B 同为 f16 或同为 bf16；init/result 为 f32。暂不接入 f16 accumulator、TF32、FP8、整数或稀疏路径 |
-| SS | A/B 为 Shared MemRef，必须是直接 `layout_view` 结果；根和静态别名链沿用 Task 18 |
-| RS | A 为 RankedTensor，B 为上述 Shared MemRef；禁止将 Local MemRef 当作 Tensor fragment |
-| Tensor B | 通用类型语法可表达，但本 SM90a target 拒绝。不得偷偷插入 shared allocation/store 把它变成另一种路径 |
-| 执行域 | 保留现有 Distributed 的非零 rank、每维大于 1 的二次幂限制；M 是 64 的倍数，K 是 16 的倍数，N 至少为 8 |
-| 原子与拼接 | 原子为 `64×n_atom×16`，`n_atom ∈ {8,16,32,64,128,256}`；整 tile 可以在 M/N/K 上重复原子，不 padding、不改 shape、不处理尾块 |
-| 线程 | 单 CTA，`threads ∈ {128,256,512,1024}`；外层 Parallel 的线程数必须一致，无 Parallel 时缺省 128，显式合法线程数可替代缺省值 |
-| 控制流 | 保留 M3 的 SSA/SCF 布局规则；Task 20 不新增 warpgroup 分歧、动态线程参与或异步 token 分析 |
+| 项目       | 本任务设计边界                                                                                                                                    |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 目标       | 最近的`frisk.target` 必须明确为 `"sm_90a"`；缺失、`sm_90` 基础能力或其他目标在 MMA target 校验中拒绝。不改变 Task 19 普通操作的默认目标行为 |
+| 数据类型   | A/B 同为 f16 或同为 bf16；init/result 为 f32。暂不接入 f16 accumulator、TF32、FP8、整数或稀疏路径                                                 |
+| SS         | A/B 为 Shared MemRef，必须是直接`layout_view` 结果；根和静态别名链沿用 Task 18                                                                  |
+| RS         | A 为 RankedTensor，B 为上述 Shared MemRef；禁止将 Local MemRef 当作 Tensor fragment                                                               |
+| Tensor B   | 通用类型语法可表达，但本 SM90a target 拒绝。不得偷偷插入 shared allocation/store 把它变成另一种路径                                               |
+| 执行域     | 保留现有 Distributed 的非零 rank、每维大于 1 的二次幂限制；M 是 64 的倍数，K 是 16 的倍数，N 至少为 8                                             |
+| 原子与拼接 | 原子为`64×n_atom×16`，`n_atom ∈ {8,16,32,64,128,256}`；整 tile 可以在 M/N/K 上重复原子，不 padding、不改 shape、不处理尾块                 |
+| 线程       | 单 CTA，`threads ∈ {128,256,512,1024}`；外层 Parallel 的线程数必须一致，无 Parallel 时缺省 128，显式合法线程数可替代缺省值                     |
+| 控制流     | 保留 M3 的 SSA/SCF 布局规则；Task 20 不新增 warpgroup 分歧、动态线程参与或异步 token 分析                                                         |
 
 硬件支持不等于 Frisk 当前表示支持：例如硬件存在的 `n=24` 原子不属于上述二次幂子集，不能通过改 shape 或忽略 encoding verifier 来接受。
 
@@ -2779,14 +2783,14 @@ Tensor result/消费位置仍使用 `DistributedEncodingAttr`，Shared 仍使用
 
 实施采用先红后绿及独立复审，先逐个打通 SS/RS vertical slice，再扩展合法模板；不能仅新增 Op 并打印一个 contract 就标记完成。
 
-- [x] **A：数学 IR 与副作用。** rank/正 shape、M/N/K、矩形 transpose、f16/bf16→f32、init/result 关系、MemRef Read/no Write、零 Tensor 初始化，printer/parser。
-- [x] **B：独立硬件坐标 oracle。** 固定原子的 A packed halves、accumulator 坐标、不同 lane/warp/寄存器顺序；多原子 M/K 拼接与 N-group replication。测试参考表不能调用待测候选生成器构造“期望值”。
-- [x] **C：SS/RS 与 descriptor。** 两种输入 dtype、所有数学 transpose 组合、K/MN major、四种 swizzle；合法及不满足支持边界的组合分类测试。覆盖父 buffer 切片的 K-panel stride、非零起点、根对齐不足、phase 错误、地址区间越界；B Tensor/Local MemRef 明确拒绝。
-- [x] **D：线程与 policy。** 128/256/512/1024、group 连续性、FullRow/FullCol/Square、无合法分组、显式 threads 与 Parallel 冲突；`sm_90a` 成功、缺失 target/`sm_90`/SM80 新路径拒绝。
-- [x] **E：联合关系与收敛。** 构造“每对看似都有支持，但不存在完整合法 tuple”的反例；重复端点、稳定 remap、多 MMA 共用 storage、显式绑定冲突、8 vars/4 candidates 边界及超限、最多 256 个组合和点数预算。256 是四个合法候选域的组合上界，不人为制造域合法却有更多组合的假场景；损坏或重复的 tuple payload 单独按图不变量拒绝。统计证明冻结后只删不增。
-- [x] **F：实际物化。** 外部 init/A encoding 保持不变，在 MMA 消费处转换；零拷贝 shared binding；删除 contract/threads、篡改 fragment/packing/descriptor/分组后拒绝；target 生成及 tuple 枚举计数均为 0；失败 IR 逐字不变、二次推断逐字一致。
-- [x] **G：legacy 分类差分。** 用旧 adapter 比较适用子集的逻辑持有关系与地址，不比较 Attribute 字面相等；旧 FP16 accumulator 用例只能作为旧行为回归，不能冒充本次 FP32 accumulator 的数值等价测试。SM80、B-local、错误 group 组织、过时 ABI 分类记录；不保留已知错误求一致。
-- [x] **H：全量 Gate、独立复审和文档。** 新单元 `GemmConstraintTest.cpp`、`SM90MmaLayoutProofTest.cpp`；新增 `infer-gemm-layout.mlir`、错误/回放 lit 与必要 IR verifier 测试；同步本文和比较文档的实际实现/差异/计数。
+- [X] **A：数学 IR 与副作用。** rank/正 shape、M/N/K、矩形 transpose、f16/bf16→f32、init/result 关系、MemRef Read/no Write、零 Tensor 初始化，printer/parser。
+- [X] **B：独立硬件坐标 oracle。** 固定原子的 A packed halves、accumulator 坐标、不同 lane/warp/寄存器顺序；多原子 M/K 拼接与 N-group replication。测试参考表不能调用待测候选生成器构造“期望值”。
+- [X] **C：SS/RS 与 descriptor。** 两种输入 dtype、所有数学 transpose 组合、K/MN major、四种 swizzle；合法及不满足支持边界的组合分类测试。覆盖父 buffer 切片的 K-panel stride、非零起点、根对齐不足、phase 错误、地址区间越界；B Tensor/Local MemRef 明确拒绝。
+- [X] **D：线程与 policy。** 128/256/512/1024、group 连续性、FullRow/FullCol/Square、无合法分组、显式 threads 与 Parallel 冲突；`sm_90a` 成功、缺失 target/`sm_90`/SM80 新路径拒绝。
+- [X] **E：联合关系与收敛。** 构造“每对看似都有支持，但不存在完整合法 tuple”的反例；重复端点、稳定 remap、多 MMA 共用 storage、显式绑定冲突、8 vars/4 candidates 边界及超限、最多 256 个组合和点数预算。256 是四个合法候选域的组合上界，不人为制造域合法却有更多组合的假场景；损坏或重复的 tuple payload 单独按图不变量拒绝。统计证明冻结后只删不增。
+- [X] **F：实际物化。** 外部 init/A encoding 保持不变，在 MMA 消费处转换；零拷贝 shared binding；删除 contract/threads、篡改 fragment/packing/descriptor/分组后拒绝；target 生成及 tuple 枚举计数均为 0；失败 IR 逐字不变、二次推断逐字一致。
+- [X] **G：legacy 分类差分。** 用旧 adapter 比较适用子集的逻辑持有关系与地址，不比较 Attribute 字面相等；旧 FP16 accumulator 用例只能作为旧行为回归，不能冒充本次 FP32 accumulator 的数值等价测试。SM80、B-local、错误 group 组织、过时 ABI 分类记录；不保留已知错误求一致。
+- [X] **H：全量 Gate、独立复审和文档。** 新单元 `GemmConstraintTest.cpp`、`SM90MmaLayoutProofTest.cpp`；新增 `infer-gemm-layout.mlir`、错误/回放 lit 与必要 IR verifier 测试；同步本文和比较文档的实际实现/差异/计数。
 
 验收至少包含 `128×128×64` 的 SS/RS f16/bf16→f32 例子及 `64×64×16` 原子例子；它们必须在未放宽既有 solver 限制的真实 pass 中成功，不只通过独立 helper。
 
@@ -2830,10 +2834,10 @@ git diff --check
 
 执行使用 subagent-driven-development：独立的 IR/硬件证明子任务由专门实现者处理，主执行者负责通用图集成；分别测试和复审后执行全量 Gate。提交步骤由用户“不自动提交”要求替代为保留工作区修改。
 
-- [x] **20A：IR 和 SM90 纯证明。** 修改 `include/Dialect/Frisk/IR/FriskLayoutOps.td`、`FriskLayoutAttrs.td` 及对应 `lib/Dialect/Frisk/IR` 实现；新增 `include/Dialect/Frisk/Target/SM90/SM90GemmConstraints.h`、`SM90MmaLayoutProof.h` 和对应 cpp。先添加 `unittests/Dialect/Frisk/Layout/GemmConstraintTest.cpp`、`SM90MmaLayoutProofTest.cpp` 的数学 verifier、已知 fragment 坐标、SS/RS 地址反例并记录 RED；实现后分别 GREEN。目标桥接口是 `prepareSM90MmaCandidates(LayoutConstraintGraph &) -> LogicalResult`、`buildSM90MmaContract(const LayoutConstraintGraph &, const LayoutConstraint &, ArrayRef<Attribute>) -> FailureOr<Attribute>`、`verifySM90MmaContract(const LayoutConstraintGraph &, const LayoutConstraint &, ArrayRef<Attribute>, Attribute) -> LayoutProof`。它们不改 IR，最后一个不生成候选或搜索方案。
-- [x] **20B：通用联合图。** 修改 `LayoutConstraint.h/.cpp`、`LayoutTarget.h`、`LayoutVerifier.h/.cpp`、`LayoutPropagation.cpp`；新增 `Analysis/MmaLayoutConstraints.h/.cpp`。`InstructionLayoutContract` 保存 source、完整实际 binding 及角色顺序对应的 `{encodings,binding}` tuples；`LayoutSolution::instructionBindings` 按 constraint ID 记录方案。用手工有限域测试无 singleton 删除、两两可行但整体不可行、重复端点、未知类别和 ID 重排，先 RED 再实现。tuple 检查对每个已赋值端点要求相等，未赋值端点要求仍在当前域，完整 assignment 必须支持同一 tuple。测试命令 `cmake --build build --target FriskLayoutUnitTests --parallel 16` 后运行 `build/unittests/Dialect/Frisk/FriskLayoutUnitTests --gtest_filter='InstructionConstraintTest.*'`。
-- [x] **20C：真实 pass 和物化。** 修改 `DistributedLayoutConstraints.cpp`、`OperationLayoutConstraints.cpp`、`SM90LayoutTarget.cpp`、`MaterializeLayouts.cpp` 及 CMake 接线。target 抽象提供上述 prepare/build/verify 三个对应 virtual 方法，默认拒绝未知指令。RelationsOnly 在 prepare/build 前返回；实际 binding 读取属性并调用纯 verify。先用 `test/Transforms/infer-gemm-layout.mlir` 与错误用例触发未支持操作，再实现 A/B/init/result 角色、线程约束、独立 encoding、方案写回和原子回滚。分别核验 `64×64×16` 和 `128×128×64` SS/RS、两种 dtype、transpose/phase/线程篡改、二次运行与打印解析回放。
-- [x] **20D：复审、Gate 和文档。** 对 20A、20B/20C 做契约与代码质量复审；运行 §20.9 全部命令，记录新增测试、实际结果、限制及与原契约差异；同步比较文档。未跑的 GPU/上游测试明确标未执行。
+- [X] **20A：IR 和 SM90 纯证明。** 修改 `include/Dialect/Frisk/IR/FriskLayoutOps.td`、`FriskLayoutAttrs.td` 及对应 `lib/Dialect/Frisk/IR` 实现；新增 `include/Dialect/Frisk/Target/SM90/SM90GemmConstraints.h`、`SM90MmaLayoutProof.h` 和对应 cpp。先添加 `unittests/Dialect/Frisk/Layout/GemmConstraintTest.cpp`、`SM90MmaLayoutProofTest.cpp` 的数学 verifier、已知 fragment 坐标、SS/RS 地址反例并记录 RED；实现后分别 GREEN。目标桥接口是 `prepareSM90MmaCandidates(LayoutConstraintGraph &) -> LogicalResult`、`buildSM90MmaContract(const LayoutConstraintGraph &, const LayoutConstraint &, ArrayRef<Attribute>) -> FailureOr<Attribute>`、`verifySM90MmaContract(const LayoutConstraintGraph &, const LayoutConstraint &, ArrayRef<Attribute>, Attribute) -> LayoutProof`。它们不改 IR，最后一个不生成候选或搜索方案。
+- [X] **20B：通用联合图。** 修改 `LayoutConstraint.h/.cpp`、`LayoutTarget.h`、`LayoutVerifier.h/.cpp`、`LayoutPropagation.cpp`；新增 `Analysis/MmaLayoutConstraints.h/.cpp`。`InstructionLayoutContract` 保存 source、完整实际 binding 及角色顺序对应的 `{encodings,binding}` tuples；`LayoutSolution::instructionBindings` 按 constraint ID 记录方案。用手工有限域测试无 singleton 删除、两两可行但整体不可行、重复端点、未知类别和 ID 重排，先 RED 再实现。tuple 检查对每个已赋值端点要求相等，未赋值端点要求仍在当前域，完整 assignment 必须支持同一 tuple。测试命令 `cmake --build build --target FriskLayoutUnitTests --parallel 16` 后运行 `build/unittests/Dialect/Frisk/FriskLayoutUnitTests --gtest_filter='InstructionConstraintTest.*'`。
+- [X] **20C：真实 pass 和物化。** 修改 `DistributedLayoutConstraints.cpp`、`OperationLayoutConstraints.cpp`、`SM90LayoutTarget.cpp`、`MaterializeLayouts.cpp` 及 CMake 接线。target 抽象提供上述 prepare/build/verify 三个对应 virtual 方法，默认拒绝未知指令。RelationsOnly 在 prepare/build 前返回；实际 binding 读取属性并调用纯 verify。先用 `test/Transforms/infer-gemm-layout.mlir` 与错误用例触发未支持操作，再实现 A/B/init/result 角色、线程约束、独立 encoding、方案写回和原子回滚。分别核验 `64×64×16` 和 `128×128×64` SS/RS、两种 dtype、transpose/phase/线程篡改、二次运行与打印解析回放。
+- [X] **20D：复审、Gate 和文档。** 对 20A、20B/20C 做契约与代码质量复审；运行 §20.9 全部命令，记录新增测试、实际结果、限制及与原契约差异；同步比较文档。未跑的 GPU/上游测试明确标未执行。
 
 #### 20.13 实现、复审与验证记录（2026-09-19）
 
@@ -2863,14 +2867,14 @@ git diff --check
 
 **Legacy 分类而非机械一致：**
 
-| 历史输入/行为 | Task 20 处理与证据 |
-| --- | --- |
-| 适用的旧 SM90 SS/RS storage 与 fragment | 保留原 adapter 持有关系/地址回归；不以属性文本相等或旧 f16 accumulator 冒充新 f32 数值等价 |
-| 旧 RS A 的 replication=2 | 新增分类测试：旧候选被新指令证明拒绝；128 线程新 canonical A 为 replication=1，不能沿用旧冗余组织；B storage 地址仍可独立对照 |
-| SM80 或仅 `sm_90` target | 新 MMA 只接受显式 `sm_90a`；旧 SM80 路径仅保留 legacy 回归，不扩展本阶段 target |
-| Local A/B、Tensor B | Local MemRef 不当寄存器；RS 必须 Tensor A，B 必须 Shared。明确拒绝，生命周期 normalization 留到 Task 22 |
-| 非四 warp 分组/错误线程 scope | 按合法 grid、连续 warp-group 和实际 Parallel scope 检查；不为旧 policy 输出放宽硬件边界 |
-| 旧 positional ABI、clear/annotation 行为 | 不复制位置下标或完成标记；新 op 用显式 init SSA 表示旧值依赖，不提供隐式 clear。旧 ABI 自动转换不在本任务 |
+| 历史输入/行为                            | Task 20 处理与证据                                                                                                            |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| 适用的旧 SM90 SS/RS storage 与 fragment  | 保留原 adapter 持有关系/地址回归；不以属性文本相等或旧 f16 accumulator 冒充新 f32 数值等价                                    |
+| 旧 RS A 的 replication=2                 | 新增分类测试：旧候选被新指令证明拒绝；128 线程新 canonical A 为 replication=1，不能沿用旧冗余组织；B storage 地址仍可独立对照 |
+| SM80 或仅`sm_90` target                | 新 MMA 只接受显式`sm_90a`；旧 SM80 路径仅保留 legacy 回归，不扩展本阶段 target                                              |
+| Local A/B、Tensor B                      | Local MemRef 不当寄存器；RS 必须 Tensor A，B 必须 Shared。明确拒绝，生命周期 normalization 留到 Task 22                       |
+| 非四 warp 分组/错误线程 scope            | 按合法 grid、连续 warp-group 和实际 Parallel scope 检查；不为旧 policy 输出放宽硬件边界                                       |
+| 旧 positional ABI、clear/annotation 行为 | 不复制位置下标或完成标记；新 op 用显式 init SSA 表示旧值依赖，不提供隐式 clear。旧 ABI 自动转换不在本任务                     |
 
 **最终 Gate：** 以下命令重新执行并通过，单元总数较 Task 19 的 129 增至 165。全量单元耗时 207207 ms，23 个 suite；其中 MMA 集成 suite 为 196996 ms，不是 GPU 性能数据。
 
@@ -2883,13 +2887,13 @@ ctest --test-dir build --output-on-failure
 git diff --check
 ```
 
-| 验证项 | 最终实际结果 |
-| --- | --- |
-| 构建及 lit | exit 0；34/34 PASS（9.46 s） |
-| 全量单元 | exit 0；165/165 PASS（207.207 s） |
-| CTest legacy executables | exit 0；4/4 PASS |
-| `git diff --check` | exit 0，无 whitespace 错误 |
-| 独立复审 | 通用图与硬件/全链路各自审阅；覆盖/诊断问题修正后复核，无剩余阻塞项 |
+| 验证项                   | 最终实际结果                                                       |
+| ------------------------ | ------------------------------------------------------------------ |
+| 构建及 lit               | exit 0；34/34 PASS（9.46 s）                                       |
+| 全量单元                 | exit 0；165/165 PASS（207.207 s）                                  |
+| CTest legacy executables | exit 0；4/4 PASS                                                   |
+| `git diff --check`     | exit 0，无 whitespace 错误                                         |
+| 独立复审                 | 通用图与硬件/全链路各自审阅；覆盖/诊断问题修正后复核，无剩余阻塞项 |
 
 构建观察到已有 Ninja `premature end of file; recovering` 和 CMake CMP0116 OLD 弃用提示，不宣称零警告构建。负例测试中的预期错误诊断不计为失败；最终通过以测试汇总与 exit code 为准。
 
@@ -2981,15 +2985,15 @@ git commit -m "feat: model gemm as layout constraints"
 
 #### 21.1 实现审计：哪些可以复用，哪些不能直接迁移
 
-| 核对对象 | 实际发现 | 对 Task 21 的影响 |
-| --- | --- | --- |
-| `FriskOps_Reduce.cpp::ReduceOp::inferLayout` | 旧输入/输出都是 Local MemRef；依赖已有 src layout，主要进行 src→dst 的维度消除与 replication condense | 复用逻辑投影思想，不复用 Local MemRef/DenseMap 生产路径，不宣称已有一般双向推断 |
-| `FriskOps.cpp::ReduceOp::verify` | 旧 kind 为 add/mul/min/max；检查删维 shape 和同 dtype，旧操作还有目的端/clear 语义 | 新 Tensor Reduce 的 sum 命名、纯值语义与旧 add/clear 的自动映射必须分开，自动 normalization 留给 Task 22 |
-| `test_pass/reduce_layout_test.cpp` | 8 个参数用例及 GEMM→Reduce legacy 用例；case 5 注释明确指出 src map 有问题；case 7 的实际 index 为 `d1*4+d1`、thread 为 `d2`，均不编码 batch 维 d0；case 6–8 使用 16 线程 | 不能以旧测试 PASS 证明输入持有关系合法。case 7 不同 batch 会落到相同物理槽；这些用例要分类或重新构造独立 oracle，不能机械复制期望 replication |
-| `LayoutRelations.cpp::permuteEncoding` | 当前 TransformLayout 接收等 rank 的轴置换，反向用逆置换；归约删维并非双射 | 不把 Reduce 塞进现有 permutation payload，不伪造逆矩阵补回已消失的 reduction 维 |
-| Task 19 execution proof | 已能验证静态覆盖、重复持有者、first_owner 和线程数；同一元素的多个持有者默认表达同值副本 | 需要另证“每个不同逻辑输入恰好贡献一次”；普通 coverage/replication 检查不能单独证明 sum 没有多算 |
-| Task 20 instruction tuples | 四角色及 MMA source 的不变量是明确契约，不是任意 arity 的通用计算节点 | Reduce 采用有名的二端点关系和独立方案绑定；不复制端点凑成四元 MMA tuple |
-| 当前公共布局表示 | Distributed pass 支持静态非零 rank、每维大于 1 的二次幂 BitLinear；已有 8 vars / 4 candidates 和 65536 点预算 | 原提纲中的非二次幂 guarded/shared fallback 不能只加一个分支就实现，需要先扩展表示与边界证明 |
+| 核对对象                                       | 实际发现                                                                                                                                                                       | 对 Task 21 的影响                                                                                                                             |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `FriskOps_Reduce.cpp::ReduceOp::inferLayout` | 旧输入/输出都是 Local MemRef；依赖已有 src layout，主要进行 src→dst 的维度消除与 replication condense                                                                         | 复用逻辑投影思想，不复用 Local MemRef/DenseMap 生产路径，不宣称已有一般双向推断                                                               |
+| `FriskOps.cpp::ReduceOp::verify`             | 旧 kind 为 add/mul/min/max；检查删维 shape 和同 dtype，旧操作还有目的端/clear 语义                                                                                             | 新 Tensor Reduce 的 sum 命名、纯值语义与旧 add/clear 的自动映射必须分开，自动 normalization 留给 Task 22                                      |
+| `test_pass/reduce_layout_test.cpp`           | 8 个参数用例及 GEMM→Reduce legacy 用例；case 5 注释明确指出 src map 有问题；case 7 的实际 index 为`d1*4+d1`、thread 为 `d2`，均不编码 batch 维 d0；case 6–8 使用 16 线程 | 不能以旧测试 PASS 证明输入持有关系合法。case 7 不同 batch 会落到相同物理槽；这些用例要分类或重新构造独立 oracle，不能机械复制期望 replication |
+| `LayoutRelations.cpp::permuteEncoding`       | 当前 TransformLayout 接收等 rank 的轴置换，反向用逆置换；归约删维并非双射                                                                                                      | 不把 Reduce 塞进现有 permutation payload，不伪造逆矩阵补回已消失的 reduction 维                                                               |
+| Task 19 execution proof                        | 已能验证静态覆盖、重复持有者、first_owner 和线程数；同一元素的多个持有者默认表达同值副本                                                                                       | 需要另证“每个不同逻辑输入恰好贡献一次”；普通 coverage/replication 检查不能单独证明 sum 没有多算                                             |
+| Task 20 instruction tuples                     | 四角色及 MMA source 的不变量是明确契约，不是任意 arity 的通用计算节点                                                                                                          | Reduce 采用有名的二端点关系和独立方案绑定；不复制端点凑成四元 MMA tuple                                                                       |
+| 当前公共布局表示                               | Distributed pass 支持静态非零 rank、每维大于 1 的二次幂 BitLinear；已有 8 vars / 4 candidates 和 65536 点预算                                                                  | 原提纲中的非二次幂 guarded/shared fallback 不能只加一个分支就实现，需要先扩展表示与边界证明                                                   |
 
 固定上游证据再次核对本地审计副本的 HEAD：TileLang `5e149e31674658f94779c7d0c6039549a1853123`、Triton `42c5e89c3871e1472968c92dd8e5c02d0b3dd40c`。没有刷新浮动 main，也没有运行上游测试。GitHub 固定源码网页本轮读取返回 cache miss，源码判断来自同 SHA 本地副本，不将其他本地 TileLang 分支误当该快照。
 
@@ -2999,11 +3003,11 @@ git commit -m "feat: model gemm as layout constraints"
 
 #### 21.2 方案取舍
 
-| 方案 | 收益 | 问题与结论 |
-| --- | --- | --- |
-| A：坐标投影＋贡献者证明＋有界通信方案（推荐） | 保持 Tensor/Storage 双域、有限候选、实际 IR 独立验证；能接上 Task 20 MMA 输出 | 首版限定现有静态 BitLinear 支持集，需要新增归约专用关系，但改动边界可控 |
-| B：只迁移旧 dst map/replication 公式 | 实现最短 | 无法证明重复输入未被多算，难以独立核验通信需求，不作为完整 Task 21 交付 |
-| C：同时引入 PartialFragment/epoch、非二次幂及 GPU lowering | 支持范围更广 | 扩展类型/语义/调度多个系统，超出当前单任务，单独规划 |
+| 方案                                                       | 收益                                                                          | 问题与结论                                                              |
+| ---------------------------------------------------------- | ----------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| A：坐标投影＋贡献者证明＋有界通信方案（推荐）              | 保持 Tensor/Storage 双域、有限候选、实际 IR 独立验证；能接上 Task 20 MMA 输出 | 首版限定现有静态 BitLinear 支持集，需要新增归约专用关系，但改动边界可控 |
+| B：只迁移旧 dst map/replication 公式                       | 实现最短                                                                      | 无法证明重复输入未被多算，难以独立核验通信需求，不作为完整 Task 21 交付 |
+| C：同时引入 PartialFragment/epoch、非二次幂及 GPU lowering | 支持范围更广                                                                  | 扩展类型/语义/调度多个系统，超出当前单任务，单独规划                    |
 
 推荐 A。此选择包含对原提纲的明确缩限：非二次幂 fallback 改为可测试的 unsupported 边界，待支持表示/guard 的后续任务补齐；不把 Shared 通信方案误说成已经支持 ragged shape。
 
@@ -3056,14 +3060,14 @@ F(y) = {x | P(x) = y}
 
 #### 21.6 验收分组与旧行为分类
 
-- [x] 数学 verifier：所有 kind/dtype、dim 越界、删维 shape、输入/结果类型不匹配、rank-0/动态/非二次幂拒绝、纯副作用及 printer/parser；sum/max/min 的语义差异和 NaN/±0 分类有独立 CPU oracle。
-- [x] 布局代数：reduce 首/中/尾轴、register 位压缩、相关列/XOR 混合、coverage、replication 重算及自定义维名；不能由待测候选生成器生成唯一“期望值”。
-- [x] 贡献证明：线程内、跨 lane、跨 warp、跨 warp-group，输入/输出副本分离；sum 漏算/重复、错误 partial、跨行混合、缺失结果分发、thread scope 和预算负例；CPU 模拟检查每个输出完整贡献集合。
-- [x] 真实推断的已通过子集：`64×64→64`、3D 删中轴、`128×128` MMA→按行 Reduce、Reduce→Global tile_store、连续两次 Reduce、外部显式编码转换、SCF/Parallel 环境；保留 bootstrap 上限。
+- [X] 数学 verifier：所有 kind/dtype、dim 越界、删维 shape、输入/结果类型不匹配、rank-0/动态/非二次幂拒绝、纯副作用及 printer/parser；sum/max/min 的语义差异和 NaN/±0 分类有独立 CPU oracle。
+- [X] 布局代数：reduce 首/中/尾轴、register 位压缩、相关列/XOR 混合、coverage、replication 重算及自定义维名；不能由待测候选生成器生成唯一“期望值”。
+- [X] 贡献证明：线程内、跨 lane、跨 warp、跨 warp-group，输入/输出副本分离；sum 漏算/重复、错误 partial、跨行混合、缺失结果分发、thread scope 和预算负例；CPU 模拟检查每个输出完整贡献集合。
+- [X] 真实推断的已通过子集：`64×64→64`、3D 删中轴、`128×128` MMA→按行 Reduce、Reduce→Global tile_store、连续两次 Reduce、外部显式编码转换、SCF/Parallel 环境；保留 bootstrap 上限。
 - [ ] 原契约完整链成功验收：Task 20 `128×128` MMA 结果→按行 Reduce→tile_store。当前只验证 9 变量超限拒绝，分段成功不替代此项；须另行确认预算或等价压缩策略。
-- [x] 传播与独立核验：输出要求反向删源候选、无支持域失败、固定点统计、稳定 ID；缺少/篡改 reduction_contract、线程/通信范围、源/结果编码均 fail-closed；actual-only 生成计数为 0，事务回滚和回放逐字稳定。
-- [x] Legacy 分类：case 1–4 作为适用候选，仍先检查完整持有关系；case 5 的不一致 replication 不迁入正确性 oracle；case 7 的 batch 丢失作为反例并另建合法 3D 样例；case 6/8 的 16 线程不伪装成新支持集，补真实 32-thread 同值复制后的独立样例。旧 add→sum、mul/clear、SM80 GEMM 来源均记录支持/延期，不以旧文本相等为验收。
-- [x] 全量回归 Gate：新增 `ReduceConstraintTest.cpp`、`ReductionLayoutProofTest.cpp`、`ReduceLayoutIntegrationTest.cpp` 和 `infer-reduce-layout{,-errors}.mlir`，197 unit / 36 lit / 4 CTest 全通过；独立复审与未完成项见 §21.8。未执行 GPU/上游实验；本项通过不消除上述完整链验收缺口。
+- [X] 传播与独立核验：输出要求反向删源候选、无支持域失败、固定点统计、稳定 ID；缺少/篡改 reduction_contract、线程/通信范围、源/结果编码均 fail-closed；actual-only 生成计数为 0，事务回滚和回放逐字稳定。
+- [X] Legacy 分类：case 1–4 作为适用候选，仍先检查完整持有关系；case 5 的不一致 replication 不迁入正确性 oracle；case 7 的 batch 丢失作为反例并另建合法 3D 样例；case 6/8 的 16 线程不伪装成新支持集，补真实 32-thread 同值复制后的独立样例。旧 add→sum、mul/clear、SM80 GEMM 来源均记录支持/延期，不以旧文本相等为验收。
+- [X] 全量回归 Gate：新增 `ReduceConstraintTest.cpp`、`ReductionLayoutProofTest.cpp`、`ReduceLayoutIntegrationTest.cpp` 和 `infer-reduce-layout{,-errors}.mlir`，197 unit / 36 lit / 4 CTest 全通过；独立复审与未完成项见 §21.8。未执行 GPU/上游实验；本项通过不消除上述完整链验收缺口。
 
 #### 21.7 确认点与实施顺序
 
@@ -3077,14 +3081,14 @@ F(y) = {x | P(x) = y}
 
 **实现接线。**
 
-| 层次 | 实际代码与责任 |
-| --- | --- |
-| IR | `FriskLayoutOps.td/.cpp` 新增纯 `ReduceTensorOp`；`FriskLayoutAttrs.td/.cpp` 新增完整、严格的 `ReductionContractAttr` |
-| 基础证明 | `ExecutionLayoutProof.h/.cpp` 提取共享的有界坐标枚举；`ReductionLayoutProof.h/.cpp` 做自然投影、register 子空间基选取、规范贡献树和完整输出分发 |
-| 图关系 | `ReductionLayoutConstraints.h/.cpp` 收集 `[src-use,result]`、解析线程环境、冻结后构建最多 16 对合法编码和 binding；`LayoutConstraint` 检查实际 SSA 角色、axis、来源、pair 唯一性与稳定 ID |
-| Target | `SM90ReduceConstraints.h/.cpp` 解释 SM90/SM90a、线程与通信范围；通过 `LayoutTarget::buildReductionContract/verifyReductionContract` 接入，不把 target 字符串判断塞进通用 solver |
-| 传播和求解 | 正向生成自然输出，反向仅以已有 pair 删减；Strict/Common 重排受影响约束；部分和完整 assignment 都要求 pair 支持；`LayoutSolution::reductionBindings` 按稳定 constraint ID 保存方案 |
-| 物化与复验 | `MaterializeLayouts.cpp` 写 `frisk.reduction_contract` 和 `frisk.execution_threads`；实际 IR 路径不调用候选生成、pair 准备或 binding 搜索；失败不更新原 IR |
+| 层次       | 实际代码与责任                                                                                                                                                                                  |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| IR         | `FriskLayoutOps.td/.cpp` 新增纯 `ReduceTensorOp`；`FriskLayoutAttrs.td/.cpp` 新增完整、严格的 `ReductionContractAttr`                                                                   |
+| 基础证明   | `ExecutionLayoutProof.h/.cpp` 提取共享的有界坐标枚举；`ReductionLayoutProof.h/.cpp` 做自然投影、register 子空间基选取、规范贡献树和完整输出分发                                             |
+| 图关系     | `ReductionLayoutConstraints.h/.cpp` 收集 `[src-use,result]`、解析线程环境、冻结后构建最多 16 对合法编码和 binding；`LayoutConstraint` 检查实际 SSA 角色、axis、来源、pair 唯一性与稳定 ID |
+| Target     | `SM90ReduceConstraints.h/.cpp` 解释 SM90/SM90a、线程与通信范围；通过 `LayoutTarget::buildReductionContract/verifyReductionContract` 接入，不把 target 字符串判断塞进通用 solver             |
+| 传播和求解 | 正向生成自然输出，反向仅以已有 pair 删减；Strict/Common 重排受影响约束；部分和完整 assignment 都要求 pair 支持；`LayoutSolution::reductionBindings` 按稳定 constraint ID 保存方案             |
+| 物化与复验 | `MaterializeLayouts.cpp` 写 `frisk.reduction_contract` 和 `frisk.execution_threads`；实际 IR 路径不调用候选生成、pair 准备或 binding 搜索；失败不更新原 IR                                |
 
 `ReductionContractAttr` 的 v1 字典准确包含 12 个字段：`version/target/kind/axis/dtype/source_shape/result_shape/threads/algorithm/input_policy/output_policy/scope`。算法固定为 `canonical_fiber_tree_v1`，输入策略固定 `first_owner`，输出策略固定 `broadcast_complete`；scope 为 `register/warp/cta_shared_tree`。物理位置序列、相邻合并树和广播目的地由实际编码唯一重建，不存 SSA 指针或缓存编号。
 
@@ -3174,6 +3178,239 @@ git commit -m "feat: model reduce ownership constraints"
 ```
 
 ### Task 22: 实现 legacy normalization 并退役旧生产路径
+
+**状态（2026-09-20）：基线为源目录 main `14b39e9`；用户已确认方案 A 及 §22.3–22.11 具体契约；生命周期转换、持久契约、pipeline 与旧 oracle 隔离已完成，独立复审通过，最终 242 unit / 48 lit / 4 CTest / 5 Python 测试方法及隔离扫描全通过。原 Step 1–7 保留为历史提纲；不自动提交或推送。**
+
+#### 22.1 首轮实现审计
+
+| 核对位置                                                                                                                 | 源码事实                                                                                  | Task 22 必须解决的问题                                                                                                               |
+| ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `Passes.td`、`LayoutInfer.cpp`、`frisk-opt.cpp`                                                                    | 已有 infer/optimize pass，但没有 normalize pass 或具名 layout pipeline                    | 新增 pass、公开构造入口和显式 pipeline 注册，不能依赖链接器保留静态初始化                                                            |
+| `FriskOps.cpp::GemmOp::verify`                                                                                         | 旧 verifier 要求 A/B/C 同 dtype，按未转置形状检查矩阵维度                                 | 新 MMA 的 f16/bf16 输入、f32 累加不能通过简单改名从这类已验证旧 IR 得到；必须区分导入接口兼容扩展与数值精度变化                      |
+| `ffi/ir.cpp::create_gemm_op`                                                                                           | Python C++ 绑定同样要求 A/B/C 同 dtype，且按未转置形状推导 M/N/K                          | 只修改 C++ verifier 不足以使 Python 入口生成新支持的导入 IR；需明确同步范围及验证方式                                                |
+| 旧 Gemm 的`clear_accum`、旧 Reduce 的 `clear`                                                                        | 都是 BoolAttr；旧布局推断没有解释执行时如何清零/与旧目的值合并                            | 不能从布局代码推断已经验证的运行时数值语义；需明确 init、覆盖与累加契约，禁止把未初始化 alloc 或 tensor.empty 当零                   |
+| `FriskOps.td::ReduceOp`                                                                                                | dst 目前只标记 MemWrite，但若 clear=false 表示与旧 dst 合并，就需要读取旧值               | 必须同时核对数学语义与内存效应，不能只生成一个 reduce_tensor 就丢掉旧值依赖                                                          |
+| Local MemRef 生命周期                                                                                                    | 原计划要求可证明无 alias escape 的完整 def-use slice；当前尚无相应转换器                  | 明确 alloc、初始化、Copy/Fill、Gemm/Reduce、读取/写回、SCF 携带与别名的支持矩阵；未知使用、读前未初始化、部分改写必须拒绝            |
+| `FriskOps.td/.cpp`、`FriskOps_Reduce.cpp`、`FriskInterfaces.td`                                                    | 三个旧 inferLayout 方法与旧 DenseMap 接口仍在；新 infer pass 已经不调用它们               | 退役是删除生产 API 与依赖，不是再次宣称新 pass 首次与旧方法隔离                                                                      |
+| `test_pass/attr_test.cpp`、`reduce_layout_test.cpp`、`LegacyLayoutAdapterTest.cpp`、`CopyFillConstraintTest.cpp` | 仍直接调用旧 inferLayout，不能直接删方法后保留测试原样                                    | 将 baseline oracle 隔离到测试专用支持代码或固定独立 fixture，保留迁移分类覆盖；不能靠删测试或让生产 pass 调用旧 oracle 过关          |
+| `layout-alias-contract-lifetime.mlir`                                                                                  | Pure 的 whole-root layout_view 可被 canonicalize/DCE 删除，其子视图随后失去根对齐前置证据 | Task 18 遗留的 durable contract 需要纳入 Task 22：只保存已有且合法作用域内的保证，不得凭指令要求扩大根对齐，也不能让未知证据变成成功 |
+| Task 21 集成与 bootstrap solver                                                                                          | MMA→Reduce→store 仍为 9 个连通变量，现有限制为 8                                        | normalization 不会自动消除该限制；不得将 normalize 成功等同于整个 pipeline 成功，也不得绕过图或擅自提高上限                          |
+
+本轮检查的是 Frisk 自身源码与已有测试，未重新获取、运行或更新 TileLang/Triton 快照。旧归约的 clear 数值行为、旧 f16 累加与新 f32 累加的等价性均没有新增 GPU 证据。
+
+#### 22.2 已确认的范围选择与实施原则
+
+| 方案                                              | 做法                                                                                                                                       | 取舍                                                                                                |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| A：严格语义边界的受限完整生命周期迁移（用户已选） | 为可证明的 Local fragment 生命周期建立导入契约；数值类型不静默变化，初始化显式化；补 pipeline、持久契约及旧 API 退役，unsupported 明确拒绝 | 保持 Task 19–21 目标边界与当前求解预算；不承诺所有旧程序都可迁移，Task 21 完整链成功验收缺口仍保留 |
+| B：同时扩大数值与求解支持集                       | 除 normalization 外，实现旧 f16 累加语义的目标路径、更多旧 Reduce 变体，以及较大图求解                                                     | 覆盖面更大，但会改变 Task 20/21 契约并进入 Task 23 范围，应拆出额外设计与验收                       |
+| C：仅注册 pipeline 并拒绝所有旧操作               | 新入口存在但不转换真实 Local fragment                                                                                                      | 不能满足本 Task 的核心交付，不采用                                                                  |
+
+用户已选择 A，以下是本方案的设计底线（不是已实施事实）：
+
+- 不把旧 f16 C 自动提升成 f32 后声称等价；若扩展旧 Buffer 导入接口以允许显式 f32 C，必须在 verifier 与前端入口明确一致地表达，原不支持的数值路径给出诊断。
+- 将 clear 的覆盖/累加、Reduce kind 的映射、NaN/有符号零及并行重结合许可写成数学契约；无初始化证据时不得制造零值，无法证明语义兼容时不自动转换。
+- 先列清直线代码、SCF if/for/while、cast/subview/逃逸的支持与拒绝条件，再设计整个生命周期的转换；不以只改写一个 Op 冒充完整 alias group 的 normalization。
+- 使用事务式改写，区分 normalize pass 的成功与后续 infer/optimize 的成功；失败与重跑稳定性均需可测试。
+- 保持现有 8 vars/component、4 candidates/domain，不把 Task 21 的未完成成功用例改成已完成；大图求解单独确认。
+- 将根前置条件的保留、作用域和实际 IR 独立验证作为公共契约设计；不通过伪造 layout_view 副作用或重复偏移来保住证据。
+- 旧推断只允许作为测试 oracle 的隔离实现；生产接口、生成代码与链接关系一起退役，并保留全部受影响测试的有效覆盖。
+
+下面补充逐项转换规则、公共接口和验收用例。后续阶段按“生命周期 normalization → pipeline/持久契约 → 旧接口退役与全量回归”组织；不将历史提纲中的 commit 命令视为自动提交授权。
+
+#### 22.3 导入语义 v1：显式同意数学契约，不隐式改变精度
+
+**已确认的入口约定：** 需要迁移的 legacy Gemm/Reduce 必须在自身或最近的 `func.func/frisk.kernel/module` 上显式声明 `frisk.legacy_semantics = "tensor_v1"`。查找由内向外；没有属性的作用域继续向外查找，遇到已声明但类型/值不合法的属性立即报错，不跳过后回退外层。Copy/Fill、已经是新 Tensor 的程序不要求此标注。旧操作 verifier 不强制此标记，检查发生在 normalization 导入边界。
+
+这是对当前缺少完整旧数值 lowering 的直接应对：标注表示导入者接受本节数学语义，不声称已经通过 GPU 实验证明所有旧行为与新行为等价。缺少标注诊断 `legacy-math-contract: explicit tensor_v1 semantics required`；不得自动补上来绕过确认。即使 dead legacy 计算最终没有结果使用，也先验证其导入语义，不靠 DCE 隐藏不支持输入。
+
+| 操作/属性                 | v1 转换规则                                                                                                                                                        |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Gemm`clear_accum=true`  | 使用 C 形状和 f32 dtype 的显式正零 Tensor 作 init；不读取 C 的旧内容，产生`mma(A_eff,B_eff,zero)`                                                                |
+| Gemm`clear_accum=false` | 使用已经初始化的 C 当前 Tensor 作 init，产生`mma(A_eff,B_eff,C_current)`；未初始化即失败                                                                         |
+| Reduce`kind=add`        | 变成`reduce_tensor kind=sum`；接受 Task 21 的并行重结合及选中布局下的规范树，不承诺旧串行顺序 bitwise 等价                                                       |
+| Reduce`kind=max/min`    | 采用 Task 21 的 NaN 传播与有符号零语义，不按旧 kind 拼写推断 maxnum/minnum 行为                                                                                    |
+| Reduce`clear=true`      | 覆盖 dst，直接绑定归约结果；不额外与零或 ±∞ 合并，以免额外改变 ±0/NaN 行为                                                                                      |
+| Reduce`clear=false`     | 先完整归约，再与已初始化的 dst 当前值逐元素合并：`arith.addf/maximumf/minimumf(dst_current,reduced)`；固定为“旧 dst 在左”，不把旧 dst 当源副本或任意插入归约树 |
+| Reduce`mul` 或未知 kind | 拒绝，不能映射成 sum，也不顺带扩展 Task 21 支持集                                                                                                                  |
+
+Gemm 迁移只接受相同 dtype 的 f16/bf16 A/B 和 f32 C，目标必须显式为 `sm_90a`；C、RS 的 A 必须来自下面的可提升 Local 生命周期。B 必须 Shared，A 可 Shared 或 Local；不支持 Local B。M/N/K 按实际 transpose 后形状核对，policy 与支持的线程配置保留；不改变 Task 20 的支持集。
+
+旧 C 为 f16/bf16 的程序仍可作为 legacy IR/旧 oracle 输入存在，但 normalization 明确报告 `legacy-gemm-accumulator: f32 required; implicit promotion is forbidden`。不通过 f32 临时累加再截断伪装成旧 f16 累加。
+
+为能构造合法的 f32 C 导入 IR，旧 `GemmOp::verify` 与 `ffi/ir.cpp::create_gemm_op` 同步扩展：保留同 dtype 的合法旧输入；额外接受上述低精度 A/B＋f32 C 组合，统一按 transpose 解释维度并核对 M/N/K。Python `create_gemm` 包装层同步可选 `legacy_semantics` 关键字，默认不标注；Reduce builder 也提供同名可选标注入口。数学形状/类型检查与目标路径可迁移性分开，不把 verifier 接受等同于 normalize 成功。
+
+Gemm/Reduce 保留真实 memory effect：Gemm 读 A/B、写 C，clear=false 再读 C；Reduce 读 src、写 dst，clear=false 再读 dst。若暂时采用保守的无条件目的 Read，其语义也不得少报实际 Read，但测试必须能检查新增的 Reduce 目的读取；实现计划选择精确的条件 effect。其他依赖这些操作的递归 effect 检查继续有效。
+
+#### 22.4 Local fragment 支持集与逐操作转换
+
+以每个 Local allocation 的完整 def-use slice 为单位，不局部转换同一根的一半使用。候选根为函数/Kernel/Parallel 或受支持顺序 region 内的 `frisk.alloc_buffer`、`memref.alloc/alloca`，类型为 Local 静态 identity MemRef，offset=0，rank>0，各维>1 且为二次幂，dtype 为 f16/bf16/f32，逻辑元素不超过 65536。Local 参数、返回的 Local 引用、global、reinterpret、动态/非 identity descriptor 不作为可提升根。
+
+同根别名首版只支持保持静态 shape/dtype/memory space/identity descriptor 的 `memref.cast`（含类型完全相同的 cast）；将其折叠到同一根状态。Local subview、降维、reshape、带布局的 Local layout_view、scalar load/store、未知调用、取地址/逃逸，以及根作为既有 SCF MemRef iter_arg/结果传递均拒绝。这里的保守 Local 支持集不缩减 Task 18 对 Shared/Global 静态 cast/subview 的已有支持。
+
+为每个根维护 `Uninitialized` 或 `Initialized(Tensor SSA value)`，所有别名共享该状态。每个读取先检查状态；每个完整写入生成或绑定新值。未知使用即 `legacy local fragment escapes supported normalization boundary`，读前未初始化即 `legacy-fragment-uninitialized`；不得用 tensor.empty、undef 或自动补零消除错误。
+
+| 原操作                              | 归一化行为                                                                                                             |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| Local alloc                         | 建立 Uninitialized 状态；所有使用转换并验证成功后删除 allocation                                                       |
+| Local Fill                          | 用原 dtype/常数 bit pattern 的 dense splat 初始化或覆盖 Tensor；保留 -0，不强行改成 +0                                 |
+| 整块 Copy，Storage→Local           | 在原 Copy 位置生成`tile_load`，源必须具有合法 layout_view；保留读取相对其他写入的顺序                                |
+| 整块 Copy，Local→Storage           | 读取当前 Tensor，在原 Copy 位置生成`tile_store`，目标必须具有合法 layout_view                                        |
+| 整块 Copy，Local→Local             | 先读取源的当前值，再更新目的状态；两个根可暂时引用同一不可变值，后续覆盖其中一个不改变另一个；同根自复制仍要求已初始化 |
+| Storage→Storage Copy、Storage Fill | 保留原操作及 Task 19 契约，必要时仅为合法端点补 layout_view                                                            |
+| legacy Gemm                         | 按 §22.3 消费 A/B/init，生成 MMA，将结果设为 C 的新当前值                                                             |
+| legacy Reduce                       | 按 §22.3 读取 src，生成 Reduce 及必要的显式目的合并，将结果设为 dst 的新当前值                                        |
+| Local dealloc                       | 仅接受同块、支配关系可验证的最终 dealloc，后面不存在使用；提升成功后移除，不支持条件释放或 use-after-free              |
+
+Copy 首版仍为同 shape/dtype、空索引和空 map 的静态整块复制；不构造动态 slice。不得把任意直接 MemRef 当成硬件 fragment。新 `tile_load/store` 如果已经访问待提升 Local 根，或者 legacy 与新 Tensor 对同一 Local 根混用，则诊断不支持；不会建立两套并行状态。
+
+待移除的 Local Fill/Copy 如果带显式执行布局、writer policy 或 vector width，首版拒绝迁移，以免删除其硬要求。待提升 allocation 的旧布局标注也不得被静默丢弃。已知 Gemm/Reduce 的 target、policy、执行线程数有明确迁移规则：`frisk.threads` 只作为旧 Gemm 的线程别名，转换到 `frisk.execution_threads`；两者或与外层 Parallel 不一致则拒绝。无法解释的 Frisk 语义属性报错，普通位置/调试元数据可保留。
+
+Shared/Global 继续使用 MemRef：`frisk.alloc_buffer` 在合法静态空间下改为同 shape/dtype/memory space 的 `memref.alloc`，保留已有正数对齐，0 表示无额外保证而不是推断成 16/128/1024。复用已有 layout_view，不覆盖其显式 layout；对未绑定的合法根或 Task 18 已支持的视图才插入未编码 layout_view。未知别名、动态边界和 dtype 重解释仍拒绝。
+
+#### 22.5 控制流与初始化：明确产生循环携带值
+
+支持单块函数/Kernel 内的顺序代码及嵌套 `scf.if/for/while`；不修改函数签名，不跨过程提升，不将一般 CFG 或并发 region 当作顺序块处理。原有无关标量值、控制条件、操作顺序和 side effect 保留。
+
+- **If：** 两分支从同一入口状态开始；对被写的外部 Local 根按稳定根序追加 Tensor 结果及 yield。若分支不写该根，则传递入口旧值。两个分支都必须能提供已初始化值；无 else 等价于旧值路径，不能给未初始化的另一分支补零。分支内新建、不逃逸的根只在分支内提升。
+- **For：** 只为被修改的外部根追加 init/iter_arg/result/yield；入口必须已初始化，即使静态看起来至少迭代一次，也不靠 trip-count 特判绕过该约定。零次迭代返回入口值，循环体每次从 iter_arg 开始，尾部 yield 最新值。只读外部根捕获当前 Tensor，不额外生成携带槽。
+- **While：** 保留原 before/input 与 after/result 两套可能不同的 tuple，给被修改根分别追加对应 Tensor 槽；before 的最新状态送入 condition/after/result，after 的最新状态经 yield 回到 before。条件第一次为假时，结果仍包含执行过 before 的状态，不能错误地当成普通 for 的零次执行。循环入口的携带根必须已初始化。
+- **已有 Tensor 携带值：** 保留原槽顺序与类型，只追加新槽；M3/M4 的 SameLayout、Convertible、region edge 语义不变。新增槽采用 IR 根出现顺序，不用 DenseMap 遍历顺序。
+- **Parallel：** 仅提升其 body 内创建且不逃逸的 Local 根；拒绝跨 Parallel 边界捕获或写回外部 Local 根，避免把潜在并发访问当作一个顺序 SSA 状态。Shared/Global 捕获按既有规则保留。
+- **旧 `frisk.for`：** 涉及待提升根时，将静态合法的正 step 半开区间 `[lower,upper)` 改成 `scf.for`，把 `frisk.end` 替为 yield，并按上述规则加携带值；不进行展开。未知语义的 `frisk.block`、其他自定义 region、并行/异步控制流若捕获待提升根则拒绝，不凭名称假定可内联。
+
+Local allocation 在循环体内创建、使用且不逃逸时，每次执行从 Uninitialized 开始，只提升该局部生命周期，不能把一次迭代的状态自动带到下一次。
+
+转换完成只说明形成了合法 SSA。若新增携带值令图超过 8 变量，后续 infer 仍明确失败；不合并应独立的 producer/use，不展开循环绕过预算，不截断候选。
+
+#### 22.6 可持久核验的存储前置契约
+
+**已确认的公共操作：** `frisk.storage_contract %root {layout = #frisk.storage<...>} : memref<...>`，无结果，声明该根的完整存储映射和根指针对齐前置条件。只保存 alignment 不够，因为原 whole-root binding 还约束了子视图的地址一致性。
+
+它是编译期可观察的前置条件声明，不是生成一个可随意丢弃的值，不标记 Pure；首版以保守、不可随意删除的契约操作保留，不能伪报对实际数据的 MemRead/MemWrite，也不改变 `layout_view` 的 Pure 属性。该声明不执行 runtime 对齐检查，不提升 allocation 的真实对齐能力；要求由调用者/原始声明满足，未来 lowering 需显式消费或证明可消除该声明。
+
+来源只允许已有显式合法的 whole-root layout_view 或用户显式写入的 storage_contract，不能从子视图需求、MMA descriptor 对齐要求或候选偏好反推根保证。自动提取条件为同 shape、view→root 恒等、同 dtype/space；声明放在原绑定位置之前，不提升出分支/循环。Root 为当前支持的 allocation/global/函数或 Kernel 入口参数，不能把子视图伪装成新根。
+
+作用域按 dominance 核验：只有支配某个使用点的声明可为该点提供证据；分支内声明不能给兄弟分支或分支外使用提供保证。Task 18 原先全图归集 whole-root 保证的路径也要加同样的作用域检查。对本阶段不能证明一致作用域的组合保守拒绝，不把条件保证变成无条件保证。
+
+实际实现额外检查每层执行 region 均为已知的 func/Kernel/Parallel/scf.if/for/while 且具有 SSA dominance；Module 仅作容器。未知或 graph region 中 MLIR 的通用 dominance 不代表执行先后，不能用来借用根保证；其中的显式 storage_contract 和 whole-root 契约保存保守拒绝。此限制与无 Local 状态的同位置 Storage 端点绑定相互独立。
+
+图中将声明作为已确定的前置事实，增加有名 unary `RootStorageContract` 约束关联被约束的 Storage 变量，payload 引用实际声明及根坐标关系。它不创建可选布局变量或额外 producer/use：此处没有新选择域；已存在的真实 LayoutVar 仍全部按原规则计数。候选准备可从显式根 map 投影有限建议，冻结后仅筛选；每个候选必须与声明的完整根地址表相容。不是仅把 metadata 存起来却不参加求解。
+
+实际 IR 路径重新读取、验证并比较每个支配声明，使用 Task 18 的有界坐标/bit interval 证明；声明之间在可共同生效的区域必须相容。无有效消费者的声明也必须检查自身 schema、根归属、map 范围及对齐格式，不能靠死代码掩盖畸形输入。超预算返回 Unknown，不生成候选、不使用上次求解缓存。
+
+`normalize` 保存已有显式 whole-root 声明；完整 pipeline 在 infer 之后、conversion 优化之前再次保存实际物化的 whole-root 绑定，防止后续 DCE 丢掉证据。按同根、同位置作用域和同契约确定性去重，不重复追加；绑定仍被使用时保留 layout_view，绑定被 DCE 删除后前置事实仍在。不得因此新增可搜索的域或改变 8/4 上限。
+
+验收同时保留两个事实：不经过保存步骤的旧直接 infer→canonicalize→infer 序列不能凭空恢复已丢失证据；经过新 normalize/pipeline 保存后的序列应成功。删除 storage_contract 并删除原 whole-root binding 后，依赖该证据的实际 IR 必须失败。
+
+#### 22.7 Pass、事务和最终核验
+
+公开入口保持 `createNormalizeLayoutIRPass()` / `frisk-normalize-layout-ir`，以及 `buildFriskLayoutPipeline(OpPassManager &pm)` / `frisk-layout-pipeline`；另提供显式 `registerFriskLayoutPipelines()`，在 frisk-opt 启动时调用并供其他宿主显式使用，不依赖静态初始化碰巧链接。当前 FFI 没有已实现的 pass-manager 注册入口，本阶段不凭空扩展 Python pass-manager API；Python 导入测试通过本次构建的 frisk-opt 验证生成 IR。
+
+`normalize` 先在 detached ModuleOp 上完成完整预检与改写，运行 MLIR verifier、残留 legacy 检查及导入契约检查，通过才替换原 module body/attrs。已归一化 IR 再次运行结果逐字稳定；不能转换的一个根会导致整个 normalize 失败，原模块不留部分转换结果。
+
+具名 pipeline 使用一个事务包装 pass，在 clone 上执行：
+
+```text
+normalize → infer/materialize → 保存实际根契约
+          → optimize-layout-conversions → actual-only 最终核验 → 成功才提交
+```
+
+这是对原提纲简单串联三个 pass 的明确适配：单个 pass 原子性不自动保证后续 pass 失败时撤销前面的修改。包装 pass 构造内层 PassManager，不递归调用自身；保留位置诊断，任一步失败都使外层原模块不变。
+
+直接运行独立 normalize 成功后，用户再单独运行 infer 失败，normalize 的先前结果仍然存在；只有上述具名 pipeline 提供整条流程的原子性。最终 actual-only 在优化后检查真实布局、存储契约、MMA/Reduce/Copy/Fill 属性，不假定优化一定保留证据。
+
+生产 infer 的入口补明确的 legacy 残留诊断：遇到旧 Gemm/Reduce 或待归一化的 fragment 用法，应要求先执行 normalize/pipeline，不能因旧操作没有 Tensor operand 就静默略过。生产中不调用任何旧 inferLayout 或 oracle。
+
+#### 22.8 旧 API 退役与测试 oracle 隔离
+
+- 从 ODS、C++ 和头文件删除 `ParallelOp/GemmOp/ReduceOp::inferLayout`、旧 `LayoutInterface::inferLayout(DenseMap&)`、旧 Parallel 调用计数 API 和相关生成/注释残留。旧 Gemm/Reduce 操作本身保留为导入 IR，不删除 Python 前端使用的操作名字。
+- 将需要保留的旧推断公式及测试计数迁入 `test/Support/LegacyLayoutOracle.{h,cpp}`，使用测试命名空间下的自由函数；必要纯 helper 随其迁入。现有 `LegacyLayoutAdapter` 继续只做表示转换，不承担生产推断。
+- 在 `test/Support/CMakeLists.txt` 用普通测试库注册，不用把库收集到 `DEEPPIPE_LIBS` 的 `add_frisk_library`，防止被 frisk_ffi 自动链接。只由 test_pass 和 unit targets 链接；frisk-opt、FriskIR、FriskTransforms、frisk_ffi 均不得依赖测试 oracle。
+- 更新原 attr/reduce 测试、LegacyLayoutAdapterTest 与 CopyFill 隔离测试，不删除旧错误布局分类或把新 target 生成结果当成唯一旧 oracle。旧生产调用计数测试改为测试 oracle 计数及生产源码/链接边界检查。
+- 补跨行源码扫描，避免原提纲单行 rg 漏掉分行签名；并用符号/链接检查确认旧公共方法与测试 oracle 不在生产入口中。不是禁止生产代码使用任何 DenseMap，而是禁止旧 Value→Attribute 推断接口与其执行路径。
+
+#### 22.9 文件与接口分工（已按此分工落地）
+
+| 文件/区域                                                                                         | 责任                                                                                                      |
+| ------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `Transforms/NormalizeLayoutIR.cpp`                                                              | normalize pass、克隆事务、阶段调用及残留检查；不把所有生命周期规则塞进单一 runOnOperation                 |
+| `Transforms/LegacyFragmentNormalization.{h,cpp}`                                                | 私有 Local root/alias 预检、初始化状态、逐操作重写及 SCF/旧 for 携带值转换                                |
+| `IR/LegacyImportSemantics.{h,cpp}`                                                              | Gemm 共享 shape/dtype 检查、tensor_v1 查找与合法值检查；供 ODS verifier 和 FFI 使用，不依赖 target solver |
+| `IR/FriskOps.td/.cpp`、`ffi/ir.cpp`、`python/frisk/common/utils.py`                         | 导入接口、条件 memory effect、旧方法退役及 Python 一致性                                                  |
+| `IR/FriskLayoutOps.td/.cpp`                                                                     | `StorageContractOp` 的语法、结构验证与可持久声明语义                                                    |
+| `Analysis/StorageRootContracts.{h,cpp}`                                                         | 根声明解析、作用域/dominance、去重依据、完整地址相容性；无候选搜索的公共验证 helper                       |
+| `Analysis/LayoutConstraint*`、`LayoutRelations*`、`LayoutPropagation*`、`LayoutVerifier*` | RootStorageContract 的图不变量、候选投影/筛选和 actual-only 接线，不改变旧 alias/region 关系语义          |
+| `Transforms/PreserveStorageContracts.{h,cpp}`                                                   | 从实际 whole-root view 提取声明并稳定去重；normalize 与 pipeline 共用，不从 unknown 候选创造保证          |
+| `Transforms/PassPipelines.cpp`、公开 `PassPipelines.h`、`Passes.td/.h`、CMake、frisk-opt    | 显式注册具名 pipeline、事务包装和优化后复验；FFI 只同步导入 builder，不新增 Python pass-manager           |
+| `test/Support/LegacyLayoutOracle.*` 及关联测试/CMake                                            | 旧公式只作测试参考，生产库不链接                                                                          |
+
+文件表中的目录分别相对于 `lib/Dialect/Frisk`；公开头文件放在匹配的 `include/Dialect/Frisk` 下，Transforms 私有 helper 头留实现目录。测试新增 `LegacyNormalizationTest.cpp`、`StorageRootContractTest.cpp`、`LayoutPipelineTest.cpp`，lit 分为 normalization 正/反例、region、durable-contract 与 no-legacy；Python 新增 `test/python/legacy_normalization_test.py`，显式从本次 build 导入 FFI，不能误用环境里旧安装包。
+
+#### 22.10 验收分组与不能宣称完成的边界
+
+- [X] **导入数学：** C++/Python 同步接受 f16/bf16 A/B＋f32 C，四种 transpose 组合按有效形状核对；旧 f16 C 可作为旧 IR 但 normalize 拒绝，且 IR 不变；未声明/错声明 tensor_v1、错误类型/target/kind 均明确失败。
+- [X] **初始化与 clear：** Fill/Copy 初始化、Gemm true 不读旧 C、false 读旧 C；Reduce true 覆盖和 false 合并分别检查 SSA；CPU 独立模型覆盖有限精确值、±0、NaN 和明确的旧 dst 合并次序，不以布局文本相等代替数值契约。
+- [X] **完整生命周期：** whole-tile load/store、Local→Local 分叉后单边重写、相同根别名、最终 dealloc；未知用户、scalar 访问、Local subview、动态 cast、逃逸和混合新旧 Local 用法拒绝；任一根失败原 module 不变。
+- [X] **控制流：** if 两边写/一边透传/缺初始化；for 零次与多次、只读捕获、嵌套、旧 frisk.for；while before/after 不同原 tuple、首次条件为假仍保留 before 写入；Parallel 内部根成功、跨边界 Local 捕获拒绝。分别验收 normalize-only 和预算内 pipeline，不假称所有循环规模都能求解。
+- [X] **持久契约：** normalize/infer/保存/优化/打印解析/二次 pipeline 稳定；canonicalize 后根 map 与对齐仍可核验；畸形、冲突、错误根、越界、缺失、篡改、非支配分支声明均有负例；actual-only 不枚举候选、不调用旧 oracle。
+- [X] **端到端：** 有真实外部写回的 legacy SS/RS MMA→store（预算内）、Fill/Copy→Reduce→store（预算内）、Copy/Fill/Parallel 和已有 Tensor 输入通过具名 pipeline；混合合法和非法函数全 module 回滚。完整 SS MMA→Reduce→store 的 normalize 可成功，但 pipeline 因 9>8 拒绝且原 module 不变。
+- [X] **退役：** 生产 ODS/生成 API/源码无三种旧 inferLayout，生产二进制不链接 oracle；旧测试通过隔离 API 保留覆盖，4 个原 CTest 保持有效。
+- [X] **全量 Gate：** 重建 FriskIR/Transforms/frisk-opt/frisk_ffi、全部 unit、全部 lit、原 4 CTest 和新增 Python 导入测试；单独运行 unit 二进制，不能以 check-frisk 代替。记录实际新增数量，不预填通过数。
+
+完整验证命令（实际执行记录见 §22.13）：
+
+```bash
+cmake --build build --target FriskIR FriskTransforms FriskLayoutUnitTests \
+  frisk-opt frisk_ffi check-frisk frisk_attr_test frisk_reduce_layout_test \
+  frisk_layout_pass_test frisk_memory_effect_test --parallel 12
+build/unittests/Dialect/Frisk/FriskLayoutUnitTests --gtest_brief=1
+ctest --test-dir build --output-on-failure
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 \
+  test/python/legacy_normalization_test.py --build-dir build
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 \
+  test/python/legacy_api_boundary_test.py --source-root . --build-dir build
+git diff --check
+```
+
+本任务不扩展 8/4 求解预算、Task 20/21 数值/目标支持集、GPU lowering 或性能成本模型。M4 验收报告必须保留 Task 21 完整链成功尚未实现这一项；Task 22 的受限 normalization 和退役通过，不等于整个 M4 无缺口。
+
+#### 22.11 设计确认点与实施顺序
+
+用户已确认方案 A，并以“进入实现与测试”确认上述具体契约，包括 **显式 `tensor_v1` 导入语义声明** 和 **不可被当作无用值删除的 `storage_contract` 前置条件操作**。其他转换、SCF、事务和测试规则按上文执行。
+
+确认后按三个可独立复审阶段实施：22A 导入语义与完整生命周期 normalization；22B 根契约、具名原子 pipeline 与 actual-only；22C 旧 API/oracle 隔离、前端/回归与文档。每阶段先写对应失败测试再实现，最后进行全量验收；不自动 commit/push，也不改动独立 Task19–21 对比汇报。
+
+#### 22.12 实施检查表（已完成）
+
+各项采用先失败测试、后实现、针对性复审；工作直接在源目录，不自动提交。
+
+1. **22A.1 导入基础。** 在 `LegacyImportSemantics` 集中 shape/dtype 与标注检查；修改 Gemm/Reduce 条件 effects、FFI 和 Python builder。先测试四种 transpose、混合 accumulator dtype、marker 查找及 clear effects，再构建 IR、FFI 和针对性单元测试。
+2. **22A.2 生命周期转换。** 新增 `LegacyFragmentNormalization` 与 `NormalizeLayoutIR`，先覆盖直线 Fill/Copy/Gemm/Reduce、失败回滚，再增量覆盖 if/for/while、Parallel 和旧 for。公开 `createNormalizeLayoutIRPass()`；完整生命周期与未初始化错误不得用局部重写替代。
+3. **22B.1 持久契约。** 新增 `StorageContractOp`、`StorageRootContracts`、`PreserveStorageContracts`；先验证 schema/作用域/地址相容性，再接 unary `RootStorageContract` 的图不变量、候选准备和 actual-only。已有 whole-root 对齐证据也按 dominance 生效。
+4. **22B.2 原子 pipeline。** 新增 `PassPipelines` 与显式注册；测试 clone 上 normalize/infer/preserve/optimize/actual-only 的提交与整体失败回滚。预算内 MMA→store、Reduce→store 成功；9 变量全链仍失败且保留原模块。
+5. **22C.1 隔离旧 oracle。** 搬迁旧公式到普通测试库 `test/Support/LegacyLayoutOracle`，删除三类生产 inferLayout API、旧接口和计数器；先增加源码/链接隔离断言，再更新旧测试调用，不削弱原覆盖。
+6. **22C.2 最终验收。** 独立审查全部改动；执行 §22.10 的完整 build、unit、lit、CTest、Python 和 diff 检查，同步设计与比较文档的实际完成状态。
+
+#### 22.13 实际实现与验收记录（已完成）
+
+实现直接位于源目录 main，基线 `14b39e9`，未创建工作树、未自动提交或推送。具体实现采用 §22.3–22.12 的已确认契约，而非下面保留的原始简化提纲：
+
+- `LegacyImportSemantics` 统一 C++/FFI 的有效 M/N/K 和 dtype 校验；Python 显式可选 `legacy_semantics`，Gemm/Reduce 按 clear 精确声明目的 Read。旧数学输入仍可解析，导入拒绝与旧 verifier 的合法性分开。
+- `LegacyFragmentNormalization` 对完整 Local 根维护 Tensor 状态，处理 Fill/整块 Copy、Gemm/Reduce、if/for/while、旧静态 for、Parallel 内部根；未初始化、未知别名、逃逸和跨函数/Kernel/Parallel 捕获明确拒绝。normalize 在 clone 上全部验证成功才提交。
+- `StorageRootContracts`、`PreserveStorageContracts` 和 unary `RootStorageContract` 保存并检查完整根地址/对齐事实，不增加候选变量。支持已有分析可证明的静态 strided 根；whole-root view 依据 shape/dtype/space 和坐标恒等判断，不要求 MemRef descriptor 类型完全相同。
+- `buildFriskLayoutPipeline`/`registerFriskLayoutPipelines` 注册事务入口。保存根契约发生在 infer 后、优化前，最终重新从实际 IR 复验；9 变量完整链只通过 normalize，pipeline 超限时整个 module 回滚。
+- 旧 Parallel/Gemm/Reduce `inferLayout`、ODS interface 与生产计数器退役。历史公式和纯 helper 搬入普通测试静态库 `test/Support/LegacyLayoutOracle*`，不进入生产 FFI 库列表；原有分类/非法布局测试继续有效。
+
+**实现中必要的适配：** Python 真正 dump→parse 的红灯暴露了 Copy 空索引 builder 仍生成 rank identity map，以及 alloc_buffer 解析缺省 Local memorySpace/打印遗漏附加属性的问题；已分别修复并增加回归。仅对 Storage 的 Copy/Fill/alloc，即使位于未知 region 或一般 CFG，也可在原位置绑定合法端点；这不提升 Local 状态、不扩展 solver 的 region 支持。Local 跨嵌套 Kernel 捕获已专门拒绝。
+
+**最终新鲜验证：** 所列全目标构建成功；独立单元可执行文件 **242/242**（276.991 秒）、**48/48 lit**（9.49 秒）、原 **4/4 CTest**（0.03 秒）、**5/5 Python 测试方法**（0.201 秒）通过；源码、生成头文件、frisk-opt/FFI 二进制的旧接口/oracle 隔离扫描及 `git diff --check` 通过。相较 Task 21 的 197 unit / 36 lit，新增 **45 项单元、12 份 lit**；其中一个数值单元包含 30 组场景。独立审查及修复后复审通过，无未解决发现。构建仍出现已有 Ninja `premature end of file; recovering` 警告，本任务未修改构建元数据。
+
+数值回归使用独立 CPU 模型核对 Reduce 的 30 组有限精确值、±0、NaN、三种 kind 和 clear 组合；不等于运行过 GPU lowering。未刷新上游快照或运行 TileLang/Triton 实验，不声称性能优势或已证明研究独创性。8 vars/component、4 candidates/domain 和 Task 21 完整链成功验收缺口保持不变。
+
+最终独立审查还发现并补测两处边界：未知/non-SSA region 的通用 dominance 可能将后出现的声明当作支配证据，现统一使用上述保守 scope 检查；残留旧 LayoutAttr 扫描原先仅检查操作属性/结果，现递归检查所有 region 的块参数类型（含未使用参数），normalize 与直接 infer 共用。两者均已观察修复前失败用例，并通过修复后全量复验与独立复审。
+
+以下为原始迁移提纲，保留用于追踪计划演进，旧复选框和简化 pipeline 示例不代表当前实现；以 §22.3–22.13 为准，提交命令不自动执行：
 
 **Files:**
 
@@ -3297,6 +3534,153 @@ Expected: pipeline 成功；生产目录旧接口匹配数为 0；Copy/Fill/Gemm
 ## M5：有限候选、SM90 契约与 conversion 优化
 
 ### Task 23: 实现连通分量候选求解和 CostVector
+
+**状态（2026-09-27）：用户确认的方案 A 及 §23.1–23.8 已完成实现、独立复审和全量验收，结果见 §23.9。源码目录 main HEAD 为 `9bc8349`，工作区包含已完成但未提交的 Task 22；保留既有修改，本轮未提交或推送。**
+
+#### 23.1 审计：不能直接照搬原始接口提纲
+
+| 当前源码事实                                                                                                           | 本任务需要适配的地方                                                           |
+| ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `LayoutVerifier.cpp::solveBootstrapLayoutGraph` 对 hard component 做 DFS，拒绝超过 8 个变量或任一域超过 4 个候选     | 替换为正式的有界求解，不只是把 8 改成更大的常数；删除 bootstrap 入口与限制结构 |
+| 现有求解只比较新增 conversion 数，然后用 stableOrdinal/文本决定同分顺序，未调用`LayoutTarget::evaluate`              | 真正接入 CostVector；不再把零转换当作独立于其他成本的最高优先级                |
+| SM90`evaluate` 只累加变量 ID 到 tie-break，相同变量的不同 assignment 得分相同                                        | 改为明确的静态基础成本，并采用与候选插入顺序无关的完整 assignment key          |
+| `LayoutConversionEdge` 已有 bytes/synchronizationCost，但当前求解没有填充                                            | 本阶段必须计算保守、非零的转换估计，不能声称已经存在可直接使用的边成本         |
+| `CandidateAssignment` 已存 Attribute 值；`LayoutSolution` 还包含 MMA instructionBindings、Reduce reductionBindings | 保留真实编码和两类 binding；原提纲不能覆盖这些已落地接口或只返回候选下标       |
+| MMA/Reduce 准备阶段另外限制关系的证明组合规模                                                                          | 与搜索预算分开命名、诊断；更大的 solver 不代表扩大指令/归约证明支持集          |
+| Task 24 计划做 placement/rematerialization，Task 25 做 shape-aware SM90 cost                                           | 本任务完成搜索和可扩展代价接线，不提前声称完成这两个任务                       |
+
+#### 23.2 方案比较与推荐
+
+- **方案 A（推荐）：小组件精确搜索＋大组件确定性 beam＋明确静态基础成本。** 删除 solver 的 8/4 硬上限，保留独立证明预算；接通完整 CostVector 顺序及已有 conversion，验收完整 9 变量链。与原 Task 23 范围一致。
+- **方案 B：全部使用有总节点预算的精确搜索。** 预算内可证明最优，但遇到较大候选乘积容易直接耗尽预算，不能提供原计划要求的 beam 路径。
+- **方案 C：本任务同时引入完整 SM90 性能模型与重计算。** 成本更丰富，但跨入 Task 24/25，验证范围显著扩大；不能仅凭名称相同把它算成 Task 23 的正常实现步骤。
+
+以下方案 A 具体契约已经用户确认，是本轮实现与验收依据。
+
+#### 23.3 候选、硬约束与稳定身份
+
+1. 沿用已存在的候选准备、strict/common 单调删减与支持表；搜索期间不再生成候选。不合并真实 producer/use 来规避预算，也不删除 RootStorageContract。
+2. 求解入口先检查图不变量、target/type 合法性及硬要求，再按 hard constraint 建组件；Convertible 属于需要实际满足的硬关系，不能为了拆小组件将其忽略。孤立变量也必须求解。现有 soft preference 不新增跨组件耦合；首版成本按组件可分解，不能对任意跨组件非可加代价宣称全局最优。
+3. 候选使用完整结构身份去重并稳定排序。允许 canonical hash 作加速索引，但必须验证实际编码相等；保留维度命名、topology、replication 等类型契约，不把数学映射相同但 SSA 类型不等的编码折叠。现有 `layoutCandidateKey` 实际是文本序列化，不能称其已提供数学语义归一化。
+4. 搜索使用稳定候选表；如暴露 candidateIndex，它引用求解开始时的该表，不能引用随后删减的可变下标。solution 仍以 Attribute assignment 为实际物化依据，保留 provenance 与 instruction/reduction bindings。
+5. 候选排序不依赖 DenseMap 迭代、地址或插入次序，也不使用 stableOrdinal 暗中编码性能偏好。最终同分按稳定变量名及完整编码 key 排序；64-bit tie-break 不能替代无碰撞的完整 key。
+6. 记录候选拒绝：变量、稳定候选身份、对应约束/target 检查及原因。区分全局域删减、某个部分 assignment 不相容、beam 丢弃：后两者不能伪造为候选本身非法。已有传播统计继续保留。
+
+#### 23.4 搜索预算与失败含义
+
+公开 `SolverOptions`，默认值为：
+
+```cpp
+uint64_t exactCombinationLimit = 256;
+unsigned beamWidth = 32;
+uint64_t maxExpandedStates = 65536; // 每个组件尝试的候选扩展总数
+```
+
+原提纲 `maxCandidatesPerComponent=256` 易被误读为变量数或单域容量；这里明确改名为精确搜索的组合数阈值。以上参数必须为正；普通 infer pass 和具名 pipeline 使用相同默认值，提供可测试的配置入口。
+
+- 计算去重/硬剪枝前后候选乘积，采用溢出安全算术；溢出记录为超过可表示范围，不能回绕成小图。
+- 剪枝后乘积 ≤256 时精确搜索；超过时启用 beam32，而非截取前 256 个组合。超过阈值输出组件、变量数、域大小、原始/剪枝后乘积、剪枝量和 beamWidth。
+- 搜索变量顺序为当前剩余合法候选数最少、hard degree 最大、stable ID 最小；每次扩展检查已就绪关系，并检查 MMA tuple/Reduce pair 是否仍存在合法延伸。
+- 部分状态按可证明的成本下界与稳定 assignment key 排序；没有可信下界的项使用非负成本的零下界，不能拿高估值剪掉可能更优的解。完整 assignment 必须重新计算完整成本并满足全部硬关系。
+- 每尝试一个候选扩展就计数，失败的扩展及 MRV 判断剩余合法域时的试探也计入 maxExpandedStates，避免“只统计成功节点”的假预算；搜索不依赖与组件深度相等的无界 C++ 递归栈。
+- 精确且未截断的搜索才可报告“当前固定候选域内最优”或“已穷尽无解”。beam 截断后找到合法解只报告可行近似解，不承诺最优。
+- beam 丢弃或节点预算耗尽后没有完整解，诊断 `search-incomplete`/`search-budget-exceeded`，不能称为已证明无解。节点预算中断不提交未完成搜索的部分 assignment；IR 保持不变。
+- 所有解仍须经过 `verifySolvedLayoutGraph` 和实际 IR 复验。硬证明为 Unknown 的候选不能当成合法；诊断保留“不被证明”的原因，不借高成本代替硬错误。
+
+取消的是 solver 的 maxVariables=8/maxDomainSize=4。MMA/Reduce 等本地证明组合预算本阶段不扩张；它们超限时明确报告 proof-preparation budget，而非继续冒用 bootstrap solver 的错误名称。
+
+#### 23.5 CostVector v1：完整比较接口，不伪造完整硬件模型
+
+九字段按声明顺序作字典序比较，合法性在成本之前完成。加法、乘法采用明确的饱和上限，并记录 saturation；不得溢出回绕导致高成本方案胜出。tie-break 只能在前八项相同后作用，SM90 首版该数值字段可保持中性，最终由完整稳定 key 解决同分。`exhaustive` 仅说明该组件搜索未截断；跨组件的可加最优性要求所有参与比较的总成本不发生饱和，不能据此声称饱和总和仍全局最优（饱和可能压平高优先级差异）。
+
+Task 23 的交付分为两层：
+
+| 层次              | 本阶段交付                                                                                                                              |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| 通用引擎          | 真正调用 target cost，支持九字段排序、可分解成本累加、合法下界、同分稳定性；用受控 target 测试所有字段优先级                            |
+| SM90 静态基础估计 | 非零 conversion 搬运/同步上界、可从编码得到的寄存器槽数与 replication、实际 Shared 根占用跨度、显式转换数量等结构项；不是测得的执行周期 |
+
+计费规则必须能审计：每条实际 conversion 边计一次；Shared 同根别名按所选合法 footprint 的最大根覆盖跨度计费，不重复当成多份 allocation；寄存器槽/replication 的基础估计按定义位置或操作 execution binding 计，不把同一个值的每个消费节点都当成额外常驻副本。`spillRiskAndRegisters` 使用编码给出的每线程寄存器坐标槽数之和，`replication` 使用各计费定义的 `replication-1` 之和，`codeSize` 首版仅计既有及新增的非恒等转换操作数。consumer conversion 的临时搬运开销由边成本承担。无活跃区间分析时，“槽数之和”只能称静态代理量，不能称精确 spill 或 occupancy。
+
+`instructionPathAndWork`、memoryTransactions、bankConflictDegree 的完整硬件估计留 Task 25；本阶段 SM90 未建模项统一中性并在 cost coverage 输出中明确标注，不把它们解释为已证明零开销。测试 target 可提供非零值验证“更好的主计算路径可以胜过零转换”。当前 soft coalescing 偏好不能冒充已经落地的事务计数模型。
+
+保留/适配现有 `LayoutTarget::evaluate`，使其获得评估所需的图/变量上下文；不得仍然接收信息不足的接口、再通过全局隐藏状态补上下文。新增 partial lower-bound 查询时默认给出安全零下界；完整评估失败应明确诊断，不返回零成本。组件独立求解依赖非负可分解成本契约，测试覆盖该前提。
+
+转换首版只支持既有 KeepCommonLayout/Convert：
+
+- 相同编码无新增转换；不同编码先由现有关系证明可转换，再评估；不能用成本让不可转换关系通过。
+- 首版对非恒等转换统一采用单 CTA shared staging 的保守估计，不假定已经识别最优 shuffle。设 `Psrc/Pdst` 为编码的完整物理槽数、`b=ceil(elementBits/8)`、`T` 为 CTA 线程数，记录 `bytes=b*(Psrc+Pdst)`，覆盖按槽写入/读取的搬运上界，`synchronizationCost=2` 表示两次 CTA 同步的估计上界；恒等转换二者为 0。估计来源标记 `cta-staging-upper-bound-v1`，不能因暂未生成 lowering 而记为零，也不由此承诺实际 scratch 已经分配。
+- `conversionBytesAndSync=bytes+4*T*synchronizationCost`，将一次 CTA 同步折算为每线程一个 32-bit 单位的固定静态惩罚。已有合法关系支持同一 CTA 内不同活跃线程子集之间的转换（如 32→128）；本轮接线明确 `T=max(Tsrc,Tdst)`，保持既有执行边界语义，不新增“两端线程数必须相等”的限制。这是公开的比较尺度，不是硬件周期或实测延迟；不可按测试用例调权重，更精细路径/频次校准留后续任务。
+- 已有显式 convert 只计一次成本、不重复插入；新边将 bytes/synchronizationCost 写入 solution。loop 频次、critical path、hoist、rematerialization 不在本任务内。
+
+#### 23.6 接线、观测与事务
+
+新增 `LayoutCandidateSolver.cpp`、`LayoutCostModel.cpp`；正式求解 API 放 `LayoutSolver.h`，保留现有 solution 的实际 assignment、conversion、MMA/Reduce binding，并附加成本/搜索统计。从 `LayoutVerifier.cpp` 移走搜索实现，验证器继续独立检查真实解；共享硬关系查询可提取为小 helper，不复制两套不同的合法性规则。
+
+生产 infer、pipeline 和受影响测试全部切换正式 solver。删除 `solveBootstrapLayoutGraph`、`BootstrapSolverLimits` 和生产旧调用，不通过同名包装保留两套求解入口。
+
+dump-analysis 增加每组件搜索模式、域大小、扩展数、硬拒绝数、beam 丢弃数、是否穷尽、所选 CostVector、cost coverage 和转换估计。统计排序稳定，可供 FileCheck 核验；“未找到解”与“证明无解”使用不同消息。
+
+求解只产生方案，不改动 IR；沿用现有物化与 Task 22 模块级事务。搜索失败、非法 solution、最终实际 IR 复验失败均不得留下部分更新。actual-only 仍不枚举候选、不调用求解器，不把成本当合法性依据。
+
+#### 23.7 验收契约
+
+- [x] 小图联合选择胜过逐变量贪心；含 SameLayout/Convertible、多角色 InstructionContract、ReductionLayout、alias/root contract/region 的回归保持语义正确。
+- [x] 相同输入打乱变量、候选、约束插入次序仍得到相同规范解、binding 和转换位置；去重不破坏支持表或候选拒绝 provenance。
+- [x] 256 及边界上下的 exact/beam 模式、beam 截断丢失唯一解、节点预算耗尽、候选乘积和成本溢出分别测试，不能混淆 unsat 与 incomplete。
+- [x] 固定随机种子的 ≤4096 组合小图用独立 exhaustive oracle 比较；提高 exact 阈值或使用足够宽的 beam 验证最优一致，默认窄 beam 仅验证合法性与确定性。
+- [x] CostVector 九字段逐项优先级、主计算优于零转换、同主成本下较轻转换优先、已有 conversion 不重插、相同根不重复计费、未知完整成本不默认为零。
+- [x] 真实 solver 接受超过 8 个变量的可解组件，以及非 MMA/Reduce 证明端点上的合法 >4 候选域；独立证明预算仍有明确拒绝测试。
+- [x] 将现有 9 变量 SS MMA→Reduce→Global store 改为完整成功验收，包含实际外部写回、MMA/Reduce binding、actual-only 与重跑稳定；另设显式小搜索预算测试替代原 8 变量回滚负例，不直接删掉回滚覆盖。
+- [x] 追加报告中含 Global→Shared Copy、Parallel128、MMA、Reduce、Global 写回的整链集成例；只在实际通过后更新其“尚受 8 变量限制”的当前状态，保留历史记录。
+- [x] 重建全部相关目标，独立跑完整 unit、lit、原 4 CTest、Python 导入与旧接口隔离测试，执行 diff 检查和独立复审；记录本轮实际数量，不预填通过数。
+
+#### 23.8 范围与确认点
+
+用户已确认方案 A：用组合/搜索预算取代 solver 的 8/4 限制，采用默认 exact256＋beam32＋每组件65536候选扩展预算，完成完整链验收；本阶段提供可审计的静态基础成本，不将 Task 24/25 的重计算、布局转换调度或完整 SM90 性能模型提前计作完成。
+
+按“成本/稳定身份与统计 → exact/beam solver 与完整 bindings → 生产替换与整链验收 → 全量回归及文档”实施。原提纲中的提交命令不代表本轮获得提交授权。
+
+#### 23.9 实际实现与验收记录（2026-09-27）
+
+实现已接入生产，独立复审及最终全量 Gate 已通过；本轮未提交或推送。
+
+| 部件 | 实际变化 |
+| --- | --- |
+| `LayoutSolver.h` / `LayoutCandidateSolver.cpp` | 正式 `solveLayoutGraph`、组件 exact/beam、MRV、独立预算、结构去重、拒绝记录、稳定全赋值 key；移除旧 bootstrap 入口及 8/4 限制 |
+| `LayoutRelations.cpp` / `LayoutVerifier.cpp` | 搜索与验证复用硬关系查询；验证器不负责搜索，仍独立核验真实解和 MMA/Reduce binding |
+| `LayoutCostModel.cpp` / `LayoutTarget.h` / SM90 target | 九项字典序、饱和成本、图上下文评估、安全部分下界、conversion 上界和静态定义/根占用计费 |
+| infer / named pipeline | 三项同默认值的搜索选项、组件及总成本统计、conversion bytes/sync/source；沿用事务物化及 actual-only 验证 |
+| 本地证明准备 | MMA/Reduce 域预算保持原值；错误名称改为 instruction/reduction proof budget，与搜索规模限制分开 |
+
+搜索前保留原 strict/common 传播，solver 自身检查 target/type、存储容量、硬 seed/unary 与 tuple/pair 单候选支持，再冻结域；搜索中的 relation cache 只记录该冻结域内的规范候选下标。MRV 试探也计入 expanded，不将某个分支拒绝当作全局候选删除。原始域乘积溢出与剪枝后乘积溢出分别记录，原始大图被硬约束缩为单解时仍可进入 exact。
+
+实施中经回归确认并适配的边界：
+
+- 保留原有同 CTA 不同线程子集之间的合法转换，成本同步项取 `max(Tsrc,Tdst)`；非单 CTA 仍拒绝。
+- 公共入口规范化未 finalized 的有效图；已 finalized 的生产图不重复清空传播统计。空图仍校验预算/异常关系；无类型非法图不先解引用类型。
+- `exhaustive` 为组件是否穷尽；不能把有限 beam 或发生饱和的跨组件总成本声称为全局最优。
+- Shared 部分别名以根原点到最大占用末端计费，例如 `[4,12)`、`[20,28)` 只计 28 bytes，不计 16、24 或完整 allocation 的 32 bytes。
+
+测试覆盖包括：256 边界及相邻模式、65 变量乘积溢出与 hard seed 缩至单解、宽/窄 beam 区分、三条联合关系使 beam 丢失唯一解、24 个固定随机样例各 64 种赋值的独立穷举对照、规范同分与真实 >4 候选、主计算优先于零转换、较轻转换优选及既有转换只计一次。成本模块独立复审和求解器复审已完成，已修正公共入口稳定性、参数检查及 conversion dump 问题；无遗留 Important 项。
+
+最终 Gate：272/272 unit（35 suites，382.771 秒）、49/49 lit、4/4 CTest、5/5 Python 测试方法；legacy production boundary 扫描、旧 bootstrap API 源码扫描及 `git diff --check` 全通过。新增 28 项成本/搜索单元用例和 2 项整链/预算单元用例；原有 9 变量失败用例改为成功验收，不删除回滚覆盖。重点 cost/solver/verifier 32/32、pipeline/Reduce 25/25 也独立运行通过。数值及性能边界未扩展为 GPU 执行保证。
+
+实际命令（在源目录运行）：
+
+```bash
+cmake --build build --target FriskLayoutUnitTests frisk-opt frisk_ffi frisk_attr_test frisk_reduce_layout_test frisk_layout_pass_test frisk_memory_effect_test --parallel 12
+build/unittests/Dialect/Frisk/FriskLayoutUnitTests --gtest_brief=1
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 /data0/xiebaokang/rocm-llvm-project/build/bin/llvm-lit -sv build/test
+ctest --test-dir build --output-on-failure
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 test/python/legacy_normalization_test.py --build-dir build
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 test/python/legacy_api_boundary_test.py --source-root . --build-dir build
+git diff --check
+```
+
+构建期间仍出现既有 Ninja 日志恢复和 CMake CMP0116 弃用告警；构建及测试退出码均为 0。本任务没有改动构建环境政策、运行 TileLang/Triton 测试或进行 GPU 性能实验。
+
+以下保留原始提纲用于追踪；具体语义以确认后的 §23.1–23.8 为准：
 
 **Files:**
 

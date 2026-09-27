@@ -1,5 +1,6 @@
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "Dialect/Frisk/Transforms/Passes.h"
+#include "Dialect/Frisk/Transforms/PassPipelines.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/InitAllPasses.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
@@ -11,6 +12,7 @@ int main(int argc, char **argv) {
 
   mlir::registerAllPasses();
   mlir::frisk::registerFriskPasses();
+  mlir::frisk::registerFriskLayoutPipelines();
 
   return mlir::failed(
       mlir::MlirOptMain(argc, argv, "Frisk optimizer\n", registry));

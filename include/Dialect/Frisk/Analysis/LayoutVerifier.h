@@ -8,22 +8,6 @@
 
 namespace mlir::frisk {
 
-struct LayoutSolution {
-  DenseMap<LayoutVarID, Attribute> assignments;
-  SmallVector<LayoutConversionEdge> conversions;
-  DenseMap<LayoutConstraintID, Attribute> instructionBindings;
-  DenseMap<LayoutConstraintID, Attribute> reductionBindings;
-};
-
-struct BootstrapSolverLimits {
-  unsigned maxVariables = 8;
-  unsigned maxDomainSize = 4;
-};
-
-FailureOr<LayoutSolution>
-solveBootstrapLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
-                          BootstrapSolverLimits limits = {});
-
 LogicalResult verifySolvedLayoutGraph(const LayoutConstraintGraph &graph,
                                       const LayoutSolution &solution,
                                       LayoutTarget &target, Location loc);

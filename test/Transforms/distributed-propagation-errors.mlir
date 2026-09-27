@@ -35,7 +35,7 @@ func.func @chain(%arg: tensor<8xf32>) {
   %7 = arith.negf %6 : tensor<8xf32>
   return
 }
-// expected-error@-11 {{bootstrap layout solver limit exceeded}}
+// Nine real SSA variables are now legal; the later split remains a negative test.
 
 // -----
 

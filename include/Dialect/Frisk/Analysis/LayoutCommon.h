@@ -34,6 +34,14 @@ struct CostVector {
   uint64_t deterministicTieBreak = 0;
 };
 
+/// Strict lexicographic priority in declaration order, not a weighted sum.
+bool operator<(const CostVector &lhs, const CostVector &rhs);
+
+struct CostEstimate {
+  CostVector cost;
+  bool saturated = false;
+};
+
 struct LayoutDimension {
   StringAttr name;
   int64_t extent;

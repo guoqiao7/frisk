@@ -1,4 +1,4 @@
-#include "Dialect/Frisk/Utils/LayoutUtils.h"
+#include "LegacyLayoutOracleUtils.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -13,7 +13,7 @@
 
 using namespace mlir;
 
-namespace mlir::frisk {
+namespace mlir::frisk::test {
 namespace {
 
 struct SplitInfo {
@@ -475,4 +475,4 @@ inferFragmentIndexFromThreadMap(OpBuilder &builder, AffineMapAttr threadMapAttr,
                      builder.getContext()));
 }
 
-} // namespace mlir::frisk
+} // namespace mlir::frisk::test

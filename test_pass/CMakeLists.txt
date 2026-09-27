@@ -6,6 +6,7 @@ llvm_update_compile_flags(frisk_attr_test)
 
 target_link_libraries(frisk_attr_test
   PRIVATE
+  FriskLegacyLayoutOracle
   FriskIR
   MLIRFuncDialect
   MLIRParser
@@ -19,6 +20,7 @@ llvm_update_compile_flags(frisk_reduce_layout_test)
 
 target_link_libraries(frisk_reduce_layout_test
   PRIVATE
+  FriskLegacyLayoutOracle
   FriskIR
   MLIRFuncDialect
   MLIRParser

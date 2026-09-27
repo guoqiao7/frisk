@@ -73,7 +73,7 @@ protected:
   LogicalResult infer(ModuleOp module) {
     auto graph = collectLayoutConstraints(module, target);
     if (failed(graph) || failed(propagateCommonToFixedPoint(*graph))) return failure();
-    auto solution = solveBootstrapLayoutGraph(*graph, target);
+    auto solution = solveLayoutGraph(*graph, target);
     if (failed(solution)) return failure();
     return materializeLayouts(module, *graph, *solution);
   }
@@ -150,7 +150,7 @@ TEST_F(GemmLayoutIntegrationTest, InvalidSolutionLeavesOriginalIRUnchanged) {
   auto graph = collectLayoutConstraints(*module, target);
   ASSERT_TRUE(succeeded(graph));
   ASSERT_TRUE(succeeded(propagateCommonToFixedPoint(*graph)));
-  auto solution = solveBootstrapLayoutGraph(*graph, target);
+  auto solution = solveLayoutGraph(*graph, target);
   ASSERT_TRUE(succeeded(solution));
   solution->instructionBindings.clear();
   ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
@@ -201,7 +201,7 @@ TEST_F(GemmLayoutIntegrationTest, TwoMmasShareFiniteStorageDomains) {
   ASSERT_TRUE(succeeded(graph));
   for (const auto &var : graph->getVariables()) EXPECT_LE(var.candidates.size(), 4u);
   ASSERT_TRUE(succeeded(propagateCommonToFixedPoint(*graph)));
-  auto solution = solveBootstrapLayoutGraph(*graph, target);
+  auto solution = solveLayoutGraph(*graph, target);
   ASSERT_TRUE(succeeded(solution));
   EXPECT_EQ(solution->instructionBindings.size(), 2u);
   ASSERT_TRUE(succeeded(materializeLayouts(*module, *graph, *solution)));

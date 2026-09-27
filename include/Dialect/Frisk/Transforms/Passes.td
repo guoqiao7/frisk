@@ -3,6 +3,13 @@
 
 include "mlir/Pass/PassBase.td"
 
+def NormalizeLayoutIR : Pass<"frisk-normalize-layout-ir", "::mlir::ModuleOp"> {
+  let summary = "Transactionally import legacy fragment lifetimes into tensor SSA";
+  let constructor = "mlir::frisk::createNormalizeLayoutIRPass()";
+  let dependentDialects = ["::mlir::frisk::FriskDialect", "::mlir::arith::ArithDialect",
+    "::mlir::memref::MemRefDialect", "::mlir::scf::SCFDialect", "::mlir::func::FuncDialect"];
+}
+
 def FriskInferLayouts : Pass<"frisk-infer-layouts", "::mlir::ModuleOp"> {
   let summary = "Infer and materialize Frisk layouts";
   let constructor = "mlir::frisk::createFriskInferLayoutsPass()";
@@ -11,7 +18,12 @@ def FriskInferLayouts : Pass<"frisk-infer-layouts", "::mlir::ModuleOp"> {
     Option<"analysisOnly", "analysis-only", "bool", "false",
            "Collect, solve and verify layouts without modifying IR">,
     Option<"dumpAnalysis", "dump-analysis", "bool", "false",
-           "Print the deterministic graph, domain sizes and conversion decisions">
+           "Print the deterministic graph, domain sizes and conversion decisions">,
+    Option<"exactCombinationLimit", "exact-combination-limit", "uint64_t", "256",
+           "Maximum domain product for exact layout search">,
+    Option<"beamWidth", "beam-width", "unsigned", "32", "Layout search beam width">,
+    Option<"maxExpandedStates", "max-expanded-states", "uint64_t", "65536",
+           "Per-component attempted candidate expansion budget">
   ];
 }
 

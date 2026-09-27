@@ -64,7 +64,7 @@ protected:
   LogicalResult infer(ModuleOp module) {
     auto g = collectLayoutConstraints(module,target);
     if (failed(g) || failed(propagateStrict(*g)) || failed(propagateCommonToFixedPoint(*g))) return failure();
-    auto s = solveBootstrapLayoutGraph(*g,target);
+    auto s = solveLayoutGraph(*g,target);
     if (failed(s) || failed(verifySolvedLayoutGraph(*g,*s,target,module.getLoc()))) return failure();
     return materializeLayouts(module,*g,*s);
   }
@@ -147,7 +147,7 @@ TEST_F(ReduceLayoutIntegrationTest, FailedMaterializationPreservesOriginal) {
   auto m=simple(); ASSERT_TRUE(m); auto before=print(*m);
   auto g=collectLayoutConstraints(*m,target); ASSERT_TRUE(succeeded(g));
   ASSERT_TRUE(succeeded(propagateCommonToFixedPoint(*g)));
-  auto solution=solveBootstrapLayoutGraph(*g,target); ASSERT_TRUE(succeeded(solution));
+  auto solution=solveLayoutGraph(*g,target); ASSERT_TRUE(succeeded(solution));
   ASSERT_FALSE(solution->reductionBindings.empty());
   auto &entry=*solution->reductionBindings.begin();
   auto contract=cast<ReductionContractAttr>(entry.second); NamedAttrList attrs(contract.getPayload());
@@ -214,8 +214,8 @@ TEST_F(ReduceLayoutIntegrationTest, MmaResultInherits128Threads) {
   ASSERT_TRUE(m); ASSERT_TRUE(succeeded(infer(*m)));
   EXPECT_EQ(reduce(*m)->getAttrOfType<IntegerAttr>("frisk.execution_threads").getInt(),128);
   auto once=print(*m); ASSERT_TRUE(succeeded(infer(*m))); EXPECT_EQ(once,print(*m));
-  // Preserve the existing bootstrap budget: adding the real store endpoints
-  // gives nine connected variables, even with all MMA roles already bound.
+  // Adding real store endpoints produces nine connected variables. Re-solving
+  // must preserve the MMA/reduction bindings and materialize the entire chain.
   auto function=*m->getOps<func::FuncOp>().begin();
   OpBuilder b(function.getBody().front().getTerminator());
   auto memory=MemRefType::get({128},b.getF32Type(),MemRefLayoutAttrInterface{},b.getI64IntegerAttr(1));
@@ -224,12 +224,19 @@ TEST_F(ReduceLayoutIntegrationTest, MmaResultInherits128Threads) {
   b.create<TileStoreOp>(m->getLoc(),reduce(*m).getResult(),view);
   auto graph=collectLayoutConstraints(*m,target); ASSERT_TRUE(succeeded(graph));
   EXPECT_EQ(graph->getVariables().size(),9u);
-  std::string diagnostic;
-  ScopedDiagnosticHandler capture(&context,[&](Diagnostic &d) {
-    llvm::raw_string_ostream(diagnostic)<<d; return success();
-  });
-  EXPECT_TRUE(failed(solveBootstrapLayoutGraph(*graph,target)));
-  EXPECT_NE(diagnostic.find("too many variables"),std::string::npos);
+  ASSERT_TRUE(succeeded(infer(*m)));
+  target.generations=target.proofs=0;
+  EXPECT_TRUE(succeeded(verifyMaterializedLayouts(*m,target)));
+  EXPECT_EQ(target.generations,0u);
+  EXPECT_GT(target.proofs,0u);
+  EXPECT_TRUE(reduce(*m)->getAttrOfType<ReductionContractAttr>("frisk.reduction_contract"));
+  once=print(*m);
+  ASSERT_TRUE(succeeded(infer(*m)));
+  EXPECT_EQ(once,print(*m));
+  auto reparsed=parseSourceString<ModuleOp>(once,&context);
+  ASSERT_TRUE(reparsed);
+  ASSERT_TRUE(succeeded(infer(*reparsed)));
+  EXPECT_EQ(once,print(*reparsed));
 }
 
 TEST_F(ReduceLayoutIntegrationTest, ReduceToStoreUsesCompletedOutputOwner) {

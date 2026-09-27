@@ -1,5 +1,6 @@
 set(FRISK_SOURCE_DIR ${PROJECT_SOURCE_DIR})
 set(FRISK_BINARY_DIR ${PROJECT_BINARY_DIR})
+add_subdirectory(Support)
 
 configure_lit_site_cfg(
   ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in

@@ -4,9 +4,8 @@ add_frisk_library(FriskIR
   FriskLayoutAttrs.cpp
   FriskLayoutInterfaces.cpp
   FriskLayoutOps.cpp
+  LegacyImportSemantics.cpp
   FriskOps.cpp
-  FriskOps_Reduce.cpp
-  ../Utils/LayoutUtils.cpp
 
   DEPENDS
   FriskTableGen

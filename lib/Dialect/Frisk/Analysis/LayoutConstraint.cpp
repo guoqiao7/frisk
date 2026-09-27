@@ -59,6 +59,8 @@ StringRef stringifyConstraintKind(ConstraintKind kind) {
     return "copy-access";
   case ConstraintKind::AliasLayout:
     return "alias-layout";
+  case ConstraintKind::RootStorageContract:
+    return "root-storage-contract";
   case ConstraintKind::Ownership:
     return "ownership";
   case ConstraintKind::ResourceLimit:
@@ -336,6 +338,20 @@ LogicalResult LayoutConstraintGraph::verifyInvariants(Location loc) const {
         if (instruction.binding != op->getAttr("frisk.mma_contract"))
           return emitError(loc) << "MMA instruction binding differs from actual operation attribute";
       }
+    }
+    if (constraint.kind == ConstraintKind::RootStorageContract) {
+      if (constraint.vars.size() != 1 || !constraint.rootStorage)
+        return emitError(loc) << "root storage contract requires one endpoint and declaration";
+      const auto &var = variables[constraint.vars.front()];
+      const auto &contract = *constraint.rootStorage;
+      Operation *decl = contract.declaration;
+      if (var.kind != LayoutKind::Storage || !var.storageAlias || !decl ||
+          decl->getName().getStringRef() != "frisk.storage_contract" ||
+          decl->getNumOperands() != 1 || decl->getAttr("layout") != contract.layout ||
+          contract.root.root != var.storageAlias->root ||
+          contract.root.viewType != contract.root.rootType ||
+          !contract.root.viewToRoot.isIdentity())
+        return emitError(loc) << "root storage contract does not match actual root declaration";
     }
     if (constraint.kind == ConstraintKind::Ownership || constraint.kind == ConstraintKind::ResourceLimit) {
       if (constraint.vars.size() != 1 || variables[constraint.vars[0]].kind != LayoutKind::Distributed)

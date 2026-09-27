@@ -23,6 +23,20 @@ public:
                                         Location loc) const = 0;
   virtual FailureOr<CostVector>
   evaluate(const CandidateAssignment &assignment) const = 0;
+  virtual FailureOr<CostEstimate>
+  evaluate(const LayoutConstraintGraph &, const CandidateAssignment &assignment) const {
+    auto cost = evaluate(assignment);
+    if (failed(cost)) return failure();
+    return CostEstimate{*cost, false};
+  }
+  // Costs must be nonnegative and separable by hard component. A partial
+  // estimate must never exceed any complete extension. Component optima do
+  // not imply an optimum of a saturated global sum (priority can collapse).
+  virtual FailureOr<CostEstimate>
+  lowerBound(const LayoutConstraintGraph &, const CandidateAssignment &) const {
+    return CostEstimate{};
+  }
+  virtual StringRef costCoverage() const { return "target-defined"; }
 
   virtual LogicalResult
   prepareInstructionCandidates(LayoutConstraintGraph &graph) const {

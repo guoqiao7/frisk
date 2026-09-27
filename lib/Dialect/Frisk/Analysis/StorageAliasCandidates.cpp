@@ -36,6 +36,20 @@ LogicalResult initializeStorageAliasCandidates(
   }
   struct Seed { LayoutVarID endpoint; LayoutCandidate candidate; };
   SmallVector<Seed> explicitSeeds;
+  // Fixed contracts propose maps without creating a searchable root variable.
+  // This preparation never runs on the RelationsOnly/actual-IR path.
+  for (const auto &constraint : graph.getConstraints()) {
+    if (constraint.kind != ConstraintKind::RootStorageContract || !constraint.rootStorage)
+      continue;
+    auto &var = graph.getVariable(constraint.vars.front());
+    const auto &contract = *constraint.rootStorage;
+    auto projected = projectStorageAliasCandidate(contract.root,
+        cast<StorageLayoutAttr>(contract.layout), *var.storageAlias);
+    if (failed(projected))
+      return emitError(var.anchor->getLoc()) << "storage-root-contract: cannot project complete root map";
+    if (llvm::none_of(var.candidates, [&](const auto &c) { return c.value == *projected; }))
+      var.candidates.push_back({*projected, constraint.provenance, 0});
+  }
   for (const auto &var : graph.getVariables()) {
     if (var.kind != LayoutKind::Storage) continue;
     if (!var.storageAlias)

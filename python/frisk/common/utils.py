@@ -109,9 +109,27 @@ class FriskHelper:
         trans_a: bool = False,
         trans_b: bool = False,
         clear_accum: bool = False,
+        legacy_semantics: str | None = None,
     ) -> ir.GemmOp:
         """Light-weight wrapper around builder.create_gemm_op with kwargs."""
-        return self.builder.create_gemm_op(A, B, C, trans_a, trans_b, clear_accum)
+        return self.builder.create_gemm_op(
+            A, B, C, trans_a, trans_b, clear_accum, legacy_semantics
+        )
+
+    def create_reduce(
+        self,
+        src: ir.value,
+        dst: ir.value,
+        kind: str,
+        dim: int,
+        *,
+        clear: bool = True,
+        legacy_semantics: str | None = None,
+    ):
+        """Light-weight wrapper around builder.create_reduce_op with kwargs."""
+        return self.builder.create_reduce_op(
+            src, dst, kind, dim, clear, legacy_semantics
+        )
 
     # ------------------------------------------------------------------ #
     # Convenience utilities

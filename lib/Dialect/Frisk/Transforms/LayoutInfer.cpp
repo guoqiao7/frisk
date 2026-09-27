@@ -1,8 +1,10 @@
 #include "Dialect/Frisk/Transforms/Passes.h"
+#include "LegacyFragmentNormalization.h"
 
 #include "Dialect/Frisk/Analysis/LayoutSolver.h"
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
+#include "Dialect/Frisk/IR/FriskOps.h"
 #include "Dialect/Frisk/Target/SM90/SM90LayoutTarget.h"
 
 namespace mlir::frisk {
@@ -35,7 +37,19 @@ LogicalResult verifySM90TargetBoundary(Operation *root) {
 class FriskInferLayoutsPass final
     : public impl::FriskInferLayoutsBase<FriskInferLayoutsPass> {
 public:
+  FriskInferLayoutsPass() = default;
+  FriskInferLayoutsPass(const FriskInferLayoutsPass &other)
+      : impl::FriskInferLayoutsBase<FriskInferLayoutsPass>(other) {}
+  explicit FriskInferLayoutsPass(const SolverOptions &options) {
+    exactCombinationLimit = options.exactCombinationLimit;
+    beamWidth = options.beamWidth;
+    maxExpandedStates = options.maxExpandedStates;
+  }
   void runOnOperation() override {
+    if (failed(verifyNoLegacyLayoutIR(getOperation()))) {
+      signalPassFailure();
+      return;
+    }
     if (failed(verifySM90TargetBoundary(getOperation()))) {
       signalPassFailure();
       return;
@@ -48,7 +62,8 @@ public:
       return;
     }
     FailureOr<LayoutSolution> solution =
-        solveBootstrapLayoutGraph(*graph, *target);
+        solveLayoutGraph(*graph, *target,
+            {exactCombinationLimit, beamWidth, maxExpandedStates});
     if (failed(solution) ||
         failed(verifySolvedLayoutGraph(*graph, *solution, *target,
                                       getOperation().getLoc()))) {
@@ -56,6 +71,7 @@ public:
       return;
     }
     if (dumpAnalysis) {
+      printLayoutSolutionStatistics(*graph, *solution, *target, llvm::errs());
       graph->print(llvm::errs());
       for (const auto &var : graph->getVariables())
         if (var.kind == LayoutKind::Distributed)
@@ -63,7 +79,9 @@ public:
                        << var.candidates.size() << '\n';
       llvm::errs() << "conversions: " << solution->conversions.size() << '\n';
       for (const auto &edge : solution->conversions)
-        llvm::errs() << "convert " << graph->getConstraint(edge.constraint).stableUseKey << '\n';
+        llvm::errs() << "convert " << graph->getConstraint(edge.constraint).stableUseKey
+                     << " bytes=" << edge.bytes << " sync=" << edge.synchronizationCost
+                     << " estimate=cta-staging-upper-bound-v1\n";
     }
     if (analysisOnly)
       return;
@@ -76,6 +94,9 @@ public:
 
 std::unique_ptr<Pass> createFriskInferLayoutsPass() {
   return std::make_unique<FriskInferLayoutsPass>();
+}
+std::unique_ptr<Pass> createFriskInferLayoutsPass(const SolverOptions &options) {
+  return std::make_unique<FriskInferLayoutsPass>(options);
 }
 
 } // namespace mlir::frisk

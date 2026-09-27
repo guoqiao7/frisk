@@ -1,3 +1,4 @@
+#include "LegacyLayoutOracle.h"
 #include "Dialect/Frisk/Analysis/LegacyLayoutAdapter.h"
 #include "Dialect/Frisk/IR/FriskAttributes.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
@@ -64,7 +65,7 @@ protected:
     gemm->setAttr("frisk.threads", builder.getI64IntegerAttr(128));
 
     DenseMap<Value, Attribute> layouts;
-    if (failed(gemm.inferLayout(builder, layouts)))
+    if (failed(mlir::frisk::test::inferLegacyGemmLayout(gemm, builder, layouts)))
       return failure();
     auto get = [&](Value value) { return dyn_cast<LayoutAttr>(layouts[value]); };
     LayoutAttr a = get(gemm.getA());

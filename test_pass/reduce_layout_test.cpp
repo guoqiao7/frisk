@@ -1,3 +1,4 @@
+#include "LegacyLayoutOracle.h"
 #include "Dialect/Frisk/IR/FriskAttributes.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
@@ -166,7 +167,7 @@ bool runReduceCase(MLIRContext &context, const ReduceCase &tc) {
       buildLayoutAttr(inferBuilder, tc.srcShape, tc.srcIndexMap,
                       tc.srcThreadMap, tc.srcReplicate));
 
-  if (failed(reduce.inferLayout(inferBuilder, layoutMap))) {
+  if (failed(mlir::frisk::test::inferLegacyReduceLayout(reduce, inferBuilder, layoutMap))) {
     llvm::errs() << "inferLayout failed for '" << tc.name << "'\n";
     return false;
   }
@@ -307,7 +308,7 @@ bool runGemmReduceIntegration(MLIRContext &context, StringRef target,
   OpBuilder gemmInferBuilder(&context);
   gemmInferBuilder.setInsertionPoint(gemm);
   DenseMap<Value, Attribute> layoutMap;
-  if (failed(gemm.inferLayout(gemmInferBuilder, layoutMap))) {
+  if (failed(mlir::frisk::test::inferLegacyGemmLayout(gemm, gemmInferBuilder, layoutMap))) {
     llvm::errs() << "GEMM inferLayout failed for '" << label << "'\n";
     return false;
   }
@@ -331,7 +332,7 @@ bool runGemmReduceIntegration(MLIRContext &context, StringRef target,
   // Seed C's layout into the reduce's source.
   layoutMap.try_emplace(reduce.getSrc(), cLayout);
 
-  if (failed(reduce.inferLayout(reduceInferBuilder, layoutMap))) {
+  if (failed(mlir::frisk::test::inferLegacyReduceLayout(reduce, reduceInferBuilder, layoutMap))) {
     llvm::errs() << "Reduce inferLayout failed for '" << label << "'\n";
     return false;
   }

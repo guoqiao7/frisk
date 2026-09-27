@@ -32,7 +32,7 @@ protected:
   FailureOr<LayoutSolution> solve(LayoutConstraintGraph &graph) {
     if (failed(propagateStrict(graph)) || failed(propagateCommonToFixedPoint(graph)))
       return failure();
-    return solveBootstrapLayoutGraph(graph, *target);
+    return solveLayoutGraph(graph, *target);
   }
 };
 

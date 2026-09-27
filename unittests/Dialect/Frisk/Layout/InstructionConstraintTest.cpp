@@ -136,7 +136,7 @@ TEST_F(InstructionConstraintTest, EnumerationAndSolverChooseOneWholeBinding) {
   EXPECT_EQ(target.builds, 16u);
   EXPECT_EQ(graph.getConstraints().front().instruction->tuples.size(), 8u);
   ASSERT_TRUE(succeeded(propagateCommonToFixedPoint(graph)));
-  auto solution = solveBootstrapLayoutGraph(graph, target);
+  auto solution = solveLayoutGraph(graph, target);
   ASSERT_TRUE(succeeded(solution));
   EXPECT_EQ(solution->instructionBindings.lookup(0), plan);
   ASSERT_TRUE(succeeded(verifySolvedLayoutGraph(graph, *solution, target, b.getUnknownLoc())));

@@ -51,6 +51,7 @@ func.func @contract(%x: tensor<2x2xf16, #a>, %out: memref<2x2xf16, 3>) -> tensor
 
 // CHECK: conversions: 1
 // CHECK-NEXT: convert 8:contract/b0/o1/use0
+// CHECK-SAME: bytes={{[1-9][0-9]*}} sync=2 estimate=cta-staging-upper-bound-v1
 // CHECK-NOT: frisk.convert_layout
 // CHECK: func.func @contract
 

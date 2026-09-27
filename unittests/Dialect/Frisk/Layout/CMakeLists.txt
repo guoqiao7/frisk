@@ -1,4 +1,6 @@
 add_unittest(FriskUnitTests FriskLayoutUnitTests
+  LayoutCandidateSolverTest.cpp
+  LayoutCostModelTest.cpp
   ReduceConstraintTest.cpp
   ReductionLayoutProofTest.cpp
   GemmConstraintTest.cpp
@@ -11,6 +13,8 @@ add_unittest(FriskUnitTests FriskLayoutUnitTests
   LayoutAliasAnalysisTest.cpp
   ExecutionLayoutProofTest.cpp
   StorageAliasIntegrationTest.cpp
+  StorageRootContractTest.cpp
+  LayoutPipelineTest.cpp
   LayoutConversionPlanTest.cpp
   BitLinearLayoutTest.cpp
   GF2MatrixTest.cpp
@@ -22,6 +26,9 @@ add_unittest(FriskUnitTests FriskLayoutUnitTests
   LayoutVerifierTest.cpp
   LayoutMaterializationTest.cpp
   LegacyLayoutAdapterTest.cpp
+  LegacyImportSemanticsTest.cpp
+  LegacyNormalizationTest.cpp
+  LegacyNormalizationNumericTest.cpp
   ProductLayoutTest.cpp
 )
 
@@ -31,6 +38,7 @@ set_target_properties(FriskLayoutUnitTests PROPERTIES
 
 target_link_libraries(FriskLayoutUnitTests
   PRIVATE
+  FriskLegacyLayoutOracle
   FriskLayoutToGPU
   FriskTransforms
   FriskAnalysis

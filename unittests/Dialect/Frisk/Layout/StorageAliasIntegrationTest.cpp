@@ -63,7 +63,7 @@ TEST_F(StorageAliasIntegrationTest, InfersRootRelativeStridedSliceAndReverifies)
   auto graph = collectLayoutConstraints(*module, *target);
   ASSERT_TRUE(succeeded(graph));
   ASSERT_TRUE(succeeded(propagateCommonToFixedPoint(*graph)));
-  auto solution = solveBootstrapLayoutGraph(*graph, *target);
+  auto solution = solveLayoutGraph(*graph, *target);
   ASSERT_TRUE(succeeded(solution));
   // A valid-shaped but wrong slice assignment must not partially bind storage.
   auto bad = *solution;

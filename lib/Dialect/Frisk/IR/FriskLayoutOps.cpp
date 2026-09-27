@@ -8,6 +8,29 @@
 
 namespace mlir::frisk {
 
+LogicalResult StorageContractOp::verify() {
+  auto type = cast<MemRefType>(getRoot().getType());
+  if (!type.hasStaticShape())
+    return emitOpError("storage-root-contract: requires a static root");
+  auto space = getFriskMemorySpace(type);
+  if (!space || *space == attr::MemorySpace::Local)
+    return emitOpError("storage-root-contract: requires Shared or Global storage");
+  bool root = false;
+  if (auto def = getRoot().getDefiningOp()) {
+    StringRef name = def->getName().getStringRef();
+    root = name == "memref.alloc" || name == "memref.alloca" ||
+           name == "memref.get_global";
+  } else if (auto arg = dyn_cast<BlockArgument>(getRoot())) {
+    Operation *owner = arg.getOwner()->getParentOp();
+    StringRef name = owner->getName().getStringRef();
+    root = (name == "func.func" || name == "frisk.kernel") &&
+           &owner->getRegion(0).front() == arg.getOwner();
+  }
+  if (!root)
+    return emitOpError("storage-root-contract: operand must be a supported storage root, not a view");
+  return getLayout().verifyForType(type, getLoc());
+}
+
 LogicalResult ReduceTensorOp::verify() {
   auto src = cast<RankedTensorType>(getSource().getType());
   auto dst = cast<RankedTensorType>(getResult().getType());

@@ -41,7 +41,7 @@ LogicalResult prepareInstructionTuples(LayoutConstraintGraph &graph,
     instruction.tuples.clear();
     for (auto id : constraint.vars)
       if (graph.getVariable(id).candidates.size() > 4)
-        return emitError(loc) << "bootstrap layout solver limit exceeded: instruction candidate domain is too large";
+        return emitError(loc) << "instruction proof budget exceeded: candidate domain is too large";
     SmallVector<Attribute> encodings;
     DenseMap<LayoutVarID, Attribute> chosen;
     std::optional<LayoutProof> firstFailure;

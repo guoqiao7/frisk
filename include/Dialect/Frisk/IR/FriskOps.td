@@ -4,7 +4,6 @@
 include "Dialect/Frisk/IR/FriskDialect.td"
 include "Dialect/Frisk/IR/FriskEnums.td"
 include "Dialect/Frisk/IR/FriskAttributes.td"
-// include "Dialect/Frisk/IR/FriskInterfaces.td"
 
 include "mlir/IR/OpBase.td"
 // include "mlir/IR/AttrTypeBase.td"
@@ -136,9 +135,6 @@ def Frisk_ParallelOp : Frisk_Op<"parallel", [RecursiveMemoryEffects,
       builder.create<EndOp>(getLoc());
       return entry;
     }
-
-    ::mlir::LogicalResult inferLayout(::mlir::OpBuilder &builder,
-                                      llvm::DenseMap<::mlir::Value, ::mlir::Attribute> &layoutMap);
   }];
 
   let hasVerifier = 1;
@@ -253,13 +249,14 @@ def Frisk_EndOp : Frisk_Op<"end", [Pure, Terminator, ReturnLike]> {
 }
 
 // gemmOp
-def Frisk_GemmOp: Frisk_Op<"gemm"> {
+def Frisk_GemmOp: Frisk_Op<"gemm", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "General matrix multiplication operation";
   let description = [{}];
   let arguments = (ins
-    Arg<AnyMemRef, "", [MemRead]>:$A,
-    Arg<AnyMemRef, "", [MemRead]>:$B,
-    Arg<AnyMemRef, "", [MemRead, MemWrite]>:$C,
+    AnyMemRef:$A,
+    AnyMemRef:$B,
+    AnyMemRef:$C,
 
     BoolAttr:$transA,
     BoolAttr:$transB,
@@ -279,8 +276,6 @@ def Frisk_GemmOp: Frisk_Op<"gemm"> {
     ValueRange getAllMatrix() {
       return ValueRange(getOperation()->getOperands());
     }
-    ::mlir::LogicalResult inferLayout(::mlir::OpBuilder &builder,
-                                      llvm::DenseMap<::mlir::Value, ::mlir::Attribute> &layoutMap);
   }];
 
   // let extraClassDeclaration = [{
@@ -427,15 +422,16 @@ def Frisk_FillOp: Frisk_Op<"fill"> {
 }
 
 // reduceOp
-def Frisk_ReduceOp: Frisk_Op<"reduce"> {
+def Frisk_ReduceOp: Frisk_Op<"reduce", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "reduce";
   let description = [{ 
     reduce
   }];
 
   let arguments = (ins 
-    Arg<AnyMemRef, "", [MemRead]>:$src,
-    Arg<AnyMemRef, "", [MemWrite]>:$dst,
+    AnyMemRef:$src,
+    AnyMemRef:$dst,
     StrAttr:$kind,
     I64Attr:$dim,
     BoolAttr:$clear
@@ -449,9 +445,6 @@ def Frisk_ReduceOp: Frisk_Op<"reduce"> {
   let extraClassDeclaration = [{
     MemRefType getSrcType() { return cast<MemRefType>(getSrc().getType()); }
     MemRefType getDstType() { return cast<MemRefType>(getDst().getType()); }
-
-    ::mlir::LogicalResult inferLayout(::mlir::OpBuilder &builder,
-                                      llvm::DenseMap<::mlir::Value, ::mlir::Attribute> &layoutMap);
   }];
 
   let hasVerifier = 1;

@@ -1,5 +1,9 @@
 add_frisk_library(FriskTransforms
+    NormalizeLayoutIR.cpp
+    LegacyFragmentNormalization.cpp
     LayoutInfer.cpp
+    PreserveStorageContracts.cpp
+    PassPipelines.cpp
     MaterializeLayouts.cpp
     LayoutTypeConverter.cpp
     OptimizeLayoutConversions.cpp

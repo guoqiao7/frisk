@@ -49,7 +49,7 @@ protected:
   StringLayoutTarget target;
 };
 
-TEST_F(LayoutVerifierTest, BootstrapSolverUsesStableCandidateOrdinal) {
+TEST_F(LayoutVerifierTest, SolverUsesCanonicalTieNotCandidateOrdinal) {
   LayoutConstraintGraph graph;
   LayoutVarID id = graph.addVariable(LayoutKind::Distributed, type, "only");
   graph.getVariable(id).candidates = {
@@ -58,14 +58,14 @@ TEST_F(LayoutVerifierTest, BootstrapSolverUsesStableCandidateOrdinal) {
   ASSERT_TRUE(succeeded(graph.finalize(loc)));
 
   FailureOr<LayoutSolution> solution =
-      solveBootstrapLayoutGraph(graph, target);
+      solveLayoutGraph(graph, target);
   ASSERT_TRUE(succeeded(solution));
-  EXPECT_EQ(solution->assignments.lookup(0), b);
+  EXPECT_EQ(solution->assignments.lookup(0), a);
   EXPECT_TRUE(
       succeeded(verifySolvedLayoutGraph(graph, *solution, target, loc)));
 }
 
-TEST_F(LayoutVerifierTest, RejectsIncompleteSolutionAndDomainLimit) {
+TEST_F(LayoutVerifierTest, RejectsIncompleteSolutionAndAllowsLargeDomain) {
   LayoutConstraintGraph graph;
   LayoutVarID id = graph.addVariable(LayoutKind::Storage, type, "only");
   graph.getVariable(id).candidates = {{a, kInvalidProvenanceID, 0}};
@@ -76,14 +76,14 @@ TEST_F(LayoutVerifierTest, RejectsIncompleteSolutionAndDomainLimit) {
       verifySolvedLayoutGraph(graph, incomplete, target, loc)));
 
   LayoutConstraintGraph tooLarge;
-  id = tooLarge.addVariable(LayoutKind::Storage, type, "large-domain");
+  id = tooLarge.addVariable(LayoutKind::Distributed, type, "large-domain");
   for (unsigned ordinal = 0; ordinal < 5; ++ordinal)
     tooLarge.getVariable(id).candidates.push_back(
         {builder.getStringAttr("candidate" + Twine(ordinal)),
          kInvalidProvenanceID, ordinal});
   tooLarge.getVariable(id).state = LayoutState::CandidateSet;
   ASSERT_TRUE(succeeded(tooLarge.finalize(loc)));
-  EXPECT_TRUE(failed(solveBootstrapLayoutGraph(tooLarge, target)));
+  EXPECT_TRUE(succeeded(solveLayoutGraph(tooLarge, target)));
 }
 
 TEST_F(LayoutVerifierTest, RejectsUnsupportedHardConstraint) {
@@ -96,7 +96,7 @@ TEST_F(LayoutVerifierTest, RejectsUnsupportedHardConstraint) {
                       "unsupported bootstrap instruction contract");
   ASSERT_TRUE(succeeded(graph.finalize(loc)));
 
-  EXPECT_TRUE(failed(solveBootstrapLayoutGraph(graph, target)));
+  EXPECT_TRUE(failed(solveLayoutGraph(graph, target)));
 }
 
 TEST_F(LayoutVerifierTest, ShuffledInsertionProducesCanonicalSolution) {
@@ -150,7 +150,7 @@ TEST_F(LayoutVerifierTest, ShuffledInsertionProducesCanonicalSolution) {
       ASSERT_TRUE(succeeded(propagateStrict(graph)));
       ASSERT_TRUE(succeeded(propagateCommonToFixedPoint(graph)));
       FailureOr<LayoutSolution> solution =
-          solveBootstrapLayoutGraph(graph, target);
+          solveLayoutGraph(graph, target);
       ASSERT_TRUE(succeeded(solution));
       ASSERT_TRUE(
           succeeded(verifySolvedLayoutGraph(graph, *solution, target, loc)));

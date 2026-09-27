@@ -17,6 +17,7 @@
 #include "Dialect/Frisk/IR/FriskAttributes.h"
 #include "Dialect/Frisk/IR/FriskEnums.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
+#include "Dialect/Frisk/IR/LegacyImportSemantics.h"
 
 
 namespace py = pybind11;
@@ -321,49 +322,36 @@ void init_ffi_ir_builder(py::module_ &m) {
       // frisk
       .def("create_gemm_op",
         [](OpBuilderWithLoc &self, Value &A, Value &B, Value &C,
-           bool transA, bool transB, bool clearAccum) {
+           bool transA, bool transB, bool clearAccum,
+           const std::optional<std::string> &legacySemantics) {
           auto &builder = self.getBuilder();
 
-          auto requireMemRef = [](Value &val, const char *name) -> MemRefType {
-            if (auto type = dyn_cast<MemRefType>(val.getType()))
-              return type;
-            throw std::invalid_argument(std::string("create_gemm_op expects memref for operand ") + name);
-          };
-
-          auto requireStaticDim = [](int64_t dim, const char *desc) -> uint64_t {
-            if (dim < 0)
-              throw std::invalid_argument(std::string("create_gemm_op requires static ") + desc);
-            return static_cast<uint64_t>(dim);
-          };
-
-          MemRefType aType = requireMemRef(A, "A");
-          MemRefType bType = requireMemRef(B, "B");
-          MemRefType cType = requireMemRef(C, "C");
-
-          if (aType.getRank() != 2 || bType.getRank() != 2 || cType.getRank() != 2)
-            throw std::invalid_argument("create_gemm_op expects rank-2 memrefs");
-
-          uint64_t m = requireStaticDim(aType.getDimSize(0), "M dimension of A");
-          uint64_t k = requireStaticDim(aType.getDimSize(1), "K dimension of A");
-          uint64_t kFromB = requireStaticDim(bType.getDimSize(0), "K dimension of B");
-          if (k != kFromB)
-            throw std::invalid_argument("create_gemm_op expects A and B inner dimensions to match");
-          uint64_t n = requireStaticDim(bType.getDimSize(1), "N dimension of B");
-          uint64_t cM = requireStaticDim(cType.getDimSize(0), "M dimension of C");
-          uint64_t cN = requireStaticDim(cType.getDimSize(1), "N dimension of C");
-          if (m != cM || n != cN)
-            throw std::invalid_argument("create_gemm_op expects C shape to match A/B product");
-
-          auto elementType = aType.getElementType();
-          if (elementType != bType.getElementType() || elementType != cType.getElementType())
-            throw std::invalid_argument("create_gemm_op expects operands to have matching element types");
+          auto aType = dyn_cast<MemRefType>(A.getType());
+          auto bType = dyn_cast<MemRefType>(B.getType());
+          if (!aType || !bType || aType.getRank() != 2 || bType.getRank() != 2 ||
+              !aType.hasStaticShape() || !bType.hasStaticShape())
+            throw std::invalid_argument(
+                "legacy-gemm-shape: A and B must be static rank-2 memrefs");
+          int64_t m = aType.getDimSize(transA ? 1 : 0);
+          int64_t k = aType.getDimSize(transA ? 0 : 1);
+          int64_t n = bType.getDimSize(transB ? 0 : 1);
+          if (auto error = getLegacyGemmValidationError(
+                  A.getType(), B.getType(), C.getType(), transA, transB, m, n,
+                  k))
+            throw std::invalid_argument(*error);
 
           auto policy = GemmPolicy::Square;
-          return self.create<GemmOp>(A, B, C, transA, transB, m, n, k, policy, clearAccum);
+          GemmOp op = self.create<GemmOp>(A, B, C, transA, transB, m, n, k,
+                                          policy, clearAccum);
+          if (legacySemantics)
+            op->setAttr("frisk.legacy_semantics",
+                        builder.getStringAttr(*legacySemantics));
+          return op;
         },
         py::arg("A"), py::arg("B"), py::arg("C"),
         py::arg("transA") = false, py::arg("transB") = false,
-        py::arg("clear_accum") = false)
+        py::arg("clear_accum") = false,
+        py::arg("legacy_semantics") = py::none())
       .def("create_kernel_op", [](OpBuilderWithLoc &self, ModuleOp &module, std::string &KernelName, Type &KernelType) {
         if (Operation *kernelOperation = module.lookupSymbol(KernelName))
           return llvm::dyn_cast<KernelOp>(kernelOperation);
@@ -466,9 +454,15 @@ void init_ffi_ir_builder(py::module_ &m) {
         }
         return self.create<FillOp>(memref, attr);
       })
-      .def("create_reduce_op", [](OpBuilderWithLoc &self, Value src, Value dst, const std::string &kind, int64_t dim, bool clear) {
-        return self.create<ReduceOp>(src, dst, kind, dim, clear);
-      }, py::arg("src"), py::arg("dst"), py::arg("kind"), py::arg("dim"), py::arg("clear")=true);
+      .def("create_reduce_op", [](OpBuilderWithLoc &self, Value src, Value dst, const std::string &kind, int64_t dim, bool clear,
+                                   const std::optional<std::string> &legacySemantics) {
+        ReduceOp op = self.create<ReduceOp>(src, dst, kind, dim, clear);
+        if (legacySemantics)
+          op->setAttr("frisk.legacy_semantics",
+                      self.getBuilder().getStringAttr(*legacySemantics));
+        return op;
+      }, py::arg("src"), py::arg("dst"), py::arg("kind"), py::arg("dim"), py::arg("clear")=true,
+         py::arg("legacy_semantics")=py::none());
 
 }
 

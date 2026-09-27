@@ -2,6 +2,12 @@
 #define FRISK_ANALYSIS_LAYOUTRELATIONS_H
 #include "Dialect/Frisk/Analysis/LayoutConstraint.h"
 namespace mlir::frisk {
+bool isSupportedHardLayoutConstraint(ConstraintKind kind);
+bool satisfiesLayoutConstraint(const LayoutConstraintGraph &graph,
+    const LayoutConstraint &constraint,
+    const DenseMap<LayoutVarID, Attribute> &assignment, bool requireComplete);
+LogicalResult verifyLayoutStorageCapacity(const LayoutConstraintGraph &graph,
+    const LayoutVar &var, Attribute candidate);
 bool isSupportedLayoutRelation(ConstraintKind kind);
 bool isSupportedUnaryLayoutConstraint(ConstraintKind kind);
 LayoutProof proveUnaryLayoutConstraint(const LayoutConstraintGraph &graph,

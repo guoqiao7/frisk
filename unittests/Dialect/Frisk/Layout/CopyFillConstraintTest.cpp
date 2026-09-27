@@ -1,3 +1,4 @@
+#include "LegacyLayoutOracle.h"
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
@@ -48,7 +49,7 @@ protected:
   LogicalResult infer(ModuleOp module) {
     auto graph = collectLayoutConstraints(module, *target);
     if (failed(graph) || failed(propagateCommonToFixedPoint(*graph))) return failure();
-    auto solution = solveBootstrapLayoutGraph(*graph, *target);
+    auto solution = solveLayoutGraph(*graph, *target);
     if (failed(solution)) return failure();
     return materializeLayouts(module, *graph, *solution);
   }
@@ -249,16 +250,16 @@ TEST_F(CopyFillConstraintTest, NewPassDoesNotCallLegacyParallelInference) {
   ASSERT_TRUE(module);
   ParallelOp op;
   module->walk([&](ParallelOp p) { op=p; });
-  auto count = getLegacyParallelInferenceCallCount();
+  auto count = mlir::frisk::test::getLegacyParallelOracleCallCount();
   OpBuilder builder(&context);
   DenseMap<Value, Attribute> legacy;
-  (void)op.inferLayout(builder, legacy);
-  EXPECT_EQ(getLegacyParallelInferenceCallCount(), count+1);
-  count = getLegacyParallelInferenceCallCount();
+  (void)mlir::frisk::test::inferLegacyParallelLayout(op, builder, legacy);
+  EXPECT_EQ(mlir::frisk::test::getLegacyParallelOracleCallCount(), count+1);
+  count = mlir::frisk::test::getLegacyParallelOracleCallCount();
   PassManager pm(&context);
   pm.addPass(createFriskInferLayoutsPass());
   ASSERT_TRUE(succeeded(pm.run(*module)));
-  EXPECT_EQ(getLegacyParallelInferenceCallCount(), count);
+  EXPECT_EQ(mlir::frisk::test::getLegacyParallelOracleCallCount(), count);
 }
 
 TEST_F(CopyFillConstraintTest, CapturedTensorConvertsAtParallelUse) {

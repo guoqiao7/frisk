@@ -1,3 +1,4 @@
+#include "LegacyLayoutOracle.h"
 #include "Dialect/Frisk/IR/FriskAttributes.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
@@ -203,7 +204,7 @@ static bool runGemmLayoutCase(MLIRContext &context, StringRef caseLabel,
   OpBuilder builder(&context);
   builder.setInsertionPoint(gemm);
   llvm::DenseMap<Value, Attribute> layoutMap;
-  if (failed(gemm.inferLayout(builder, layoutMap))) {
+  if (failed(mlir::frisk::test::inferLegacyGemmLayout(gemm, builder, layoutMap))) {
     llvm::errs() << "inferLayout returned failure for case '" << caseLabel
                  << "'\n";
     return false;
@@ -316,7 +317,7 @@ bool testReduceLayoutInference(MLIRContext &context) {
   layoutMap.try_emplace(reduce.getSrc(),
                         buildSimpleFragmentLayout(inferBuilder, srcType));
 
-  if (failed(reduce.inferLayout(inferBuilder, layoutMap))) {
+  if (failed(mlir::frisk::test::inferLegacyReduceLayout(reduce, inferBuilder, layoutMap))) {
     llvm::errs() << "reduce layout inference failed\n";
     return false;
   }

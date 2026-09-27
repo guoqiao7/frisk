@@ -1,5 +1,7 @@
 # Triton、TileLang 与 Frisk 布局推断对比及 Frisk 架构决策
 
+> 最新验收（2026-09-27）：Task 23 已完成，正式 exact/beam 求解器与静态 CostVector 接入，272 unit / 49 lit / 4 CTest / 5 Python 及独立复审通过，旧 9/8 变量集成缺口已补齐。本轮未刷新上游快照、未做性能对比、未提交或推送。
+
 > 文档性质：技术对比 + Frisk 架构决策记录
 >
 > Frisk 目标平台：NVIDIA SM90/SM90a
@@ -7,6 +9,8 @@
 > 首次审阅：2026-08-16；本次源码审计：2026-09-12
 >
 > 状态（2026-09-19）：M0–M3 与 M4 Task 18–20 已完成；Task 21 的受限 Reduce 实现、独立复审及 197 unit / 36 lit / 4 CTest 回归已完成，完整 MMA→Reduce→tile_store 成功验收仍受 9 变量与 8 变量上限冲突限制，见实现计划 §21.8。Task 22 尚未实施。Task 19/20 已提交为本地 main `c028e82`，未 push；Task 21 未提交、未推送。远端同步状态不由本文推断。
+
+> 最新进展（2026-09-20）：Task 22 已按用户确认的方案 A 契约实现，独立复审与全量验收已通过，记录见实现计划 §22.13。上一轮已经将 `c028e82` 与 `14b39e9` 推送到 `origin/main`；上文未推送为历史记录，本轮修改未提交或推送。Task 21 的 9/8 变量完整链验收缺口仍保留。
 >
 > 实现更新（2026-09-19）：Task 20 的 SS＋RS 具体契约 v1 已确认并实施；实际适配、有限联合约束与验证边界见下节及实现计划 §20.13。本轮核对固定上游快照的 GEMM 源码，没有升级快照或运行上游测试。
 
@@ -35,6 +39,34 @@
 - 本轮没有 TileLang/Triton 运行实验、GPU benchmark 或端到端性能结论。上表 27/74/4 是 M3 基线；Task 18 的新增测试结果单独记录，不能混用。
 
 ## 1. 结论摘要
+
+### Task 23 求解器实现与验收（2026-09-27，已完成）
+
+本轮以 Frisk 工作区（main `9bc8349`＋未提交 Task 22）为起点，未刷新或运行 TileLang/Triton。起点审计核实了旧 bootstrap 的 8 变量/4 候选限制、转换数优先及未被调用的 target CostVector；当时 `LayoutConversionEdge` 的字节/同步字段没有实际填充值。Task 23 现已替换该求解器并接通静态成本，不把此前“已有代价结构体”表述为“当时已有性能求解器”。
+
+用户确认的固定候选域小组件 exact、大组件确定性 beam 已实现，明确区分穷尽无可证明方案、beam 未找到解和搜索预算耗尽，并保留操作级证明、实际 IR 复验与模块事务。具体契约及验收见[实现计划 §23](./layout_inference_implementation_plan.md#task-23-实现连通分量候选求解和-costvector)，独立复审与 272 unit / 49 lit / 4 CTest / 5 Python、生产接口隔离扫描均通过；本轮未 commit/push。
+
+可追踪的设计重点是：候选组合选择与硬件合法性证明分离；搜索不完整不能冒充非法性证明；联合 SSA/use、Storage、MMA tuple 和 Reduce pair 的既有关系求解；CostVector 区分已建模静态项和未来硬件估计。Beam/exact、字典序代价及稳定排序本身不是创新性证明，也不能由此宣称比固定快照的上游系统更快或更优。Task 24/25 的 placement/rematerialization 与完整 SM90 成本仍不在本任务范围内。
+
+本轮实际差异：选择以硬关系连通分量为范围，输出实际 Attribute assignment、指令/归约 binding 和逐 use conversion；小图 exact、大图有界 beam，失败区分无可证明方案、截断未找到解与预算耗尽。已有 32→128 活跃线程子集转换继续合法，成本取两端最大线程覆盖；Shared 别名只按根最大占用末端计一次。这与旧 Frisk 局部 layoutMap 更新不同，但并不证明上游缺少全局分析或代价选择。9 变量核心及 Copy/Parallel128/MMA/Reduce/Global 写回已在 25 项集成回归中成功；全量 Gate 及精确命令见实现计划 §23.9。
+
+### Task 22 方案 A 的实现与验收（2026-09-20）
+
+基线为 Frisk `14b39e9`。方案 A 的生命周期转换、持久契约、事务 pipeline 和旧入口退役已落地，独立复审通过，最终 242 unit / 48 lit / 4 CTest / 5 Python 测试方法及隔离扫描通过；本轮未刷新或运行上游框架。实际代码、适配及测试证据以[实现计划 §22.13](./layout_inference_implementation_plan.md#task-22-实现-legacy-normalization-并退役旧生产路径)为准，不把测试文件存在等同于执行通过。
+
+旧 Buffer→Tensor 迁移不能只替换类型或 Op 名字：原 Gemm verifier 与 Python 绑定要求同 dtype，而新 MMA 目标采用 f16/bf16 输入与 f32 累加。本任务同步扩展导入 builder/verifier，并以显式数学声明处理旧 clear；不静默提升累加精度，不把尚未初始化的 Local buffer 当零。新增完整 Local 生命周期和 SCF 状态转换，不能归功于此前已有的 Tensor region graph。
+
+已落实的体系区分点仍是 Frisk 自身的“双域表示＋操作契约＋实际 IR 独立验证”：真实存储继续使用 MemRef，寄存器值生命周期转成 Tensor；whole-root map/对齐前置事实经持久声明保存，不从消费者需求反推根保证。旧方法已从生产 API 删除，baseline 仅保留测试角色。这是本仓库可核验的工程实现，不能单凭 Tensor 化、SSA 或旧路径退役声称上游没有相同机制或已证明研究独创性。
+
+已确认契约增加以下明确选择：
+
+- `frisk.legacy_semantics = "tensor_v1"` 作为 legacy Gemm/Reduce 的显式数学导入声明，区分“导入者接受新语义”与“已经证明所有旧数值实现等价”；f16 C 不静默提升成 f32。旧 Buffer builder/verifier 同步支持显式 f32 C，不能只让内部 C++ fixture 能构造。
+- clear=true 表示覆盖；clear=false 必须有已初始化旧值，Reduce 先归约再按同 kind 与旧 dst 合并，并补全真实目的 Read effect。SCF 的初始化/分支合并/循环携带值单独证明，不把原有 Tensor region graph 当作现成 Buffer promotion。
+- `frisk.storage_contract` 保存完整根 map 与对齐前置条件，并按 dominance 限定作用域；其不可随意删除来自声明本身的语义，不伪造 layout_view 内存副作用。验证同时检查映射相容性，不只保存对齐数值。
+- 对原简单 pass 串联计划作事务适配：具名 pipeline 在 clone 上执行 normalize、infer、根契约保存、conversion 优化及最终 actual-only，全部成功才提交；单 pass 原子性不冒充整条 pipeline 原子性。
+- 旧公式只保留在不被生产二进制链接的测试 oracle 中。使用普通测试库而非收集到 FFI 链接列表的生产库，避免源码位置看似隔离而链接仍污染生产路径。
+
+本阶段保留 8 变量求解预算；normalize、预算内 pipeline 成功和完整 MMA→Reduce→store 成功分别验收。根声明是硬前置事实，不新增可选布局域，不移除真实 producer/use 来绕过预算。不把 Task 21 的分段证据重新包装成端到端证据，也不在缺少 GPU/上游实验时声明数值等价或性能领先。
 
 ### Task 21 实现增量与验收边界（2026-09-19）
 

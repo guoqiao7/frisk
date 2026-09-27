@@ -1,10 +1,14 @@
 # Frisk SM90 MLIR-native 布局推断系统设计
 
+> 最新验收（2026-09-27）：Task 23 已完成，272 unit / 49 lit / 4 CTest / 5 Python 与独立复审通过；完整 MMA→Reduce→Global store 和含 Copy/Parallel 的整链成功，历史 9/8 变量缺口已补齐，详见 §22。本轮未提交或推送。
+
 > 状态：MLIR-native 双域 IR 架构已确认（原架构候选“方案 C”）
 > 日期：2026-08-16
 > 范围：NVIDIA SM90/SM90a；布局推断、布局验证与布局物化
 > 核心选择：Local/Register Tile 使用 `RankedTensorType + EncodingAttr`，Shared/Global 保持 MemRef，由统一约束系统连接分布式布局与存储布局
 > 实施状态（2026-09-19）：M0–M3、M4 Task 18–20 已完成；Task 21 Reduce 的受限实现、独立复审及 197 unit / 36 lit / 4 CTest 回归已完成，设计增量见 §20，验收记录见实现计划 §21.8。完整 MMA→Reduce→tile_store 成功验收仍因 9 变量超过保留的 8 变量上限而未完成；Task 22 legacy normalization 尚未实施，可执行 GPU 验收仍属后续阶段。Task 19/20 已按用户要求提交到源目录 main `c028e82`，未 push；Task 21 未提交、未推送。
+
+> 最新进展（2026-09-20）：Task 19–21 已在上一轮提交并推送到 origin/main，当前基线为 `14b39e9`。Task 22 已按确认的方案 A 契约实现，独立复审与全量验收已通过，实际记录见实现计划 §22.13。本轮改动未提交或推送；以上旧未提交/未推送描述是历史状态。
 
 ## 1. 结论先行
 
@@ -58,9 +62,9 @@ Frisk 应采用已经确认的 MLIR-native 双域 IR 架构，并进行以下重
 
 ## 3. 当前代码与参考系统审计
 
-### 3.1 Frisk 当前状态
+### 3.1 Frisk 初始审计状态（M2 时点）
 
-当前实现已经完成 Storage 纵向切片，但 Distributed Tensor、显式 conversion 和完整 SM90 指令契约仍未实现：
+以下保留 M2 时点的源码审计以追踪演进，当时仅完成 Storage 纵向切片。当前 Distributed/MMA/Reduce 实现及 Task 22 旧入口退役分别见后续实施记录和 §21；不将下列历史接口描述视为现行生产 API：
 
 - `LayoutAttr` 同时包含 `forwardIndex`、`forwardThread` 和 `replicateSize`，混合了存储布局、线程分布和复制语义。
 - `forwardIndex/forwardThread` 只用 `AffineMapAttr` 表示，无法自然表达 XOR swizzle。
@@ -300,8 +304,8 @@ M1 固化的通用 encoding 文本与单位如下：
   `legacy layout cannot be represented by the canonical layout algebra`，不猜测布局。
 
 M1 差分门覆盖当前 SM90 `sm90_ss` 与 `sm90_rs`：shared A/B 地址和 local A/C
-ownership 均逐点比较。SM80 旧测试继续作为原生产路径回归保留，但不属于当前
-SM90-only adapter 的支持承诺。
+ownership 均逐点比较。SM80 旧公式测试在 Task 22 后通过测试专用 oracle 保留，
+不再链接生产推断路径，也不属于当前 SM90-only adapter 的支持承诺。
 
 ## 6. 创新核心：Affine × BitLinear 组合布局代数
 
@@ -452,7 +456,7 @@ struct LayoutConstraint {
 
 ### 7.4 新 Op Interface
 
-现有 `inferLayout(builder, DenseMap&)` 应废弃，替换为只收集语义、不修改全局状态的接口：
+原 `inferLayout(builder, DenseMap&)` 已在 Task 22 从生产 ODS/C++ 删除；当前采用新接口与分类 collector 收集约束，不更新旧全局 map。以下为接口方向示意，实际 API 以 `FriskLayoutOpInterfaces` 与 Analysis collectors 为准：
 
 ```cpp
 class LayoutConstraintOpInterface {
@@ -892,6 +896,8 @@ NVIDIA 对 compute capability 9 的 TMA swizzle 给出了 32B/64B/128B 模式及
 
 实施采用方案 A：“基础能力 + 纵向切片 + 逐类扩展”。旧 `LayoutAttr + DenseMap` 在迁移期作为语义基线保留，但所有新增能力只进入新 Attr、constraint、solver 和 materializer；当 Copy、Fill、Gemm、Reduce 和基础 region 全部迁移后删除旧生产路径。
 
+Task 22 已执行该退役：旧属性/操作可作为受限导入或测试输入保留，旧推断方法只存在于测试 oracle；生产 infer 不接受残留旧布局。完整 M4 仍保留 Task 21 的 9/8 变量端到端验收缺口，不因接口退役而视作消除。
+
 ### M0：基础设施与现状冻结
 
 工作：
@@ -1178,3 +1184,47 @@ negative tests 独立覆盖其拒绝边界。详细接口及命令见
 - 支持单 CTA、32/64/128/256/512/1024 线程、静态二次幂且每维大于 1 的输入，输入 rank 至少 2。逻辑及硬件各 65536 点预算；超预算 Unknown。保留 8 vars/component、4 candidates/domain，不提供无限全局搜索。
 
 完整 SS MMA→Reduce→tile_store 有 9 个真实图变量，超过现有上限；当前验收使用 MMA→Reduce 与 Reduce→store 两个切片，完整链作为超限拒绝用例，不宣称整链成功。静态依赖证明也不等于已分配 shared scratch、插入同步或执行 GPU 数值测试。PartialFragment/epoch、动态/ragged/标量结果、旧 Buffer Reduce normalization 和 GPU lowering 均不在本阶段。
+
+## 21. M4 Task 22：受限生命周期归一化与旧入口退役（已实现并验证）
+
+用户已确认以下公共设计，生命周期归一化、持久声明、事务 pipeline 和旧 API 退役均已实现，独立复审及 242 unit / 48 lit / 4 CTest / 5 Python 测试方法均已通过。完整定义、实际适配和验证证据见[实现计划 §22.3–22.13](layout_inference_implementation_plan.md#task-22-实现-legacy-normalization-并退役旧生产路径)。此节不修改前面各任务的历史验收结论。
+
+### 21.1 显式导入语义与不可隐式提升的 dtype
+
+legacy Gemm/Reduce 需在操作或最近的函数/Kernel/module 明确声明 `frisk.legacy_semantics = "tensor_v1"`，表示接受与新 Tensor 操作一致的数学契约；不从缺少旧 lowering 的布局代码推导数值等价。旧 f16/bf16 C 不自动提升；Buffer 导入 verifier 与 Python builder 同步增加 f16/bf16 A/B＋f32 C 支持，按 transpose 核对实际 shape。
+
+Gemm clear=true 使用显式正零 init，false 使用已初始化的旧 C。Reduce add→sum，max/min 采用 NaN 传播及有符号零契约；clear=true 覆盖结果，false 在完成归约后生成 `combiner(old_dst,reduced)`。后者必须读取旧 dst，memory effect 同步表达；未初始化、mul 和语义未知输入明确失败。
+
+### 21.2 完整 Local 生命周期与控制流
+
+只提升静态 identity Local allocation 及保持其完整形状/类型的静态 cast；不接受 Local 参数、subview、动态/重解释视图、scalar 访问、未知用户或逃逸。每根共享 Uninitialized/当前 Tensor 状态；Fill、整块 Copy、Gemm、Reduce 完整改写后才删除 allocation/cast/dealloc。Shared/Global 保留 MemRef 与 layout_view，真正 load/store 出现在原读取/写入位置。
+
+支持 scf.if 的分支结果合并、scf.for 的 init/iter_arg/result/backedge，以及 scf.while 两套 tuple 的独立扩展；缺失路径不得补零，for 零次和 while 首次 false 的 before 执行语义分别保持。只读外部值可直接捕获，循环修改值必须显式携带。Parallel 只提升其内部新建且不逃逸的 Local 根；旧静态正步长 frisk.for 可转 scf.for，含待提升根的未知 region/frisk.block 拒绝。
+
+### 21.3 根存储契约是持久前置事实
+
+新增 `frisk.storage_contract %root {layout=...}` 保存完整根 map 和对齐前置条件，无结果、不标记 Pure。它声明编译期契约，不伪造实际数据读写，也不执行 runtime 对齐检查；layout_view 保持 Pure。
+
+仅从实际 whole-root 绑定或显式声明取得证据，保留原作用域并检查 dominance；分支内保证不能提升到外部。映射和对齐共同参与 RootStorageContract 硬约束及实际 IR 独立验证，声明不创建可选布局域。normalize 保存已有声明，pipeline 在 infer 后、可能 DCE 的优化前保存物化根绑定；重复运行去重稳定。根本不存在的证据不能恢复，不能从消费者需求反推保证。
+
+执行作用域必须是已知且具 SSA dominance 的 func/Kernel/Parallel/scf.if/for/while；未知或 graph region 的通用 dominance 不作为执行顺序证明，声明与 whole-root 保存保守拒绝。这不影响仅在原位置绑定端点的 Storage-only Copy/Fill 转换。
+
+### 21.4 事务 pipeline 与测试隔离
+
+`frisk-layout-pipeline` 用事务包装在 clone 上依次 normalize、infer/materialize、保存根契约、优化转换和最终 actual-only，成功才提交。公开 builder/显式注册入口保留，frisk-opt 必须显式注册；独立 normalize 与整条 pipeline 的回滚边界分别测试。
+
+生产 ODS/C++ 删除旧 inferLayout(DenseMap&) 和计数入口，旧 Op 名字作为导入 IR 保留。旧公式移到 `test/Support/LegacyLayoutOracle`，只链接测试，不借 LegacyLayoutAdapter 恢复生产推断，也不被收集到 frisk_ffi 的生产库列表。
+
+维持 8 vars/component、4 candidates/domain 和既有证明预算。新的 SSA 可以构造成功但仍因图规模在 infer 阶段失败；Task 21 的 9 变量完整链仍是明确的未完成成功验收项。此设计不增加 GPU lowering、完整成本求解或数值/性能领先结论。
+
+## 22. M5 Task 23：有界候选选择与可审计成本（已完成）
+
+2026-09-27 审计起点：bootstrap 按 8 变量/4 候选限制执行穷举，以新增 conversion 数优先；SM90 的 CostVector 回调未被该求解器调用，conversion bytes/sync 字段未填充。用户确认的方案 A 已完成实现、独立复审及 272 unit / 49 lit / 4 CTest / 5 Python 全量验收；9 变量核心及含 Copy/Parallel 的整链实际成功，补齐历史集成缺口。完整契约与记录见[实现计划 §23](layout_inference_implementation_plan.md#task-23-实现连通分量候选求解和-costvector)。
+
+已在冻结并硬剪枝的候选域上替换生产 bootstrap：剪枝后乘积不超过 256 时精确搜索，超过时 beamWidth=32，每组件最多尝试 65536 次候选扩展（含 MRV 试探和硬拒绝）。删除 solver 的 8/4 限制，但保留独立的 MMA/Reduce/alias 证明预算。变量顺序、候选身份和同分 assignment key 均稳定；不以合并真实 producer/use 或削弱硬约束来满足预算。
+
+CostVector 按字段字典序比较，先硬合法、后软成本；候选域内最优性要求穷尽搜索、非负可分解成本，跨组件合并还要求不因饱和压平比较项。首版 SM90 建模静态 conversion 搬运/同步上界、寄存器槽、Shared 根跨度、replication 与转换数；不将未建模的 instruction/transaction/bank 项解释为真实零开销。部分状态使用安全下界，不可靠估计不能用于证明剪枝。成本接口显式提供图/变量上下文，不依赖隐藏全局状态。同 CTA 不同活跃线程子集转换采用 `T=max(Tsrc,Tdst)`；Shared 同根部分视图按最大根相对末端计一次。
+
+exact 穷尽、beam 截断和预算中断有不同结果语义：beam 找到的解只承诺合法；被截断后找不到解不等于证明无解。输出搜索统计与成本覆盖，保留 MMA/Reduce binding、consumer conversion、实际 IR 独立验证和 Task 22 事务。完整 9 变量链及含 Copy/Parallel 的整链已经实测成功并更新此前验收缺口；失败回滚改用显式搜索预算测试继续覆盖。
+
+本任务不包含 Task 24 的 hoist/rematerialization/critical-path placement，也不包含 Task 25 的完整 SM90 性能模型或 GPU 验收。方案及契约已经用户确认并实施，实际验收进度见实现计划 §23.9。

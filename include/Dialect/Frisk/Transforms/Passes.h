@@ -5,11 +5,14 @@
 #include "mlir/IR/BuiltinOps.h"
 
 namespace mlir::frisk {
+struct SolverOptions;
 
 #define GEN_PASS_DECL
 #include "Dialect/Frisk/Transforms/Passes.h.inc"
 
 std::unique_ptr<Pass> createFriskInferLayoutsPass();
+std::unique_ptr<Pass> createFriskInferLayoutsPass(const SolverOptions &options);
+std::unique_ptr<Pass> createNormalizeLayoutIRPass();
 std::unique_ptr<Pass> createOptimizeLayoutConversionsPass();
 std::unique_ptr<Pass> createTestLowerLayoutConversionsPass();
 

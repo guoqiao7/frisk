@@ -78,7 +78,7 @@ TEST_F(DistributedPropagationTest, RealDualConsumerKeepsAlternatives) {
   EXPECT_EQ(distributed, 3u);
   ASSERT_TRUE(succeeded(propagateStrict(*graph)));
   ASSERT_TRUE(succeeded(propagateCommonToFixedPoint(*graph)));
-  auto solution = solveBootstrapLayoutGraph(*graph, *target);
+  auto solution = solveLayoutGraph(*graph, *target);
   ASSERT_TRUE(succeeded(solution));
   EXPECT_TRUE(solution->conversions.empty());
   EXPECT_TRUE(succeeded(verifySolvedLayoutGraph(
@@ -103,7 +103,7 @@ TEST_F(DistributedPropagationTest, HardConsumerChoicesConvertExactlyOneRealUse) 
   ASSERT_EQ(consumer, 2u);
   ASSERT_TRUE(succeeded(graph->finalize(module->getLoc())));
   ASSERT_TRUE(succeeded(propagateCommonToFixedPoint(*graph)));
-  auto solution = solveBootstrapLayoutGraph(*graph, *target);
+  auto solution = solveLayoutGraph(*graph, *target);
   ASSERT_TRUE(succeeded(solution));
   ASSERT_EQ(solution->conversions.size(), 1u);
   EXPECT_TRUE(succeeded(verifySolvedLayoutGraph(*graph, *solution, *target, module->getLoc())));
@@ -145,7 +145,7 @@ TEST_F(DistributedPropagationTest, HardConsumerChoicesConvertExactlyOneRealUse) 
   for (auto &var : reordered.getVariables())
     std::reverse(var.candidates.begin(), var.candidates.end());
   ASSERT_TRUE(succeeded(reordered.finalize(module->getLoc())));
-  auto again = solveBootstrapLayoutGraph(reordered, *target);
+  auto again = solveLayoutGraph(reordered, *target);
   ASSERT_TRUE(succeeded(again));
   EXPECT_EQ(again->assignments, solution->assignments);
   ASSERT_EQ(again->conversions.size(), 1u);
@@ -186,7 +186,7 @@ TEST_F(DistributedPropagationTest, UnencodedNonSquareTransposeBidirectionalFixed
   ASSERT_TRUE(succeeded(propagateCommonToFixedPoint(*graph)));
   for (auto [index, var] : llvm::enumerate(graph->getVariables()))
     EXPECT_EQ(var.candidates.size(), sizes[index]);
-  auto solution = solveBootstrapLayoutGraph(*graph, *target);
+  auto solution = solveLayoutGraph(*graph, *target);
   ASSERT_TRUE(succeeded(solution));
   EXPECT_TRUE(solution->conversions.empty());
   EXPECT_TRUE(succeeded(verifySolvedLayoutGraph(*graph, *solution, *target, module->getLoc())));
@@ -236,7 +236,7 @@ TEST_F(DistributedPropagationTest, ConversionCountPrecedesCandidateOrdinal) {
   }
   ASSERT_TRUE(succeeded(graph->finalize(module->getLoc())));
   ASSERT_TRUE(succeeded(propagateCommonToFixedPoint(*graph)));
-  auto solution = solveBootstrapLayoutGraph(*graph, *target);
+  auto solution = solveLayoutGraph(*graph, *target);
   ASSERT_TRUE(succeeded(solution));
   EXPECT_TRUE(solution->conversions.empty());
   for (const auto &var : graph->getVariables())
@@ -270,14 +270,14 @@ TEST_F(DistributedPropagationTest, ExistingExplicitConversionsAreNotReinserted) 
     auto graph = collectLayoutConstraints(*module, *target);
     ASSERT_TRUE(succeeded(graph));
     ASSERT_TRUE(succeeded(propagateCommonToFixedPoint(*graph)));
-    auto solution = solveBootstrapLayoutGraph(*graph, *target);
+    auto solution = solveLayoutGraph(*graph, *target);
     ASSERT_TRUE(succeeded(solution));
     EXPECT_TRUE(solution->conversions.empty());
     EXPECT_TRUE(succeeded(verifySolvedLayoutGraph(*graph, *solution, *target, module->getLoc())));
   }
 }
 
-TEST_F(DistributedPropagationTest, RealUseComponentsRespectEightVariableBound) {
+TEST_F(DistributedPropagationTest, RealUseComponentsExceedEightVariables) {
   auto module = parseSourceString<ModuleOp>(R"mlir(
     func.func @chain(%arg: tensor<8xf32>) {
       %0 = arith.negf %arg : tensor<8xf32>
@@ -295,9 +295,9 @@ TEST_F(DistributedPropagationTest, RealUseComponentsRespectEightVariableBound) {
   auto graph = collectLayoutConstraints(*module, *target);
   ASSERT_TRUE(succeeded(graph));
   ASSERT_EQ(graph->getVariables().size(), 9u);
-  expectDiagnostic("too many variables", [&] {
-    return failed(solveBootstrapLayoutGraph(*graph, *target));
-  });
+  auto solution = solveLayoutGraph(*graph, *target);
+  ASSERT_TRUE(succeeded(solution));
+  EXPECT_TRUE(succeeded(verifySolvedLayoutGraph(*graph, *solution, *target, module->getLoc())));
 }
 
 TEST_F(DistributedPropagationTest, DomainOverflowIsNotSilentlyTruncated) {
@@ -316,9 +316,9 @@ TEST_F(DistributedPropagationTest, DomainOverflowIsNotSilentlyTruncated) {
     ASSERT_TRUE(llvm::none_of(var.candidates, [&](auto candidate) { return candidate.value == *fifth; }));
     var.candidates.push_back({*fifth, kInvalidProvenanceID, 5});
   }
-  expectDiagnostic("candidate domain is too large", [&] {
-    return failed(solveBootstrapLayoutGraph(*graph, *target));
-  });
+  auto solution = solveLayoutGraph(*graph, *target);
+  ASSERT_TRUE(succeeded(solution));
+  EXPECT_TRUE(succeeded(verifySolvedLayoutGraph(*graph, *solution, *target, module->getLoc())));
 }
 
 TEST_F(DistributedPropagationTest, FunctionResultBindingsSurviveFinalize) {
@@ -393,7 +393,7 @@ TEST_F(DistributedPropagationTest, CustomNamedTransposePreservesEndpointEncoding
     EXPECT_TRUE(layoutRelationCompatible(*graph, relation, destination, dst,
                                          source, relabeled));
   }
-  auto solution = solveBootstrapLayoutGraph(*graph, *target);
+  auto solution = solveLayoutGraph(*graph, *target);
   ASSERT_TRUE(succeeded(solution));
   EXPECT_TRUE(solution->conversions.empty());
   EXPECT_TRUE(succeeded(verifySolvedLayoutGraph(*graph, *solution, *target, module->getLoc())));

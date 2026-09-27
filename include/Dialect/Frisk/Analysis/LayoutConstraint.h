@@ -42,6 +42,7 @@ enum class ConstraintKind {
   StorageAccess,
   CopyAccess,
   AliasLayout,
+  RootStorageContract,
   Ownership,
   ResourceLimit,
   Preference
@@ -128,6 +129,14 @@ struct ReductionLayoutContract {
   SmallVector<ReductionLayoutPair, 0> pairs;
 };
 
+/// A fixed declaration, not a candidate variable. Its IR identity is borrowed
+/// just like graph operands; rebuilding the graph revalidates the declaration.
+struct RootStorageContract {
+  Operation *declaration = nullptr;
+  StorageAliasInfo root;
+  Attribute layout;
+};
+
 struct LayoutConstraint {
   LayoutConstraintID id = 0;
   ConstraintKind kind = ConstraintKind::SameLayout;
@@ -143,6 +152,7 @@ struct LayoutConstraint {
   int64_t requiredThreads = 0;
   std::optional<InstructionLayoutContract> instruction;
   std::optional<ReductionLayoutContract> reduction;
+  std::optional<RootStorageContract> rootStorage;
 };
 
 enum class RegionLayoutEdgeKind {
@@ -222,6 +232,7 @@ public:
                                    Attribute requiredEncoding = {});
 
   LogicalResult finalize(Location loc);
+  bool isFinalized() const { return finalized; }
   LogicalResult verifyInvariants(Location loc) const;
   LogicalResult printProvenanceChain(ProvenanceID id,
                                      raw_ostream &os) const;

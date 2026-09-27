@@ -1,6 +1,19 @@
 #ifndef FRISK_LAYOUT_OPS
 #define FRISK_LAYOUT_OPS
 
+def Frisk_StorageContractOp : Frisk_Op<"storage_contract"> {
+  let summary = "persistent whole-root storage mapping precondition";
+  let description = [{
+    Declares a caller-provided whole-root address map and alignment precondition.
+    This compile-time declaration is observable and must not be dropped as a
+    dead value. It neither reads nor writes the stored data and performs no
+    runtime alignment check. Only dominating declarations apply to a use.
+  }];
+  let arguments = (ins AnyMemRef:$root, StorageLayoutAttr:$layout);
+  let hasVerifier = 1;
+  let assemblyFormat = "$root attr-dict `:` type($root)";
+}
+
 def Frisk_ReduceTensorOp : Frisk_Op<"reduce_tensor", [Pure]> {
   let summary = "pure, deterministic-tree tensor reduction";
   let description = [{

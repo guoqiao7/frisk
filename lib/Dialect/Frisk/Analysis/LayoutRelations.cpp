@@ -1,4 +1,7 @@
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
+#include "Dialect/Frisk/Analysis/InstructionLayoutConstraints.h"
+#include "Dialect/Frisk/Analysis/ReductionLayoutConstraints.h"
+#include "Dialect/Frisk/Analysis/StorageRootContracts.h"
 #include "Dialect/Frisk/Analysis/ReductionLayoutProof.h"
 #include "Dialect/Frisk/Analysis/ExecutionLayoutProof.h"
 #include "Dialect/Frisk/IR/FriskAttributes.h"
@@ -6,6 +9,83 @@
 #include "llvm/ADT/STLExtras.h"
 
 namespace mlir::frisk {
+bool isSupportedHardLayoutConstraint(ConstraintKind kind) {
+  return kind == ConstraintKind::RequireEncoding ||
+         kind == ConstraintKind::InstructionContract ||
+         kind == ConstraintKind::ReductionLayout ||
+         isSupportedUnaryLayoutConstraint(kind) ||
+         isSupportedLayoutRelation(kind);
+}
+
+bool satisfiesLayoutConstraint(const LayoutConstraintGraph &graph,
+                         const LayoutConstraint &constraint,
+                         const DenseMap<LayoutVarID, Attribute> &assignment,
+                         bool requireComplete) {
+  if (constraint.strength != ConstraintStrength::Hard)
+    return true;
+  if (constraint.kind == ConstraintKind::ReductionLayout) {
+    if (requireComplete && llvm::any_of(constraint.vars, [&](auto id) {
+          return !assignment.count(id);
+        })) return false;
+    return findReductionSupport(graph, constraint, assignment);
+  }
+  if (constraint.kind == ConstraintKind::InstructionContract) {
+    if (requireComplete && llvm::any_of(constraint.vars, [&](auto id) {
+          return !assignment.count(id);
+        })) return false;
+    return findInstructionSupport(graph, constraint, assignment);
+  }
+  for (LayoutVarID id : constraint.vars)
+    if (!assignment.count(id))
+      return !requireComplete;
+
+  if (constraint.kind == ConstraintKind::RequireEncoding)
+    return assignment.lookup(constraint.vars.front()) ==
+           constraint.requiredEncoding;
+  if (!isSupportedHardLayoutConstraint(constraint.kind))
+    return false;
+  if (isSupportedUnaryLayoutConstraint(constraint.kind))
+    return proveUnaryLayoutConstraint(graph, constraint,
+        assignment.lookup(constraint.vars.front())).status == ProofStatus::Proven;
+  for (size_t index = 1; index < constraint.vars.size(); ++index)
+    if (!layoutRelationCompatible(graph, constraint,
+            constraint.vars.front(), assignment.lookup(constraint.vars.front()),
+            constraint.vars[index], assignment.lookup(constraint.vars[index])))
+      return false;
+  return true;
+}
+
+LogicalResult verifyLayoutStorageCapacity(const LayoutConstraintGraph &graph,
+                                    const LayoutVar &var,
+                                    Attribute candidate) {
+  if (var.kind != LayoutKind::Storage)
+    return success();
+  Location loc = var.anchor ? var.anchor->getLoc() : UnknownLoc::get(var.shapedType.getContext());
+  auto type = dyn_cast<MemRefType>(var.shapedType);
+  auto storage = dyn_cast<StorageLayoutAttr>(candidate);
+  if (!type || !storage)
+    return emitError(loc) << "storage solution for " << var.stableName
+                          << " has an incompatible type or encoding";
+  if (var.storageAlias) {
+    const auto &proof = getStorageAliasFootprint(graph, var.id, candidate).proof;
+    if (proof.status == ProofStatus::Proven) return success();
+    return emitError(loc) << "storage alias proof failed for " << var.stableName
+                          << ": " << proof.reason;
+  }
+  FailureOr<uint64_t> required = getStorageFootprintBytes(storage, type);
+  FailureOr<uint64_t> capacity = getMemRefStaticCapacityBytes(type);
+  if (failed(required) || failed(capacity))
+    return emitError(loc)
+           << "cannot prove storage layout footprint for " << var.stableName
+           << " fits the underlying memref type";
+  if (*required > *capacity)
+    return emitError(loc) << "storage layout requires " << *required
+                          << " bytes but underlying memref type provides "
+                          << *capacity << " bytes for " << var.stableName;
+  return success();
+}
+
+
 const StorageAliasFootprint &getStorageAliasFootprint(
     const LayoutConstraintGraph &graph, LayoutVarID id, Attribute candidate) {
   auto &cache = graph.getAliasFootprintCache();
@@ -57,7 +137,8 @@ bool isSupportedLayoutRelation(ConstraintKind kind) {
 }
 
 bool isSupportedUnaryLayoutConstraint(ConstraintKind kind) {
-  return kind == ConstraintKind::Ownership || kind == ConstraintKind::ResourceLimit;
+  return kind == ConstraintKind::Ownership || kind == ConstraintKind::ResourceLimit ||
+         kind == ConstraintKind::RootStorageContract;
 }
 
 bool matchesLayoutThreadCount(Attribute candidate, int64_t threads) {
@@ -80,6 +161,11 @@ LayoutProof proveUnaryLayoutConstraint(const LayoutConstraintGraph &graph,
   if (constraint.vars.size() != 1)
     return {ProofStatus::Unknown, {}, "unary execution constraint requires one endpoint"};
   const auto &var = graph.getVariable(constraint.vars.front());
+  if (constraint.kind == ConstraintKind::RootStorageContract) {
+    if (!constraint.rootStorage || !var.storageAlias)
+      return {ProofStatus::Unknown, {}, "missing root storage contract metadata"};
+    return proveRootStorageContract(*constraint.rootStorage, *var.storageAlias, candidate);
+  }
   if (constraint.kind == ConstraintKind::ResourceLimit)
     return {matchesLayoutThreadCount(candidate, constraint.requiredThreads)
                 ? ProofStatus::Proven : ProofStatus::Disproven,

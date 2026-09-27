@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Target/SM90/SM90LayoutTarget.h"
+#include "Dialect/Frisk/Analysis/LayoutCostModel.h"
 #include "Dialect/Frisk/Target/SM90/SM90GemmConstraints.h"
 #include "Dialect/Frisk/Target/SM90/SM90ReduceConstraints.h"
 
@@ -230,11 +231,18 @@ public:
   }
 
   FailureOr<CostVector>
-  evaluate(const CandidateAssignment &assignment) const override {
-    CostVector cost;
-    for (const auto &entry : assignment.values)
-      cost.deterministicTieBreak += entry.first;
-    return cost;
+  evaluate(const CandidateAssignment &) const override { return CostVector{}; }
+  FailureOr<CostEstimate> evaluate(const LayoutConstraintGraph &graph,
+      const CandidateAssignment &assignment) const override {
+    return evaluateStaticLayoutCost(graph, assignment);
+  }
+  FailureOr<CostEstimate> lowerBound(const LayoutConstraintGraph &graph,
+      const CandidateAssignment &assignment) const override {
+    return evaluateStaticLayoutCost(graph, assignment);
+  }
+  StringRef costCoverage() const override {
+    return "cta-staging-upper-bound-v1; register/replication slots; shared root spans; "
+           "unmodeled=instructionPathAndWork,memoryTransactions,bankConflictDegree";
   }
 };
 

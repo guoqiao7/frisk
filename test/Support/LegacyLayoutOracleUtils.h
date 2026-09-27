@@ -1,5 +1,5 @@
-#ifndef FRISK_UTILS_LAYOUT_UTILS_H
-#define FRISK_UTILS_LAYOUT_UTILS_H
+#ifndef FRISK_TEST_LEGACY_LAYOUT_ORACLE_UTILS_H
+#define FRISK_TEST_LEGACY_LAYOUT_ORACLE_UTILS_H
 
 #include <cstdint>
 #include <optional>
@@ -8,7 +8,7 @@
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinAttributes.h"
 
-namespace mlir::frisk {
+namespace mlir::frisk::test {
 
 struct CompressedReplicateInfo {
   AffineMapAttr mapAttr;
@@ -45,6 +45,6 @@ std::optional<AffineMapAttr>
 inferFragmentIndexFromThreadMap(OpBuilder &builder, AffineMapAttr threadMapAttr,
                                 ArrayRef<int64_t> inputShape);
 
-} // namespace mlir::frisk
+} // namespace mlir::frisk::test
 
-#endif // FRISK_UTILS_LAYOUT_UTILS_H
+#endif // FRISK_TEST_LEGACY_LAYOUT_ORACLE_UTILS_H

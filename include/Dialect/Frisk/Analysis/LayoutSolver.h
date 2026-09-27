@@ -10,6 +10,46 @@
 
 namespace mlir::frisk {
 
+struct LayoutSolution {
+  DenseMap<LayoutVarID, Attribute> assignments;
+  SmallVector<LayoutConversionEdge> conversions;
+  DenseMap<LayoutConstraintID, Attribute> instructionBindings;
+  DenseMap<LayoutConstraintID, Attribute> reductionBindings;
+  CostEstimate cost;
+  struct ComponentStatistics {
+    LayoutVarID root = 0;
+    uint64_t rawCombinations = 1, combinations = 1;
+    uint64_t expanded = 0, hardRejected = 0, beamDiscarded = 0;
+    uint64_t deduplicated = 0;
+    bool rawProductOverflow = false, productOverflow = false;
+    bool usedBeam = false, exhaustive = false;
+    unsigned beamWidth = 0;
+    SmallVector<unsigned> domains;
+    CostEstimate cost;
+  };
+  struct CandidateRejection {
+    LayoutVarID variable;
+    std::string candidate, reason;
+    LayoutConstraintID constraint;
+  };
+  SmallVector<ComponentStatistics> components;
+  SmallVector<CandidateRejection> rejections;
+};
+
+struct SolverOptions {
+  uint64_t exactCombinationLimit = 256;
+  unsigned beamWidth = 32;
+  uint64_t maxExpandedStates = 65536;
+};
+
+FailureOr<LayoutSolution>
+solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
+                 SolverOptions options = {});
+void printLayoutSolutionStatistics(const LayoutConstraintGraph &graph,
+                                   const LayoutSolution &solution,
+                                   LayoutTarget &target, llvm::raw_ostream &os);
+
+
 class LayoutConstraintBuilder {
 public:
   explicit LayoutConstraintBuilder(LayoutConstraintGraph &graph)

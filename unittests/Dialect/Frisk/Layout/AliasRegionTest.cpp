@@ -194,7 +194,7 @@ TEST_F(AliasRegionTest, CommonAccountingAndAssignmentIgnoreInsertionOrder) {
                                 common.changesByVariable.end(), uint64_t{0}),
                 common.domainChanges);
       EXPECT_TRUE(common.hasValidBounds());
-      auto solution = solveBootstrapLayoutGraph(graph, target);
+      auto solution = solveLayoutGraph(graph, target);
       ASSERT_TRUE(succeeded(solution));
       std::string summary;
       llvm::raw_string_ostream out(summary);

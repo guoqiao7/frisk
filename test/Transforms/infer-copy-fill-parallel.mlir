@@ -3,6 +3,7 @@
 // RUN: FileCheck %s < %t.once
 // RUN: frisk-opt %t.once --frisk-infer-layouts -verify-each > %t.twice
 // RUN: diff %t.once %t.twice
+// RUN: frisk-opt %s --frisk-layout-pipeline -verify-each > %t.pipeline
 
 // GRAPH-DAG: operation-execution {{.*}} threads=128 writer=first_owner vector-bytes=1
 // GRAPH-DAG: hard copy-access

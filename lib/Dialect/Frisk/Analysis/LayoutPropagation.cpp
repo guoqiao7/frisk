@@ -1,6 +1,8 @@
 #include "Dialect/Frisk/Analysis/LayoutSolver.h"
 #include "Dialect/Frisk/Analysis/OperationLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
+#include "Dialect/Frisk/Analysis/StorageRootContracts.h"
+#include "mlir/IR/Dominance.h"
 #include "Dialect/Frisk/Analysis/InstructionLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/ReductionLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/MmaLayoutConstraints.h"
@@ -363,16 +365,19 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
   });
   if (failedCollection) return failure();
 
+  DominanceInfo dominance(root);
   for (Value source : sourceOrder) {
     ArrayRef<LayoutVarID> ids = viewsBySource.find(source)->second;
-    uint64_t alignment = graph.getVariable(ids.front()).storageAlias->rootAlignment;
-    std::string alignmentEvidence =
-        graph.getVariable(ids.front()).storageAlias->alignmentEvidence;
     // Only a whole-root binding may declare a root base-alignment contract.
     // Child demands never become root guarantees.
-    for (LayoutVarID id : ids) {
+    for (LayoutVarID destination : ids) {
+      auto &destinationVar = graph.getVariable(destination);
+      uint64_t alignment = destinationVar.storageAlias->rootAlignment;
+      std::string alignmentEvidence = destinationVar.storageAlias->alignmentEvidence;
+      for (LayoutVarID id : ids) {
       const auto &var = graph.getVariable(id);
       const auto &info = *var.storageAlias;
+      if (!storageContractDominates(var.anchor, destinationVar.anchor, dominance)) continue;
       if (info.viewType.getShape() != info.rootType.getShape() ||
           !info.viewToRoot.isIdentity()) continue;
       for (const auto &seed : var.candidates)
@@ -382,10 +387,9 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
               " (not a runtime proof), alignment=" +
               std::to_string(storage.getAlignment().getInt());
         }
-    }
-    for (auto id : ids) {
-      graph.getVariable(id).storageAlias->rootAlignment = alignment;
-      graph.getVariable(id).storageAlias->alignmentEvidence = alignmentEvidence;
+      }
+      destinationVar.storageAlias->rootAlignment = alignment;
+      destinationVar.storageAlias->alignmentEvidence = alignmentEvidence;
     }
     // Partial overlap is not transitive: every pair matters, including disjoint
     // logical domains whose proposed physical intervals might collide.
@@ -398,6 +402,7 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
                 graph.getVariable(ids[i]).storageAlias->rootKey);
   }
 
+  failedCollection |= failed(attachStorageRootContracts(root, graph));
   failedCollection |= failed(collectOperationLayoutConstraints(root, graph, builder));
   failedCollection |= failed(collectDistributedLayoutConstraints(root, graph, builder));
   failedCollection |= failed(collectMmaLayoutConstraints(root, graph, builder));

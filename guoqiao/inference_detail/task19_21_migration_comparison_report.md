@@ -4,6 +4,8 @@
 
 本文比较旧 Frisk 的实际推断路径与三个任务的实际增量，不把后续规划当成已经实现的能力。测试数字引用已完成的验收记录，本次文档整理未重新运行测试。
 
+后续更新（2026-09-27）：上文整理日期及第 1–10 节为 Task 19–21 的历史汇报；Task 22 的完整例子见第 11 节。Task 23 已解除旧求解器 8/4 上限，完整链实际测试通过，当前边界以 §11.8 更新为准。
+
 ## 1. 汇报结论：不是简单搬代码，而是重新表达和验证旧规则
 
 Task 19、20、21 的共同目标，是让原先分散在各个 Op 中的布局规则进入新 Frisk 的统一推断流程。但三个任务的工作并不完全相同：
@@ -286,12 +288,12 @@ A1 和 B2 分别都在某套合法方案中，但 `A1+B2+C1+C1` 没有完整方�
 | Parallel | 单 CTA、32/64/128/256/512/1024 线程；保留对实际线程组织的检查 |
 | MMA | 显式 sm_90a、SS/RS、f16/bf16 输入与 f32 累加；不支持 Tensor B，也未继承旧路径所有 Ampere/Local MemRef 形式 |
 | Reduce | 静态二次幂、各维大于 1、输入至少二维；暂不支持标量输出、动态/ragged、mul 或部分和专用类型 |
-| 求解预算 | 仍为每个连通分量最多 8 变量、每个域最多 4 候选；不是大图全局最优布局求解器 |
+| 求解预算 | Task 21 交付时为每组件最多 8 变量、每域最多 4 候选；Task 23 已改为有界 exact/beam，见 §11.8 |
 | 后续工作 | 旧 Buffer 程序自动 normalization、完整 GPU lowering、同步/资源落实和性能成本优化尚未由这三项交付 |
 
-尤其要保留 Task 21 的验收差异：`MMA→Reduce` 与 `Reduce→Global tile_store` 已分别验证成功，但完整 `MMA→Reduce→tile_store` 有 9 个连通变量，超过现有 8 变量上限。
+尤其要保留 Task 21 当时的验收差异：`MMA→Reduce` 与 `Reduce→Global tile_store` 已分别验证成功，但完整 `MMA→Reduce→tile_store` 有 9 个连通变量，超过当时的 8 变量上限。
 
-其数量是 MMA 的 5 个变量，加 Reduce 的 2 个，再加 store 的 2 个。当前完整链测试验证超限拒绝，不能把分段成功拼成端到端成功。Task 21 受限实现已交付，但原契约的完整链成功验收仍需解决。
+其数量是 MMA 的 5 个变量，加 Reduce 的 2 个，再加 store 的 2 个。当时完整链测试验证超限拒绝，不能把分段成功拼成端到端成功。该历史缺口后来由 Task 23 的完整成功测试补齐，而非追溯计作 Task 21 已完成。
 
 ## 8. 验证结果：增强点有测试，边界也有拒绝用例
 
@@ -333,3 +335,246 @@ A1 和 B2 分别都在某套合法方案中，但 `A1+B2+C1+C1` 没有完整方�
 详细汇报：[Task 19](./task19_report.md)、[Task 20](./task20_report.md)、[Task 21](./task21_report.md)。
 
 维护依据：[实现计划](../layout_inference_implementation_plan.md) §19.1/19.9、§20.1/20.13、§21.1/21.8；[布局系统设计](../layout_inference_design.md)；[三方策略比较](../layout_inference_strategy_comparison.md)。
+
+## 11. 完整例子：Copy → Gemm → Reduce → 写回，新旧系统分别怎样推断
+
+本节补充 Task 22 完成后的状态。前文“旧推断仍在生产保留、normalization 尚待实现”是 Task 19–21 时点的记录；目前旧公式已迁入测试专用 [LegacyLayoutOracle.cpp](../../test/Support/LegacyLayoutOracle.cpp)，生产入口使用新 pipeline。
+
+### 11.1 同一个计算任务
+
+在一个 128 线程的 Parallel 中，读取两个矩阵，执行矩阵乘加，再逐行求和：
+
+```text
+A：64×16，f16，Global 输入
+B：16×64，f16，Global 输入
+C：64×64，f32，中间累加值
+Y：64，   f32，Global 输出
+
+C[i,j] = 1 + Σ(k=0..15) A[i,k] × B[k,j]
+Y[i]   = Σ(j=0..63) C[i,j]
+```
+
+若 A、B 全为 1，则每个 C 元素为 17，每个 Y 元素为 1088。下面的代码均为省略具体语法的推断示意。
+
+旧 Buffer 形式：
+
+```text
+target = sm_90a
+parallel(128 threads) {
+    As = alloc Shared[64,16] f16，显式 alignment=1024
+    Bs = alloc Shared[16,64] f16，显式 alignment=1024
+    C  = alloc Local [64,64] f32
+    R  = alloc Local [64]    f32
+
+    Copy(A_global, As)
+    Copy(B_global, Bs)
+    Fill(C, 1.0)
+    Gemm(As, Bs, C, transA=false, transB=false,
+         policy=Square, clear_accum=false)
+    Reduce(C, R, kind=add, dim=1, clear=true)
+    Copy(R, Y_global)
+}
+```
+
+这里选 SS MMA：A/B 都在 Shared，C 表示寄存器累加片段。Shared allocation 的对齐是输入中真实声明的保证，不是由 MMA 的需求倒推出来的。
+
+**精度边界：** Task 22 扩展后的旧操作导入 verifier 支持 f16 A/B＋f32 C；原始旧 verifier 要求 A/B/C 同 dtype。下面旧侧对照的是历史布局推断规则，不声称这段混合精度文本在旧版本中可以原样通过，更不把旧 f16 C 自动提升成 f32。
+
+### 11.2 旧系统：Gemm 决定 A/B/C，Reduce 再由 C 推出 R
+
+旧 Gemm 读取目标、128 线程、M/N/K、transpose 和 warp policy，调用目标相关公式，分别构造：
+
+```text
+L_As：Shared A 的布局
+L_Bs：Shared B 的布局
+L_C ：累加片段的线程/索引布局
+```
+
+然后写入共享布局表：
+
+```cpp
+layoutMap.try_emplace(As, L_As);
+layoutMap.try_emplace(Bs, L_Bs);
+layoutMap.try_emplace(C,  L_C);
+```
+
+旧 Reduce 被调用且找到 `layoutMap[C]` 后，再执行：
+
+```text
+C 的线程映射
+  → 消去列维，将相应持有关系转入复制维
+  → 压缩复制维并推导结果索引
+  → 得到 L_R
+  → 写入/检查 layoutMap[R]
+```
+
+这条推断依赖可概括为：
+
+```text
+Gemm 的目标公式 → L_As、L_Bs、L_C
+                                  └→ Reduce 局部投影 → L_R
+```
+
+旧规则已有 Tensor Core 布局知识、replication 表示及部分兼容性检查。局限不在于“完全不会推断”，而在于这些结果主要以每个 Buffer 一个表项组织：
+
+- `C` 的生产布局与 Reduce 消费 `C` 的布局，没有成为两个可协调的端点。
+- Copy 的访问分工、Gemm 的指令组合、Reduce 的贡献者没有进入同一张操作约束图共同检查。
+- `try_emplace` 在表项已存在时不会执行联合候选求解；不能将“不覆盖旧值”解释为“已证明旧布局满足新操作”。
+- 旧 Reduce 找不到源布局时可以直接返回 success，不代表这条链已经推断完整。
+
+另外，保留的旧 Parallel 实现并没有自动调度完整的 Copy→Gemm→Reduce→Copy 求解链；这里展示的是各旧规则之间的依赖，不是假设旧系统已有同样的完整 pipeline。
+
+### 11.3 Task 22：先把隐式 Buffer 更新变成明确的生产/消费关系
+
+为导入操作声明 `frisk.legacy_semantics="tensor_v1"` 后，归一化得到：
+
+```text
+parallel(128 threads) {
+    // Global/Shared 仍为真实存储；补充或复用 Storage view。
+    Copy(A_global_view, As_view)
+    Copy(B_global_view, Bs_view)
+
+    c0 = TensorConstant<64×64×f32>(1.0)
+    c1 = mma(As_view, Bs_view, c0)
+    r  = reduce_tensor(c1, kind=sum, dim=1)
+    tile_store(r, Y_global_view)
+}
+```
+
+转换前后最关键的对应关系是：
+
+| 原操作 | 转换后 | 对布局推断的作用 |
+| --- | --- | --- |
+| Global→Shared Copy | 保留 Copy，端点绑定 Storage view | 读写地址与执行线程分工能够进入新图 |
+| Local `Fill(C,1)` | 产生 `c0` Tensor | 明确 MMA 的初始累加值，不隐式读取未知 C |
+| Gemm 修改 C | `c1 = mma(As,Bs,c0)` | init、结果及各消费位置可以分别建立布局变量 |
+| Reduce 读取 C、修改 R | `r = reduce_tensor(c1)` | 明确 MMA 结果到 Reduce 输入的依赖 |
+| Local→Global Copy | `tile_store(r,Y)` | 将结果消费布局与输出地址映射连接 |
+
+这里的 **Local Fill→常量属于 Task 22**；它不是 Task 19 对 Shared/Global Fill 的线程写入规则。Buffer 引用原本也是 SSA 值，真正改变的是“引用背后会变的内容”现在由 `c0/c1/r` 三个明确的计算值表示。
+
+### 11.4 Task 19：Copy 的布局不能只看目的 Shared buffer
+
+以 `Copy(A_global, As)` 为例，Global A 若采用普通行主序，则：
+
+```text
+S_global(i,k) = 2 × (16 × i + k) 字节
+```
+
+Shared As 可以采用另一种合法映射，例如满足后续 MMA 要求的 swizzle 布局。两端布局不必相等，但必须复制同一个逻辑元素：
+
+```text
+线程/寄存器位置 h
+      │ 执行布局 E_copy
+      ▼
+逻辑坐标 (i,k)
+      ├→ S_global(i,k)：从哪里读
+      └→ S_shared(i,k)：写到哪里
+```
+
+Task 19 给 Copy 增加的正是这些要求：
+
+- 执行分工必须覆盖要复制的逻辑元素。
+- 源、目的访问必须对应同一逻辑坐标，而非强迫两端物理布局相同。
+- 若执行布局含副本，写入责任必须合法，不能让全部副本无条件写同一地址。
+- 访问的向量宽度、对齐与 Parallel 的 128 线程环境必须相容。
+
+**与旧路径的区别：** 不只是拿到 `L_As` 后认为 Copy 可以照做；Copy 自己也对 `As` 的候选布局提出约束。随后 Gemm 又对同一个 Shared 存储提出指令要求，二者必须共同成立。这里的 swizzle 是候选说明，不是宣称完整链当前已经选中了某个具体 swizzle。
+
+### 11.5 Task 20：MMA 选择的是完整合法组合，不是三个独立表项
+
+新 MMA 的核心联合关系是：
+
+```text
+(As 的实际 Storage 布局,
+ Bs 的实际 Storage 布局,
+ c0 在 MMA 消费位置的 Distributed 布局,
+ c1 的 Distributed 布局)
+                 ↓
+       必须属于同一个合法 MMA 组合
+```
+
+同一个 `As_view` 同时受到上一步 Copy 访问要求和这里的 MMA 指令要求约束，不能由两段代码各自决定一份互不相干的布局。
+
+Task 20 的证明还会核对实际 Shared 字节地址、descriptor 条件、线程组织和累加片段的寄存器映射。硬件契约不满足的候选不能靠“另一个候选代价更低”或“旧公式曾经生成过它”来放行。
+
+对 `c0`，新系统区分：
+
+```text
+c0 的生产布局 ── Convertible ── MMA 实际消费 c0 的布局
+```
+
+能共用就共用；需要且允许转换时在消费点转换，不修改显式生产者布局来掩盖冲突。选定的指令组合写入 `mma_contract`，后续从真实 IR 重新核验。
+
+**与旧路径的区别：** 旧系统已有 Shared/fragment 公式；新增的是四角色联合相容性、实际地址/寄存器证明，以及它们与其他操作约束共同求解的接线。
+
+### 11.6 Task 21：Reduce 不仅推导结果布局，还证明每个 C 元素恰好贡献一次
+
+MMA 输出的 `c1` 布局首先满足矩阵指令要求，但 Reduce 按行求和需要检查另一类关系：
+
+```text
+c1 的生产布局
+      │ Convertible
+Reduce 消费 c1 的布局
+      │ ReductionLayout
+r 的自然输出布局
+      │ Convertible
+tile_store 消费 r 的布局
+```
+
+这里不强制 MMA 输出布局和 Reduce 消费布局天然相同，也不直接拿 Reduce 的输出要求覆盖 MMA 结果；二者通过明确的使用点关系协调。
+
+对某一行，本例有 64 个不同的 C 元素。A/B 全为 1 时，这些元素都等于 17，正确结果为：
+
+```text
+64 × 17 = 1088
+```
+
+若某个候选布局使每个 C 元素有两份物理副本，正确贡献者数量仍应是 64，不能变成 128。若输出也有两份副本，每份都必须持有完整的 1088，不能各持有部分和 544。
+
+Task 21 据实际候选布局检查逻辑输入的唯一贡献、归约树、完整结果分发和通信范围，并将方案写入 `reduction_contract`。
+
+**与旧路径的区别：** 旧投影主要回答“R 由谁持有”；新关系还回答“这些持有者得到的是否是完整且不重算的行和”。上面的两份副本用于说明验证条件，不是本例某个已选布局的实际复制数。
+
+### 11.7 把四个任务放回同一条推断链
+
+```text
+Task 22：Buffer 生命周期 → 明确的 Tensor 生产/消费关系
+                                  ↓
+Task 19：Global→Shared Copy 的地址、分工、写入和线程约束
+                                  ↓ 共享 As/Bs 的 Storage 变量
+Task 20：As/Bs/init/result 的 MMA 联合指令约束
+                                  ↓ Convertible
+Task 21：Reduce 输入/输出的投影、贡献和通信约束
+                                  ↓ Convertible + StorageAccess
+                        归约结果写回 Global
+                                  ↓
+Task 22：保存根存储契约、优化、实际 IR 复验、事务提交
+```
+
+旧逻辑主要形成 `As/Bs/C/R → LayoutAttr` 的局部推断结果；新逻辑把“Copy 是否能搬、MMA 是否能算、Reduce 是否算全、结果是否能正确写回”表达为可共同检查的关系。源布局不必等于消费布局，存储布局不必等于执行布局；需要满足的是它们之间的操作契约。
+
+Task 22 还保存实际 whole-root 存储映射与对齐前置条件，防止纯 view 被优化删除后丢失验证依据。最终检查读取真实类型和操作属性，而不是信任旧 `layoutMap` 或上次求解缓存；具名 pipeline 任一步失败都不改动原模块。
+
+### 11.8 Task 22 的历史限制与 Task 23 的完整链验收
+
+**Task 22 交付时，这个例子覆盖四个任务的作用，但整链布局求解受限。Task 23 已解除这一规模限制并验证完整链成功。** 即使先不计 Global→Shared Copy 引入的额外变量，SS MMA→Reduce→store 核心就已有：
+
+| 部分 | 变量 |
+| --- | --- |
+| MMA | As Storage、Bs Storage、init 生产位置、init 消费位置、MMA 结果，共 5 个 |
+| Reduce | 输入消费位置、归约结果，新增 2 个 |
+| Store | 输入消费位置、输出 Storage，新增 2 个 |
+| 合计 | 9 个，属于同一连通分量 |
+
+Task 22 可以完成这个核心的旧 IR 归一化，但当时的 bootstrap solver 最多接受每连通分量 8 个变量，因此完整 pipeline 会超限拒绝并回滚。加入前面的 Copy 约束不会消除这个问题。这是历史验收边界，不再是当前求解器的变量数限制。
+
+2026-09-27 Task 23 的实际测试现在覆盖：
+
+- `NineVariableFullChainMaterializesAndReplays`：9 变量核心完整求解，保留 MMA/Reduce binding，实际写回外部 Global 参数，实际 IR 复验与重跑一致。
+- `GlobalCopyParallelMmaReduceStoreMaterializesAndReplays`：两次 Global→Shared Copy、Parallel128、MMA、Reduce、Global 写回完整成功，并验证序列化后重新解析、重跑一致。
+- `ExplicitSearchBudgetRollsBackFullChainNormalization`：将搜索预算显式设为 1 后仍验证原模块不变，不因解除旧 8 变量限制而删除回滚覆盖。
+
+上述用例所在的 pipeline/Reduce 集成测试本轮 25/25 通过。对应证据见 [LayoutPipelineTest.cpp](../../unittests/Dialect/Frisk/Layout/LayoutPipelineTest.cpp) 和 [ReduceLayoutIntegrationTest.cpp](../../unittests/Dialect/Frisk/Layout/ReduceLayoutIntegrationTest.cpp)。求解器改为固定候选域上的 exact/beam，MMA/Reduce 的操作级证明预算未放宽。
+
+**因此，Task 19–22 完成统一表示、联合约束与可验证的操作契约；Task 23 再把大连通分量的统一选择接通。完整链成功依靠统一求解器，不是恢复逐个 Op 的旧式局部猜测。这里的验收是布局推断、物化与复验，不代表已生成并执行 GPU 内核。**
