@@ -160,11 +160,11 @@ LogicalResult verifyNames(function_ref<InFlightDiagnostic()> emitError,
 
 FailureOr<unsigned>
 sumBitWidths(function_ref<InFlightDiagnostic()> emitError, StringRef kind,
-             DenseI64ArrayAttr widths) {
+             DenseI64ArrayAttr widths, bool allowZero = false) {
   uint64_t total = 0;
   for (int64_t width : widths.asArrayRef()) {
-    if (width <= 0) {
-      emitError() << kind << " bit widths must be positive";
+    if (width < 0 || (!allowZero && width == 0)) {
+      emitError() << kind << (allowZero ? " bit widths must be nonnegative" : " bit widths must be positive");
       return failure();
     }
     total += static_cast<uint64_t>(width);
@@ -346,7 +346,7 @@ LogicalResult BitLinearLayoutMapAttr::verify(
   FailureOr<unsigned> inputBits =
       sumBitWidths(emitError, "input", inputBitWidths);
   FailureOr<unsigned> outputBits =
-      sumBitWidths(emitError, "output", outputBitWidths);
+      sumBitWidths(emitError, "output", outputBitWidths, true);
   if (failed(inputBits) || failed(outputBits))
     return failure();
 
@@ -378,6 +378,16 @@ FailureOr<GF2Matrix> BitLinearLayoutMapAttr::getMatrixValue() const {
 }
 
 FailureOr<Attribute> BitLinearLayoutMapAttr::canonicalizeMap() const {
+  // The unique map into a zero-bit logical domain is already canonical. Keep
+  // zero-row handling local: the general GF2Matrix API requires nonempty axes.
+  auto matrixAttr = getMatrix();
+  auto matrixType = matrixAttr ? dyn_cast<RankedTensorType>(matrixAttr.getType())
+                               : RankedTensorType();
+  if (!matrixType || matrixType.getRank() != 2) return failure();
+  if (matrixType.getDimSize(0) == 0) {
+    if (failed(verifyMap(UnknownLoc::get(getContext())))) return failure();
+    return Attribute(*this);
+  }
   FailureOr<GF2Matrix> matrix = getMatrixValue();
   if (failed(matrix))
     return failure();
@@ -597,26 +607,58 @@ namespace {
 // return Unknown and must be handled by a later Presburger proof, never guessed.
 constexpr uint64_t kEnumerationLimit = 65536;
 
+// Evaluate the same finite integer expressions without interning IndexAttrs at
+// every enumerated point. No proof or enumeration limit is skipped. Arithmetic
+// outside int64 is inconclusive, never wrapped into a successful layout proof.
+FailureOr<int64_t> evaluateAffineExpression(AffineExpr expression,
+                                          ArrayRef<int64_t> coordinates) {
+  if (auto constant = dyn_cast<AffineConstantExpr>(expression))
+    return constant.getValue();
+  if (auto dimension = dyn_cast<AffineDimExpr>(expression)) {
+    if (dimension.getPosition() >= coordinates.size()) return failure();
+    return coordinates[dimension.getPosition()];
+  }
+  auto binary = dyn_cast<AffineBinaryOpExpr>(expression);
+  if (!binary) return failure(); // Symbols remain unsupported.
+  auto lhs = evaluateAffineExpression(binary.getLHS(), coordinates);
+  auto rhs = evaluateAffineExpression(binary.getRHS(), coordinates);
+  if (failed(lhs) || failed(rhs)) return failure();
+  int64_t value;
+  switch (binary.getKind()) {
+  case AffineExprKind::Add:
+    if (llvm::AddOverflow(*lhs, *rhs, value)) return failure();
+    return value;
+  case AffineExprKind::Mul:
+    if (llvm::MulOverflow(*lhs, *rhs, value)) return failure();
+    return value;
+  case AffineExprKind::Mod:
+    if (*rhs <= 0) return failure();
+    return llvm::mod(*lhs, *rhs);
+  case AffineExprKind::FloorDiv:
+  case AffineExprKind::CeilDiv:
+    if (*rhs == 0 || (*lhs == std::numeric_limits<int64_t>::min() && *rhs == -1))
+      return failure();
+    return binary.getKind() == AffineExprKind::FloorDiv
+        ? llvm::divideFloorSigned(*lhs, *rhs) : llvm::divideCeilSigned(*lhs, *rhs);
+  default:
+    return failure();
+  }
+}
+
 FailureOr<SmallVector<int64_t>>
 evaluateAffine(AffineLayoutMapAttr map, ArrayRef<int64_t> coordinates) {
   AffineMap affineMap = map.getAffineMap().getValue();
   if (coordinates.size() != affineMap.getNumDims() ||
-      affineMap.getNumSymbols() != 0)
-    return failure();
-
-  Builder builder(map.getContext());
-  SmallVector<Attribute> operands;
-  operands.reserve(coordinates.size());
-  for (int64_t coordinate : coordinates)
-    operands.push_back(builder.getIndexAttr(coordinate));
-  SmallVector<Attribute> folded;
-  if (failed(affineMap.constantFold(operands, folded)))
+      affineMap.getNumSymbols() != 0 || affineMap.getNumResults() == 0)
     return failure();
 
   SmallVector<int64_t> result;
-  result.reserve(folded.size());
-  for (Attribute value : folded)
-    result.push_back(cast<IntegerAttr>(value).getInt());
+  result.reserve(affineMap.getNumResults());
+  for (AffineExpr expression : affineMap.getResults()) {
+    auto value = evaluateAffineExpression(expression, coordinates);
+    if (failed(value)) return failure();
+    result.push_back(*value);
+  }
   return result;
 }
 
@@ -642,6 +684,14 @@ evaluateBitLinear(BitLinearLayoutMapAttr map,
     offset += width;
   }
 
+  auto matrixAttr = map.getMatrix();
+  auto matrixType = matrixAttr ? dyn_cast<RankedTensorType>(matrixAttr.getType())
+                               : RankedTensorType();
+  if (!matrixType || matrixType.getRank() != 2) return failure();
+  if (matrixType.getDimSize(0) == 0) {
+    if (failed(map.verifyMap(UnknownLoc::get(map.getContext())))) return failure();
+    return SmallVector<int64_t>(map.getOutputNames().size(), 0);
+  }
   FailureOr<GF2Matrix> matrix = map.getMatrixValue();
   if (failed(matrix))
     return failure();
@@ -651,6 +701,10 @@ evaluateBitLinear(BitLinearLayoutMapAttr map,
   offset = 0;
   for (int64_t widthValue : map.getOutputBitWidths().asArrayRef()) {
     unsigned width = static_cast<unsigned>(widthValue);
+    if (!width) {
+      result.push_back(0);
+      continue;
+    }
     llvm::APInt value = output.extractBits(width, offset);
     if (width > 63 && value.getActiveBits() > 63)
       return failure();
@@ -957,6 +1011,11 @@ FailureOr<Attribute> composeAffine(AffineLayoutMapAttr lhs,
 
 } // namespace
 
+FailureOr<SmallVector<int64_t>> evaluateLayoutMap(
+    Attribute map, ArrayRef<int64_t> coordinates) {
+  return evaluateLayout(map, coordinates);
+}
+
 FailureOr<Attribute> composeLayoutMaps(Attribute lhs, Attribute rhs) {
   if (auto lhsBit = dyn_cast<BitLinearLayoutMapAttr>(lhs)) {
     auto rhsBit = dyn_cast<BitLinearLayoutMapAttr>(rhs);
@@ -1249,6 +1308,7 @@ LogicalResult DistributedEncodingAttr::verifyForType(ShapedType type,
   if (!map)
     return emitError(loc)
            << "M1 distributed type verification requires a bit-linear map";
+  if (failed(map.verifyMap(loc))) return failure();
   if (map.getOutputBitWidths().size() !=
       static_cast<size_t>(type.getRank()))
     return emitError(loc)
@@ -1281,13 +1341,16 @@ LogicalResult DistributedEncodingAttr::verifyForType(ShapedType type,
              << "carrier bit width must exactly match its topology extent";
   }
 
-  FailureOr<GF2Matrix> matrix = map.getMatrixValue();
-  if (failed(matrix))
-    return emitError(loc) << "distributed GF(2) matrix is malformed";
   unsigned outputBits = 0;
   for (int64_t width : map.getOutputBitWidths().asArrayRef())
     outputBits += static_cast<unsigned>(width);
-  unsigned rank = matrix->rank();
+  unsigned rank = 0;
+  if (outputBits) {
+    FailureOr<GF2Matrix> matrix = map.getMatrixValue();
+    if (failed(matrix))
+      return emitError(loc) << "distributed GF(2) matrix is malformed";
+    rank = matrix->rank();
+  }
   if (rank != outputBits)
     return emitError(loc)
            << "distributed map does not cover the complete logical tile";

@@ -2,6 +2,9 @@
 #include "Dialect/Frisk/Analysis/LayoutCostModel.h"
 #include "Dialect/Frisk/Target/SM90/SM90GemmConstraints.h"
 #include "Dialect/Frisk/Target/SM90/SM90ReduceConstraints.h"
+#include "Dialect/Frisk/Target/SM90/SM90CopyConstraints.h"
+#include "Dialect/Frisk/Target/SM90/SM90CostModel.h"
+#include "Dialect/Frisk/IR/FriskOps.h"
 
 #include "Dialect/Frisk/IR/FriskAttributes.h"
 
@@ -126,9 +129,7 @@ StorageLayoutAttr buildXor(MemRefType type, unsigned swizzleBytes) {
   unsigned columnBits = llvm::Log2_64(type.getDimSize(1));
   unsigned elementByteBits = llvm::Log2_64(elementBits / 8);
   unsigned byteBits = rowBits + columnBits + elementByteBits;
-  unsigned targetByteBit = llvm::Log2_64(swizzleBytes) - 1;
-  if (rowBits == 0 || targetByteBit >= byteBits ||
-      targetByteBit >= columnBits + elementByteBits)
+  if (rowBits == 0 || byteBits >= 63)
     return {};
 
   SmallVector<uint64_t> basisOutputs(rowBits + columnBits);
@@ -138,7 +139,10 @@ StorageLayoutAttr buildXor(MemRefType type, unsigned swizzleBytes) {
   for (unsigned bit = 0; bit < columnBits; ++bit)
     basisOutputs[rowBits + bit] = uint64_t{1}
                                   << (elementByteBits + bit);
-  basisOutputs[0] ^= uint64_t{1} << targetByteBit;
+  // SM90 TMA non-interleaved canonical swizzle: byte[4:4+B] XOR
+  // byte[7:7+B], B=1/2/3. Derive every basis from the byte equation.
+  for (auto &basis : basisOutputs)
+    basis ^= ((basis >> 7) & (swizzleBytes / 16 - 1)) << 4;
 
   MLIRContext *context = type.getContext();
   Builder builder(context);
@@ -164,6 +168,24 @@ StorageLayoutAttr buildXor(MemRefType type, unsigned swizzleBytes) {
 
 class SM90LayoutTarget final : public LayoutTarget {
 public:
+  void enumerateRelaxedCandidates(const LayoutConstraintGraph &,
+      const LayoutVar &var, RelaxationKind kind,
+      SmallVectorImpl<LayoutCandidate> &out) const override;
+  StringRef relaxationCoverage(RelaxationKind kind) const override {
+    switch (kind) {
+    case RelaxationKind::Replication:
+      return "bounded intermediate lane replication, at most 65536 carrier slots";
+    case RelaxationKind::StoragePaddingOrNarrowerVector:
+      return "ordinary storage padding and legal vector widths already enumerated; hard minima unchanged";
+    case RelaxationKind::GuardedRagged:
+      return "static whole-tile guarded Copy already in ordinary candidates; other ragged operations unsupported";
+    case RelaxationKind::TMAFallback:
+      return "cp.async/vector already compete in ordinary Copy candidates";
+    case RelaxationKind::WGMMAFallback:
+      return "unsupported: no implemented warp MMA/SIMT replacement for WGMMA";
+    }
+    llvm_unreachable("unknown relaxation kind");
+  }
   FailureOr<Attribute> buildReductionContract(const LayoutConstraintGraph &graph,
       const LayoutConstraint &constraint, Attribute source, Attribute result) const override {
     return buildSM90ReductionContract(graph, constraint, source, result);
@@ -174,15 +196,20 @@ public:
     return verifySM90ReductionContract(graph, constraint, source, result, binding);
   }
   LogicalResult prepareInstructionCandidates(LayoutConstraintGraph &graph) const override {
+    if (failed(prepareSM90CopyCandidates(graph))) return failure();
     return prepareSM90MmaCandidates(graph);
   }
   FailureOr<Attribute> buildInstructionContract(const LayoutConstraintGraph &graph,
       const LayoutConstraint &constraint, ArrayRef<Attribute> encodings) const override {
+    if (constraint.instruction && isa_and_nonnull<CopyOp>(constraint.instruction->source))
+      return buildSM90CopyContract(graph, constraint, encodings);
     return buildSM90MmaContract(graph, constraint, encodings);
   }
   LayoutProof verifyInstructionContract(const LayoutConstraintGraph &graph,
       const LayoutConstraint &constraint, ArrayRef<Attribute> encodings,
       Attribute binding) const override {
+    if (constraint.instruction && isa_and_nonnull<CopyOp>(constraint.instruction->source))
+      return verifySM90CopyContract(graph, constraint, encodings, binding);
     return verifySM90MmaContract(graph, constraint, encodings, binding);
   }
   void enumerateCandidates(
@@ -214,6 +241,8 @@ public:
 
   LogicalResult verifyCandidate(const LayoutVar &var, Attribute candidate,
                                 Location loc) const override {
+    if (var.kind == LayoutKind::Instruction)
+      return success(isa_and_nonnull<CopyOp>(var.anchor) && isSM90CopyPath(candidate));
     if (var.kind == LayoutKind::Distributed) {
       auto tensor = dyn_cast<RankedTensorType>(var.shapedType);
       auto encoding = dyn_cast<DistributedEncodingAttr>(candidate);
@@ -234,19 +263,30 @@ public:
   evaluate(const CandidateAssignment &) const override { return CostVector{}; }
   FailureOr<CostEstimate> evaluate(const LayoutConstraintGraph &graph,
       const CandidateAssignment &assignment) const override {
-    return evaluateStaticLayoutCost(graph, assignment);
+    return evaluateSM90LayoutCost(graph, assignment);
   }
   FailureOr<CostEstimate> lowerBound(const LayoutConstraintGraph &graph,
       const CandidateAssignment &assignment) const override {
     return evaluateStaticLayoutCost(graph, assignment);
   }
   StringRef costCoverage() const override {
-    return "cta-staging-upper-bound-v1; register/replication slots; shared root spans; "
-           "unmodeled=instructionPathAndWork,memoryTransactions,bankConflictDegree";
+    return "bounded-owner-proof-v1 with cta-staging-upper-bound-v1 fallback; "
+           "pure-slice-byte-work-v1; loop-depth proxy; register/replication slots; shared root spans; "
+           "sm90-shape-work-v1; warp-issue-32B-sectors-v1 (unknown base phase upper bound); "
+           "shared-128B-phase-32x4B-distinct-word-conflicts-v2; unmodeled=latency,cache,overlap";
   }
 };
 
 } // namespace
+
+void enumerateSM90ReplicatedCandidates(const LayoutVar &,
+                                      SmallVectorImpl<LayoutCandidate> &);
+void SM90LayoutTarget::enumerateRelaxedCandidates(const LayoutConstraintGraph &,
+    const LayoutVar &var, RelaxationKind kind,
+    SmallVectorImpl<LayoutCandidate> &out) const {
+  if (kind == RelaxationKind::Replication && var.kind == LayoutKind::Distributed)
+    enumerateSM90ReplicatedCandidates(var, out);
+}
 
 std::unique_ptr<LayoutTarget> createSM90LayoutTarget() {
   return std::make_unique<SM90LayoutTarget>();

@@ -19,8 +19,11 @@ add_frisk_library(FriskLegacyLayoutAdapter
 )
 
 add_frisk_library(FriskLayoutAnalysis
+  LayoutStatistics.cpp
   LayoutCostModel.cpp
+  LayoutConversionChoice.cpp
   LayoutCandidateSolver.cpp
+  LayoutRelaxation.cpp
   ReductionLayoutProof.cpp
   ReductionLayoutConstraints.cpp
   InstructionLayoutConstraints.cpp

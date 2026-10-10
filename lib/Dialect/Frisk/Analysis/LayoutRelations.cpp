@@ -5,6 +5,7 @@
 #include "Dialect/Frisk/Analysis/ReductionLayoutProof.h"
 #include "Dialect/Frisk/Analysis/ExecutionLayoutProof.h"
 #include "Dialect/Frisk/IR/FriskAttributes.h"
+#include "Dialect/Frisk/IR/FriskOps.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -315,81 +316,101 @@ FailureOr<Attribute> projectLayoutCandidate(
       storage.getVectorGranularity()));
 }
 
-bool layoutRelationCompatible(const LayoutConstraintGraph &graph,
+LayoutProof proveLayoutRelation(const LayoutConstraintGraph &graph,
                               const LayoutConstraint &relation,
                               LayoutVarID lhsID, Attribute lhs,
                               LayoutVarID rhsID, Attribute rhs) {
+  auto checked = [](bool valid) -> LayoutProof {
+    return {valid ? ProofStatus::Proven : ProofStatus::Disproven, {},
+            valid ? "layout relation proven" : "incompatible layout relation"};
+  };
+  auto unknown = []() -> LayoutProof {
+    return {ProofStatus::Unknown, {}, "unsupported layout relation decoder"};
+  };
   const LayoutVar &a = graph.getVariable(lhsID), &b = graph.getVariable(rhsID);
   if (relation.kind == ConstraintKind::CopyAccess) {
     if (!sameLogicalType(a.shapedType, b.shapedType) || !a.storageAlias || !b.storageAlias)
-      return false;
+      return unknown();
     (void)getStorageAliasFootprint(graph, lhsID, lhs);
     (void)getStorageAliasFootprint(graph, rhsID, rhs);
     const auto &x = getStorageAliasFootprint(graph, lhsID, lhs);
     const auto &y = getStorageAliasFootprint(graph, rhsID, rhs);
-    if (x.proof.status != ProofStatus::Proven || y.proof.status != ProofStatus::Proven)
-      return false;
+    if (x.proof.status != ProofStatus::Proven) return x.proof;
+    if (y.proof.status != ProofStatus::Proven) return y.proof;
     // Distinct identities are NOT a NoAlias proof: nonoverlap is the Copy
     // caller precondition. A proven common root permits a stronger check.
-    if (x.root != y.root) return true;
+    if (x.root != y.root) return checked(true);
     bool identity = x.entries.size() == y.entries.size() &&
         llvm::equal(x.entries, y.entries, [](const auto &p, const auto &q) {
           return p.view == q.view && p.begin == q.begin && p.end == q.end;
         });
-    if (identity) return true;
+    if (identity) return checked(true);
     unsigned i = 0, j = 0;
     while (i < x.entries.size() && j < y.entries.size()) {
       const auto &p = x.entries[i], &q = y.entries[j];
-      if (p.begin < q.end && q.begin < p.end) return false;
+      if (p.begin < q.end && q.begin < p.end) return checked(false);
       if (p.end <= q.end) ++i; else ++j;
     }
-    return true;
+    return checked(true);
   }
   if (relation.kind == ConstraintKind::AliasLayout)
-    return proveAliasLayoutRelation(graph, lhsID, lhs, rhsID, rhs).status ==
-           ProofStatus::Proven;
+    return proveAliasLayoutRelation(graph, lhsID, lhs, rhsID, rhs);
   if (relation.kind == ConstraintKind::TransformLayout) {
     auto destination = dyn_cast<DistributedEncodingAttr>(rhs);
     if (!destination)
-      return false;
+      return unknown();
     auto destinationMap = dyn_cast<BitLinearLayoutMapAttr>(destination.getMap());
     if (!destinationMap)
-      return false;
+      return unknown();
     auto projected = permuteEncoding(
         lhs, relation.coordinateTransform, cast<ShapedType>(b.shapedType),
         lhsID != relation.vars.front(), destinationMap.getOutputNames());
-    return succeeded(projected) && layoutEncodingsEqual(*projected, rhs);
+    if (failed(projected)) return unknown();
+    return checked(layoutEncodingsEqual(*projected, rhs));
   }
   if (relation.kind == ConstraintKind::Convertible) {
     auto d0 = dyn_cast<DistributedEncodingAttr>(lhs);
     auto d1 = dyn_cast<DistributedEncodingAttr>(rhs);
-    return d0 && d1 && sameLogicalType(a.shapedType, b.shapedType) &&
-           d0.getTopology()[4] == 1 && d1.getTopology()[4] == 1;
+    return checked(d0 && d1 && sameLogicalType(a.shapedType, b.shapedType) &&
+           d0.getTopology()[4] == 1 && d1.getTopology()[4] == 1);
   }
   if (relation.kind == ConstraintKind::StorageAccess) {
     auto s0 = dyn_cast<StorageLayoutAttr>(lhs);
     auto s1 = dyn_cast<StorageLayoutAttr>(rhs);
     if (s0 && s1)
-      return s0.getMap() == s1.getMap(); // Existing whole-tile M2 copy.
+      return checked(s0.getMap() == s1.getMap()); // Existing whole-tile M2 copy.
     auto d0 = dyn_cast<DistributedEncodingAttr>(lhs);
     auto d1 = dyn_cast<DistributedEncodingAttr>(rhs);
     if ((d0 && s1) || (s0 && d1)) {
       const auto &execution = d0 ? a : b;
       const auto &storage = d0 ? b : a;
       if (execution.operationExecution) {
-        if (!sameLogicalType(a.shapedType, b.shapedType) || !storage.storageAlias)
-          return false;
+        if (!storage.storageAlias)
+          return unknown();
         const auto &contract = *execution.operationExecution;
         const auto &footprint = getStorageAliasFootprint(graph, storage.id, d0 ? rhs : lhs);
+        if (!sameLogicalType(a.shapedType, b.shapedType)) {
+          if (!isa_and_nonnull<CopyOp>(execution.anchor)) return checked(false);
+          return proveGuardedExecutionVectorAccess(d0 ? d0 : d1,
+              dyn_cast<RankedTensorType>(execution.shapedType), *storage.storageAlias,
+              footprint, contract.vectorBytes, relation.access, contract.writerPolicy);
+        }
         return proveExecutionVectorAccess(d0 ? d0 : d1, *storage.storageAlias,
-            footprint, contract.vectorBytes, relation.access, contract.writerPolicy).status == ProofStatus::Proven;
+            footprint, contract.vectorBytes, relation.access, contract.writerPolicy);
       }
       // Verified D covers the logical tile; verified S addresses that exact
       // domain. Therefore S(D(h)) is valid, independent of coalescing. Store
       // lowering elects a deterministic owner for replicated logical elements.
-      return sameLogicalType(a.shapedType, b.shapedType);
+      return checked(sameLogicalType(a.shapedType, b.shapedType));
     }
   }
-  return layoutEncodingsEqual(lhs, rhs);
+  return checked(layoutEncodingsEqual(lhs, rhs));
+}
+bool layoutRelationCompatible(const LayoutConstraintGraph &graph,
+                              const LayoutConstraint &relation,
+                              LayoutVarID lhsID, Attribute lhs,
+                              LayoutVarID rhsID, Attribute rhs) {
+  return proveLayoutRelation(graph, relation, lhsID, lhs, rhsID, rhs).status ==
+         ProofStatus::Proven;
 }
 } // namespace mlir::frisk

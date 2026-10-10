@@ -1,4 +1,6 @@
 #include "Dialect/Frisk/Target/SM90/SM90MmaLayoutProof.h"
+#include "Dialect/Frisk/Target/SM90/SM90InstructionTable.h"
+#include "Dialect/Frisk/Target/SM90/SM90TargetInfo.h"
 #include "Dialect/Frisk/Analysis/LayoutAlgebra.h"
 #include "Dialect/Frisk/Analysis/ExecutionLayoutProof.h"
 #include "mlir/IR/Builders.h"
@@ -22,7 +24,7 @@ bool bounded(int64_t a, int64_t b) {
 
 FailureOr<SM90MmaGeometry> mlir::frisk::getSM90MmaGeometry(MmaOp op, int64_t threads) {
   int64_t m = op.getMAttr().getInt(), n = op.getNAttr().getInt(), k = op.getKAttr().getInt();
-  if ((threads != 128 && threads != 256 && threads != 512 && threads != 1024) ||
+  if (!isSM90WGMMAThreadCount(threads) ||
       !bounded(m,n) || !bounded(m,k) || !bounded(n,k) || m % 64 || k % 16 || n < 8)
     return failure();
   int64_t bestM = 0, bestN = 0, score = std::numeric_limits<int64_t>::max();
@@ -37,6 +39,11 @@ FailureOr<SM90MmaGeometry> mlir::frisk::getSM90MmaGeometry(MmaOp op, int64_t thr
   if (!bestM) return failure();
   int64_t atomN = 256;
   while ((n / bestN) % atomN) atomN /= 2;
+  bool rs = isa<RankedTensorType>(op.getA().getType());
+  if (!lookupSM90WGMMA(cast<ShapedType>(op.getA().getType()).getElementType(),
+                      cast<ShapedType>(op.getResult().getType()).getElementType(),
+                      rs ? "rs" : "ss", 64, atomN, 16, threads, "k", "k"))
+    return failure();
   return SM90MmaGeometry{m,n,k,threads,bestM,bestN,atomN,
                         m/(64*bestM),n/(atomN*bestN),k/16};
 }
@@ -178,17 +185,13 @@ LayoutProof mlir::frisk::verifySM90MmaContract(const LayoutConstraintGraph &grap
   if (failed(MmaInstructionContractAttr::verify([&] {return op.emitOpError();},p)) ||
       failed(op.verify()))
     return reject("mma-joint-contract: malformed binding or mathematical shape");
-  StringAttr target;
-  for (Operation *scope = op; scope && !target; scope = scope->getParentOp())
-    if (Attribute attr = scope->getAttr("frisk.target")) {
-      target = dyn_cast<StringAttr>(attr);
-      if (!target) return reject("sm90-mma-target: malformed nearest target");
-    }
-  if (!target || target.getValue()!="sm_90a" || p.getAs<StringAttr>("target")!=target)
+  auto target = getSM90TargetInfo(op);
+  if (failed(target)) return reject("sm90-mma-target: malformed nearest target");
+  if (!target->supportsWGMMA || p.getAs<StringAttr>("target").getValue()!=target->targetKey)
     return reject("sm90-mma-target: explicit sm_90a target required");
   auto input = cast<ShapedType>(op.getA().getType()).getElementType();
   auto result = cast<RankedTensorType>(op.getResult().getType());
-  if ((!input.isF16() && !input.isBF16()) || !result.getElementType().isF32() ||
+  if (!lookupSM90WGMMA(input,result.getElementType(),"ss",64,8,16,128,"k","k") ||
       p.getAs<TypeAttr>("input_type").getValue()!=input ||
       p.getAs<TypeAttr>("accumulator_type").getValue()!=result.getElementType())
     return reject("sm90-mma-fragment: requires f16/bf16 inputs and f32 accumulator");
@@ -213,6 +216,13 @@ LayoutProof mlir::frisk::verifySM90MmaContract(const LayoutConstraintGraph &grap
   bool rs = isa<RankedTensorType>(op.getA().getType());
   if (p.getAs<StringAttr>("form").getValue()!=(rs ? "rs" : "ss"))
     return reject("mma-joint-contract: instruction form disagrees with operand A");
+  StringRef majorA = rs ? StringRef("k") :
+      p.getAs<MmaDescriptorPlanAttr>("a_descriptor").getPayload().getAs<StringAttr>("major").getValue();
+  StringRef majorB = p.getAs<MmaDescriptorPlanAttr>("b_descriptor").getPayload().getAs<StringAttr>("major").getValue();
+  auto rule = lookupSM90WGMMA(input,result.getElementType(),rs ? "rs" : "ss",
+                            64,g->atomN,16,threads,majorA,majorB);
+  if (!rule || p.getAs<StringAttr>("packing").getValue()!=rule->packing)
+    return reject("sm90-mma-fragment: unsupported instruction major or packing");
   for (unsigned role = 2; role < 4; ++role) {
     auto proof = verifySM90MmaFragment(*g,false,false,result,
                                       dyn_cast_or_null<DistributedEncodingAttr>(encodings[role]));

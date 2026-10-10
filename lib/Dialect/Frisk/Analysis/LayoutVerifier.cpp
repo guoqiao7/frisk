@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
+#include "Dialect/Frisk/Analysis/LayoutConversionChoice.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
 #include "Dialect/Frisk/Analysis/InstructionLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/ReductionLayoutConstraints.h"
@@ -38,7 +39,8 @@ LogicalResult verifySolvedLayoutGraph(const LayoutConstraintGraph &graph,
     const auto &constraint = graph.getConstraint(edge.constraint);
     if (constraint.kind != ConstraintKind::Convertible || constraint.existingConversion ||
         !edge.use || constraint.use != edge.use ||
-        edge.resolution != EdgeResolutionKind::Convert ||
+        (edge.resolution != EdgeResolutionKind::Convert &&
+         edge.resolution != EdgeResolutionKind::Rematerialize) ||
         !converted.insert(edge.constraint).second ||
         edge.sourceEncoding != solution.assignments.lookup(constraint.vars[0]) ||
         edge.targetEncoding != solution.assignments.lookup(constraint.vars[1]) ||
@@ -121,7 +123,9 @@ LogicalResult verifySolvedLayoutGraph(const LayoutConstraintGraph &graph,
     }
     return failure();
   }
-  return success();
+  // Preserve specific missing-edge/hard-constraint diagnostics before checking
+  // the richer placement, cost and clone certificate.
+  return verifyLayoutConversionChoices(graph, solution, target, loc);
 }
 
 } // namespace mlir::frisk

@@ -38,6 +38,15 @@ public:
   }
   virtual StringRef costCoverage() const { return "target-defined"; }
 
+  // Proposals only: the engine retains every original hard requirement and
+  // revalidates candidates. No IR or graph mutation is permitted here.
+  virtual void enumerateRelaxedCandidates(const LayoutConstraintGraph &,
+      const LayoutVar &, RelaxationKind,
+      SmallVectorImpl<LayoutCandidate> &) const {}
+  virtual StringRef relaxationCoverage(RelaxationKind) const {
+    return "unsupported by target";
+  }
+
   virtual LogicalResult
   prepareInstructionCandidates(LayoutConstraintGraph &graph) const {
     for (const auto &constraint : graph.getConstraints())

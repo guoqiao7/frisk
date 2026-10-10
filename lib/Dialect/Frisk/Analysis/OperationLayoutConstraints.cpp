@@ -47,7 +47,30 @@ LogicalResult collectOperationLayoutConstraints(
       return WalkResult::interrupt();
     }
     auto type = cast<MemRefType>(dst.getType());
-    if (failed(checkExecutionShape(op, type))) return WalkResult::interrupt();
+    SmallVector<int64_t> executionShape(type.getShape());
+    if (copy) {
+      if (type.getRank() == 0 || !type.getElementType().isIntOrFloat()) {
+        op->emitError("Copy execution requires a positive-rank scalar-element tile");
+        return WalkResult::interrupt();
+      }
+      uint64_t actualCount = 1, paddedCount = 1;
+      for (int64_t &extent : executionShape) {
+        if (extent <= 0 || uint64_t(extent) > 65536 / actualCount) {
+          op->emitError("Copy logical proof budget exceeded or nonpositive extent (65536)");
+          return WalkResult::interrupt();
+        }
+        actualCount *= extent;
+        uint64_t padded = llvm::PowerOf2Ceil(uint64_t(extent));
+        if (padded > 65536 / paddedCount) {
+          op->emitError("Copy padded execution proof budget exceeded (65536)");
+          return WalkResult::interrupt();
+        }
+        paddedCount *= padded;
+        extent = padded;
+      }
+    } else if (failed(checkExecutionShape(op, type))) {
+      return WalkResult::interrupt();
+    }
     OperationExecutionBinding binding;
     if (auto threads = op->getAttrOfType<IntegerAttr>("frisk.execution_threads"))
       binding.threads = threads.getInt();
@@ -60,10 +83,14 @@ LogicalResult collectOperationLayoutConstraints(
     }
     if (auto width = op->getAttrOfType<IntegerAttr>("frisk.vector_bytes"))
       binding.vectorBytes = width.getInt();
+    if (copy && ArrayRef<int64_t>(executionShape) != type.getShape() && binding.vectorBytes != 1) {
+      op->emitError("guarded Copy requires scalar vector_bytes=1");
+      return WalkResult::interrupt();
+    }
     if (auto policy = op->getAttrOfType<StringAttr>("frisk.writer_policy"))
       binding.writerPolicy = policy.getValue().str();
     auto execution = builder.createOperationExecutionVar(op,
-        RankedTensorType::get(type.getShape(), type.getElementType()), binding);
+        RankedTensorType::get(executionShape, type.getElementType()), binding);
     if (auto declared = op->getAttr("frisk.execution_layout"))
       if (failed(builder.require(execution, declared, op, "operation-execution-binding")))
         return WalkResult::interrupt();
@@ -79,6 +106,17 @@ LogicalResult collectOperationLayoutConstraints(
       graph.addConstraint(ConstraintKind::CopyAccess, ConstraintStrength::Hard,
           {source, target}, op, "whole-tile-copy",
           "logical pointwise copy; known-root overlap must be disjoint or identity; distinct arguments require nonoverlap precondition");
+      auto path = graph.addVariable(LayoutKind::Instruction,
+          graph.getVariable(execution).shapedType,
+          graph.getVariable(execution).stableName + "/instruction", op);
+      auto &pathVar = graph.getVariable(path);
+      pathVar.instructionRole = true;
+      pathVar.requiredThreads = binding.threads;
+      auto id = graph.addConstraint(ConstraintKind::InstructionContract,
+          ConstraintStrength::Hard, {source, target, execution, path}, op,
+          "copy-joint-contract", "storage/execution/instruction path must jointly satisfy Copy semantics");
+      graph.getConstraints()[id].instruction = InstructionLayoutContract{
+          op, op->getAttr("frisk.copy_contract"), {}};
     }
     return WalkResult::advance();
   });

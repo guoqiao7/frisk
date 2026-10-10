@@ -33,6 +33,13 @@ std::string layoutDebugString(LayoutAttr layout);
 LayoutProof checkInjective(BitLinearLayoutMapAttr map);
 LayoutProof checkSurjective(BitLinearLayoutMapAttr map);
 
+/// Evaluate one coordinate using the same evaluator as coverage/injectivity
+/// proofs. Callers must supply a non-null, verified canonical map and in-domain
+/// coordinates; this wrapper does not validate the map or enforce its declared
+/// input extents. Unsupported map kinds fail closed.
+FailureOr<SmallVector<int64_t>> evaluateLayoutMap(
+    Attribute map, ArrayRef<int64_t> coordinates);
+
 std::optional<attr::MemorySpace> getFriskMemorySpace(MemRefType type);
 FailureOr<uint64_t> getMemRefStaticCapacityBytes(MemRefType type);
 FailureOr<uint64_t> getStorageFootprintBytes(StorageLayoutAttr layout,

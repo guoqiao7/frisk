@@ -298,7 +298,15 @@ TEST_F(CopyFillConstraintTest, CapturedTensorConvertsAtParallelUse) {
     auto layout = cast<DistributedEncodingAttr>(cast<RankedTensorType>(c.getType()).getEncoding());
     EXPECT_EQ(layout.getTopology()[1]*layout.getTopology()[2]*layout.getTopology()[3],128);
   });
-  EXPECT_EQ(conversions,2u);
+  // Task 24 shares the same captured value's conversion at the two operands,
+  // but keeps it inside the parallel block and never retags the outer value.
+  EXPECT_EQ(conversions,1u);
+  module->walk([&](arith::AddFOp add) {
+    EXPECT_EQ(add.getLhs(), add.getRhs());
+    auto converted = add.getLhs().getDefiningOp<ConvertLayoutOp>();
+    ASSERT_TRUE(converted);
+    EXPECT_EQ(converted->getBlock(), add->getBlock());
+  });
   EXPECT_TRUE(succeeded(verifyMaterializedLayouts(*module, *target)));
 }
 

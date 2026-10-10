@@ -103,3 +103,9 @@ install(TARGETS frisk_ffi LIBRARY DESTINATION ${PY_BUILD_CMAKE_MODULE_NAME} COMP
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/test)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/test_pass)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/unittests)
+
+option(FRISK_ENABLE_CUDA_BENCHMARKS "Build SM90 layout conversion benchmarks" OFF)
+if(FRISK_ENABLE_CUDA_BENCHMARKS)
+  enable_language(CUDA)
+endif()
+add_subdirectory(benchmark)

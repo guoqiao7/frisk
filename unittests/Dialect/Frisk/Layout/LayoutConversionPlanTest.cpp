@@ -369,6 +369,7 @@ TEST_F(ConversionPlanTest, CleanupPreservesExactCanonicalEquivalentResultType) {
   ASSERT_TRUE(succeeded(verify(*module)));
   PassManager pm(&context); pm.addPass(createOptimizeLayoutConversionsPass());
   ASSERT_TRUE(succeeded(pm.run(*module)));
+  f = module->lookupSymbol<func::FuncOp>("exact");
   unsigned count = 0;
   module->walk([&](ConvertLayoutOp op) {
     ++count; EXPECT_EQ(op.getSource(), f.getArgument(0)); EXPECT_EQ(op.getResult().getType(), out);

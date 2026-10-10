@@ -1,5 +1,6 @@
 #include "Dialect/Frisk/Analysis/InstructionLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
+#include "Dialect/Frisk/IR/FriskOps.h"
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/IR/Diagnostics.h"
 #include <functional>
@@ -83,7 +84,8 @@ LogicalResult prepareInstructionTuples(LayoutConstraintGraph &graph,
     }
     if (instruction.tuples.empty()) {
       auto diagnostic = emitError(instruction.source ? instruction.source->getLoc() : loc);
-      diagnostic << "mma-joint-contract: no proven instruction tuple in frozen candidate domains";
+      diagnostic << (isa_and_nonnull<CopyOp>(instruction.source) ? "copy-joint-contract" : "mma-joint-contract")
+                 << ": no proven instruction tuple in frozen candidate domains";
       if (firstFailure) {
         diagnostic << "; " << (firstFailure->status == ProofStatus::Unknown
                                  ? "unknown proof: " : "counterexample: ") << firstFailure->reason;

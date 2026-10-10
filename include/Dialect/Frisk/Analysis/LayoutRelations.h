@@ -15,6 +15,10 @@ LayoutProof proveUnaryLayoutConstraint(const LayoutConstraintGraph &graph,
                                       Attribute candidate);
 bool matchesLayoutThreadCount(Attribute encoding, int64_t threads);
 bool layoutEncodingsEqual(Attribute lhs, Attribute rhs);
+LayoutProof proveLayoutRelation(const LayoutConstraintGraph &graph,
+                              const LayoutConstraint &relation,
+                              LayoutVarID lhsID, Attribute lhs,
+                              LayoutVarID rhsID, Attribute rhs);
 bool layoutRelationCompatible(const LayoutConstraintGraph &graph,
                               const LayoutConstraint &relation,
                               LayoutVarID lhsID, Attribute lhs,

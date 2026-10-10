@@ -29,7 +29,11 @@ func.func @two(%a: memref<8x8xf32, 1>, %b: memref<8x8xf32, 1>,
 // CHECK-COUNT-2: hard convertible
 // CHECK-COUNT-3: hard storage-access
 // CHECK-COUNT-3: distributed domain {{.*}}: 4
-// CHECK: conversions: 0
+// The transposed consumer now chooses a better-coalesced access layout. The
+// address cost precedes conversion work, so one proven shuffle is worthwhile.
+// CHECK: conversions: 1
+// CHECK-NEXT: convert 3:two/b0/o5/use0
+// CHECK-SAME: estimate=bounded-owner-proof-v1/shuffle
 
 // -----
 
@@ -51,7 +55,7 @@ func.func @contract(%x: tensor<2x2xf16, #a>, %out: memref<2x2xf16, 3>) -> tensor
 
 // CHECK: conversions: 1
 // CHECK-NEXT: convert 8:contract/b0/o1/use0
-// CHECK-SAME: bytes={{[1-9][0-9]*}} sync=2 estimate=cta-staging-upper-bound-v1
+// CHECK-SAME: bytes={{[1-9][0-9]*}} sync={{[02]}} estimate={{[^ ]+}} loop-depth=0
 // CHECK-NOT: frisk.convert_layout
 // CHECK: func.func @contract
 

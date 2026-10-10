@@ -1,5 +1,9 @@
 # Frisk Layout Inference System Implementation Plan
 
+> **M6 完成（2026-10-10）：Task27–29 实现及分项复审通过，最终 405/405 unit、58/58 lit、7/7 CTest、Python/生产 API 隔离通过。真实 GPU 的 11 个正确性用例、33 次 sanitizer 检查通过；三个必测用例 runtime 比值不超过 1.00834，布局编译占比 3.80%/3.97%/6.67%，参考基线已独立评审接受。整体源码及最终文档复审通过，按已声明支持域完成 M6 验收。首轮失败与修复过程保留在 §29.2，最终验收见 §29.3 及 `layout_inference_acceptance.md`。未 commit/push。**
+
+> **当前进展（2026-09-28）：Task 26 按确认的方案 A 完成有序候选扩展、安全转换提升和共享重计算，分块/整体复审通过；357 unit / 53 lit / 4 CTest / 5 Python normalization、SM90 工具与旧生产接口隔离验收通过，契约、范围与结果见 §26.1–26.5。Task 24/25/26 修改保留在源目录 main，未 commit/push；HEAD 仍为 `36df49f`。Task 22/23 已推送至 origin/main。以下旧状态保留为历史记录。**
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 在 Frisk 中实现一个面向 NVIDIA SM90/SM90a 的 MLIR-native 布局系统闭环，覆盖组合布局代数、Distributed/Storage IR、约束传播、有限候选求解、显式 conversion、正确性验证和性能守门。
@@ -24,7 +28,7 @@
 
 - 首个目标仅为 NVIDIA SM90/SM90a；不得在通用 solver 中散布 target 字符串判断。
 - 完整 WGMMA/TMA/mbarrier 指令 lowering 不在本计划范围；本计划实现布局契约、静态成本和 conversion 微基准所需的最小 lowering adapter。
-- 本轮 TileLang 审计及 Task 28 拟建立的新语义参考固定为 `5e149e31674658f94779c7d0c6039549a1853123`；旧 `6623b12d232b343648a5ba99992e3e6f0d6376d2` 保留作历史迁移参考。上游升级不自动改变 Frisk 契约；每次须记录新旧行为与采用理由，不得链接或 vendor TVM/TIRX 类型。
+- 本轮 TileLang 审计及 Task28 已建立的新语义参考固定为 `5e149e31674658f94779c7d0c6039549a1853123`；旧 `6623b12d232b343648a5ba99992e3e6f0d6376d2` 保留作历史迁移参考。上游升级不自动改变 Frisk 契约；每次须记录新旧行为与采用理由，不得链接或 vendor TVM/TIRX 类型。
 - Local/Register 的最终公共表示必须是 RankedTensor SSA；不得继续扩展 local-memory MemRef 作为长期寄存器模型。
 - Shared/Global 保持 MemRef；XOR storage mapping 通过 `frisk.layout_view`/binding 表达，不强塞进 MemRef semi-affine layout。
 - `frisk.convert_layout` 和 rematerialization 是普通候选，不以“零转换方案无解”为启用条件。
@@ -35,7 +39,7 @@
 - 长期同时维护本计划和 `guoqiao/layout_inference_strategy_comparison.md`：计划记完成度/设计/验收，比较记版本证据/取舍/差异假设。Task 18 确认实施后同步设计总文档和属性/API 注释；公共地址与对齐契约见 §18.2–18.3。
 - 现有用户修改属于用户；不得覆盖 `build.sh` 或其他与当前任务无关的工作区变更。
 - 正确性零容忍：race、OOB、invalid ownership、未解析 LayoutVar 和 nondeterministic IR 必须为 0。
-- 性能守门：受支持 kernel 固定环境中位运行时间回退不超过 3%；常规 component candidate 上限 256，首版 beam width 32，布局推断不超过完整编译时间的 10%。
+- 性能守门：受支持 kernel 固定环境中位运行时间回退不超过 3%；沿用 Task23 的 exactCombinationLimit=256、beamWidth=32、maxExpandedStates=65536，256 是精确搜索组合数阈值而非候选硬上限；对具备真实完整编译路径的用例，布局推断不超过完整编译时间的 10%，无完整路径只报告阶段耗时，不冒充该比例通过。
 
 ---
 
@@ -103,7 +107,7 @@ rg -n "LayoutAttr|DistributedEncodingAttr|StorageLayoutAttr|convert_layout|CostV
 4. 新旧行为的正例、反例、失败策略与实际验证命令；旧版错误用独立语义不变量修正，不能强制复制。
 5. 差异化写成可检验假设，注明当前证据和否证条件；不把通用 alias/GF(2)/while/worklist 当作首创。
 
-审计历史与精确上游证据集中在[比较文档 §0、§13、§15](./layout_inference_strategy_comparison.md)；下方 M4 记录审计缺口、已确认设计和实现验收。Task 28 corpus 尚未生成，本轮也未运行 TileLang/Triton 测试或 GPU 性能实验。
+审计历史与精确上游证据集中在[比较文档 §0、§13、§15](./layout_inference_strategy_comparison.md)；下方 M4 记录审计缺口、已确认设计和实现验收。Task28 已真实导出并验证固定 TileLang corpus（§28.2），不等同于运行上游完整测试集；本轮尚无 Triton 运行测试或 GPU 性能结论。
 
 ## 1. 里程碑与依赖
 
@@ -3625,15 +3629,15 @@ dump-analysis 增加每组件搜索模式、域大小、扩展数、硬拒绝数
 
 #### 23.7 验收契约
 
-- [x] 小图联合选择胜过逐变量贪心；含 SameLayout/Convertible、多角色 InstructionContract、ReductionLayout、alias/root contract/region 的回归保持语义正确。
-- [x] 相同输入打乱变量、候选、约束插入次序仍得到相同规范解、binding 和转换位置；去重不破坏支持表或候选拒绝 provenance。
-- [x] 256 及边界上下的 exact/beam 模式、beam 截断丢失唯一解、节点预算耗尽、候选乘积和成本溢出分别测试，不能混淆 unsat 与 incomplete。
-- [x] 固定随机种子的 ≤4096 组合小图用独立 exhaustive oracle 比较；提高 exact 阈值或使用足够宽的 beam 验证最优一致，默认窄 beam 仅验证合法性与确定性。
-- [x] CostVector 九字段逐项优先级、主计算优于零转换、同主成本下较轻转换优先、已有 conversion 不重插、相同根不重复计费、未知完整成本不默认为零。
-- [x] 真实 solver 接受超过 8 个变量的可解组件，以及非 MMA/Reduce 证明端点上的合法 >4 候选域；独立证明预算仍有明确拒绝测试。
-- [x] 将现有 9 变量 SS MMA→Reduce→Global store 改为完整成功验收，包含实际外部写回、MMA/Reduce binding、actual-only 与重跑稳定；另设显式小搜索预算测试替代原 8 变量回滚负例，不直接删掉回滚覆盖。
-- [x] 追加报告中含 Global→Shared Copy、Parallel128、MMA、Reduce、Global 写回的整链集成例；只在实际通过后更新其“尚受 8 变量限制”的当前状态，保留历史记录。
-- [x] 重建全部相关目标，独立跑完整 unit、lit、原 4 CTest、Python 导入与旧接口隔离测试，执行 diff 检查和独立复审；记录本轮实际数量，不预填通过数。
+- [X] 小图联合选择胜过逐变量贪心；含 SameLayout/Convertible、多角色 InstructionContract、ReductionLayout、alias/root contract/region 的回归保持语义正确。
+- [X] 相同输入打乱变量、候选、约束插入次序仍得到相同规范解、binding 和转换位置；去重不破坏支持表或候选拒绝 provenance。
+- [X] 256 及边界上下的 exact/beam 模式、beam 截断丢失唯一解、节点预算耗尽、候选乘积和成本溢出分别测试，不能混淆 unsat 与 incomplete。
+- [X] 固定随机种子的 ≤4096 组合小图用独立 exhaustive oracle 比较；提高 exact 阈值或使用足够宽的 beam 验证最优一致，默认窄 beam 仅验证合法性与确定性。
+- [X] CostVector 九字段逐项优先级、主计算优于零转换、同主成本下较轻转换优先、已有 conversion 不重插、相同根不重复计费、未知完整成本不默认为零。
+- [X] 真实 solver 接受超过 8 个变量的可解组件，以及非 MMA/Reduce 证明端点上的合法 >4 候选域；独立证明预算仍有明确拒绝测试。
+- [X] 将现有 9 变量 SS MMA→Reduce→Global store 改为完整成功验收，包含实际外部写回、MMA/Reduce binding、actual-only 与重跑稳定；另设显式小搜索预算测试替代原 8 变量回滚负例，不直接删掉回滚覆盖。
+- [X] 追加报告中含 Global→Shared Copy、Parallel128、MMA、Reduce、Global 写回的整链集成例；只在实际通过后更新其“尚受 8 变量限制”的当前状态，保留历史记录。
+- [X] 重建全部相关目标，独立跑完整 unit、lit、原 4 CTest、Python 导入与旧接口隔离测试，执行 diff 检查和独立复审；记录本轮实际数量，不预填通过数。
 
 #### 23.8 范围与确认点
 
@@ -3645,13 +3649,13 @@ dump-analysis 增加每组件搜索模式、域大小、扩展数、硬拒绝数
 
 实现已接入生产，独立复审及最终全量 Gate 已通过；本轮未提交或推送。
 
-| 部件 | 实际变化 |
-| --- | --- |
-| `LayoutSolver.h` / `LayoutCandidateSolver.cpp` | 正式 `solveLayoutGraph`、组件 exact/beam、MRV、独立预算、结构去重、拒绝记录、稳定全赋值 key；移除旧 bootstrap 入口及 8/4 限制 |
-| `LayoutRelations.cpp` / `LayoutVerifier.cpp` | 搜索与验证复用硬关系查询；验证器不负责搜索，仍独立核验真实解和 MMA/Reduce binding |
-| `LayoutCostModel.cpp` / `LayoutTarget.h` / SM90 target | 九项字典序、饱和成本、图上下文评估、安全部分下界、conversion 上界和静态定义/根占用计费 |
-| infer / named pipeline | 三项同默认值的搜索选项、组件及总成本统计、conversion bytes/sync/source；沿用事务物化及 actual-only 验证 |
-| 本地证明准备 | MMA/Reduce 域预算保持原值；错误名称改为 instruction/reduction proof budget，与搜索规模限制分开 |
+| 部件                                                       | 实际变化                                                                                                                       |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `LayoutSolver.h` / `LayoutCandidateSolver.cpp`         | 正式`solveLayoutGraph`、组件 exact/beam、MRV、独立预算、结构去重、拒绝记录、稳定全赋值 key；移除旧 bootstrap 入口及 8/4 限制 |
+| `LayoutRelations.cpp` / `LayoutVerifier.cpp`           | 搜索与验证复用硬关系查询；验证器不负责搜索，仍独立核验真实解和 MMA/Reduce binding                                              |
+| `LayoutCostModel.cpp` / `LayoutTarget.h` / SM90 target | 九项字典序、饱和成本、图上下文评估、安全部分下界、conversion 上界和静态定义/根占用计费                                         |
+| infer / named pipeline                                     | 三项同默认值的搜索选项、组件及总成本统计、conversion bytes/sync/source；沿用事务物化及 actual-only 验证                        |
+| 本地证明准备                                               | MMA/Reduce 域预算保持原值；错误名称改为 instruction/reduction proof budget，与搜索规模限制分开                                 |
 
 搜索前保留原 strict/common 传播，solver 自身检查 target/type、存储容量、硬 seed/unary 与 tuple/pair 单候选支持，再冻结域；搜索中的 relation cache 只记录该冻结域内的规范候选下标。MRV 试探也计入 expanded，不将某个分支拒绝当作全局候选删除。原始域乘积溢出与剪枝后乘积溢出分别记录，原始大图被硬约束缩为单解时仍可进入 exact。
 
@@ -3771,12 +3775,69 @@ git commit -m "feat: select global layout candidate assignments"
 
 ### Task 24: 将 conversion placement 和 rematerialization 纳入普通候选
 
+#### 24.1 已确认设计：方案 A（2026-09-27）
+
+用户确认先写入契约，再实施与测试。直接在源目录工作，不创建 worktree；本轮不自动提交或推送。以下细化取代本节旧步骤中未明确的策略，Task 25/26 不提前计作完成。
+
+**目标与架构：** 在 Task 23 的有限布局赋值搜索内，对每个完整赋值求解可分离的边界方案，再联合比较 CostVector。保持共同布局、consumer conversion、同块共享 conversion、便宜 producer rematerialization 都是普通方案，不以零转换不可行为前提。物化前记录可验证的计划，物化失败不改变原 IR。
+
+**全局约束：**
+
+- 保留 exact256 / beam32 / 65536 布局扩展预算；边界方案采用确定性、有限的同源/同目标/同块分组。组间不共享临时值或重计算切片，成本可相加；不宣称跨组或跨 region 全局最优。
+- 同组比较各 consumer 独立转换、一次共享转换、各 consumer 的受限重计算组合。共享转换插在最早 consumer 前，源定义必须支配该位置。首版不跨 block、if、loop 移动或共享。
+- 显式已有 conversion 保留其语义与位置，计费但不重复生成；相同 encoding 不生成转换。Hard seed、SameLayout、AliasLayout、MMA/Reduce/Storage 契约均不可用重计算或转换覆盖。
+- 重计算只接受无 region、单 Tensor 结果、静态同形的受支持便宜操作。首版白名单为 dense arith.constant、arith 的 add/sub/mul、整数按位操作和 select；还必须由 MemoryEffectOpInterface 证明无副作用。不包含 load/store、MMA、Reduce、随机、时钟、除法、未知操作或 tensor.empty。
+- backward slice 限制为最多 8 个不同操作（共享子表达式只算一次）；第 9 个操作出现时整条重计算候选不枚举。只复制 consumer 所在块中的生产者；块参数或不可复制的定义作为叶子，不穿越 region。叶子必须支配插入点；叶子布局不符时插入的转换必须一并验证与计费。
+- 克隆保留操作属性、标量依赖及运算顺序，不做浮点重结合；每个 Tensor 克隆结果均重新检查目标布局、硬 seed 与资源约束。原有 producer 和其他 users 不修改；本任务不依赖 DCE 获得成本收益。
+
+#### 24.2 成本契约
+
+- 新增生产侧的有限、可解释交换分类，不依赖 `frisk::test` 的测试 lowering ABI：同线程 register、同 warp shuffle、跨 warp shared；证明/枚举预算不足或布局不支持分类时回退到 Task 23 的 CTA staging 上界，并记录 provenance。
+- 使用元素 bit width（按字节向上取整）、tile volume/物理 carrier 数、是否 staging、barrier 数和插入位置的 loop depth。循环权重采用 `2^depth` 的静态代理，饱和运算；它不是 trip count 或 cycle 预测，动态循环也不假装已知执行次数。
+- `conversionBytesAndSync` 在 Task 24 明确为“边界修复成本”：转换搬运/同步或重计算工作与其叶子转换的同量纲静态代理。便宜克隆每个输出物理元素计一次元素字节工作；不把克隆工作单独加到更高优先级的 `instructionPathAndWork`，否则转换的该项为 0 会机械地禁止任何重计算。主计算路径的 target 评分优先级不变。
+- 克隆寄存器/replication/codeSize 增量也计费；共享转换只计一次，独立方案逐次计费。仅当重计算总边界成本严格低于该 use 的直接转换时枚举；同分优先不克隆，再按稳定图 key。
+- 部分布局赋值的边界成本下界取 0，避免将随后可共享/替代的转换重复计入下界。完整赋值执行组内有限比较；不因 beam 的不完整搜索声称不可行性已证明。
+
+#### 24.3 方案表示、验证与物化
+
+- `LayoutConversionEdge` 扩展 placement、共享组 leader、交换模式、loop depth、成本来源和有序 rematerialization slice；每个不一致的实际 use 仍保留一条有授权 constraint ID 的记录。
+- 新建 `LayoutConversionChoice.h/.cpp`，负责 slice 构造、组内方案比较及方案核验；`LayoutCostModel.cpp` 只负责数值估计；solver 不直接改 IR。
+- verifier 从原 SSA、完整 assignments 和硬约束重新检查计划，拒绝伪造/遗漏/重复 use、错误插入点、越块共享、过大切片和硬 seed 改写；不能仅相信成本字段。
+- `MaterializeLayouts.cpp` 在 detached module 内按计划生成共享 conversion 或克隆切片，重用同组转换 SSA；之后执行 MLIR 与实际布局验证，成功才替换原 module body。循环 carried slot 和函数签名保持既有约束。
+
+#### 24.4 实施与验收清单
+
+使用 writing-plans、TDD 与实现后独立代码复审。代码任务按以下顺序推进，未验证前不打完成标记。
+
+- [X] **24-A 成本分类。** 修改 `LayoutCostModel.h/.cpp` 和 `LayoutConstraint.h`，在 `LayoutCostModelTest.cpp` 先加入 register/shuffle/shared、fallback、位宽、loop depth、饱和的红灯测试；保持未知路径非零。运行 `cmake --build build --target FriskLayoutUnitTests --parallel 12` 与 `build/unittests/Dialect/Frisk/FriskLayoutUnitTests --gtest_filter='*LayoutCost*'`。
+- [X] **24-B 候选选择。** 新建 `LayoutConversionChoice.h/.cpp`、`LayoutConversionChoiceTest.cpp` 并登记 CMake。先断言同块两个同目标 use 只付一次成本、便宜常量/算术 slice 选择 Rematerialize，再实现分组、8-op 限制及叶子计费。接入 solver 完整赋值评分，下界不重复计算边界成本。
+- [X] **24-C 验证与物化。** 扩展 `LayoutVerifier.cpp`、`MaterializeLayouts.cpp`。测试真实 solver 输出的转换位置、多个 use 同一个 SSA、克隆结果/属性、8/9 op、循环隔离、hard seed，以及篡改方案失败后原 IR 字节级不变。
+- [X] **24-D 集成。** 新建 `test/Transforms/layout-conversion-choice.mlir`；验证主路径 100/零转换 与 10/带转换的两个成本方向、相同主路径选择便宜边界、确定性与推断重跑。保留完整 Copy/Parallel/MMA/Reduce/store 回归。
+- [X] **24-E 文档与 Gate。** 同步本计划、`layout_inference_design.md` §8.7–8.9 和 `layout_inference_strategy_comparison.md`，区分实际完成与未来跨 region 优化。运行全量 unit、lit、CTest、Python normalization 和 legacy boundary 扫描；独立复审后记录确切命令与数量，不以历史 Task 23 测试替代。
+
+示例验收断言（具体建图沿用现有 test fixture）：
+
+```cpp
+EXPECT_EQ(solution.conversions[0].resolution, EdgeResolutionKind::Rematerialize);
+EXPECT_EQ(firstConsumer.getOperand(0), secondConsumer.getOperand(0)); // shared conversion
+EXPECT_TRUE(failed(materializeLayouts(module, graph, tampered)));
+EXPECT_EQ(before, print(module)); // transaction rollback
+```
+
+#### 24.5 原始任务分解（实施时同步勾选）
+
 **Files:**
 
 - Modify: `include/Dialect/Frisk/Analysis/LayoutConstraint.h`
-- Modify: `include/Dialect/Frisk/Analysis/LayoutSolver.h`
+- Create: `include/Dialect/Frisk/Analysis/LayoutConversionChoice.h`
+- Create: `lib/Dialect/Frisk/Analysis/LayoutConversionChoice.cpp`
+- Modify: `include/Dialect/Frisk/Analysis/LayoutCostModel.h`
 - Modify: `lib/Dialect/Frisk/Analysis/LayoutCandidateSolver.cpp`
 - Modify: `lib/Dialect/Frisk/Analysis/LayoutCostModel.cpp`
+- Modify: `lib/Dialect/Frisk/Analysis/LayoutVerifier.cpp`
+- Modify: `lib/Dialect/Frisk/Transforms/MaterializeLayouts.cpp`
+- Modify: `lib/Dialect/Frisk/Transforms/LayoutInfer.cpp`
+- Modify: `lib/Dialect/Frisk/Target/SM90/SM90LayoutTarget.cpp`
 - Create: `unittests/Dialect/Frisk/Layout/LayoutConversionChoiceTest.cpp`
 - Create: `test/Transforms/layout-conversion-choice.mlir`
 
@@ -3794,14 +3855,25 @@ struct LayoutConversionEdge {
   EdgeResolutionKind resolution;
   uint64_t bytes;
   uint64_t synchronizationCost;
+  LayoutConstraintID constraint;
+  ConversionExchangeKind exchange;
+  uint64_t loopDepth;
+  std::string costProvenance;
+  Operation *insertionPoint;
+  LayoutConstraintID sharedLeader;
+  SmallVector<Operation *> rematerialization;
 };
 
 bool isRematerializable(Operation *op);
-FailureOr<CostVector> evaluateConversionEdge(const LayoutConversionEdge &edge,
-                                             LayoutTarget &target);
+FailureOr<LayoutConversionChoices> chooseLayoutConversions(
+    const LayoutConstraintGraph &, const CandidateAssignment &, LayoutTarget &);
+FailureOr<CostEstimate> evaluateLayoutConversionCost(
+    const LayoutVar &, Attribute source, Attribute target, LayoutConversionEdge &);
+FailureOr<CostEstimate> evaluateLayoutCloneCost(
+    const LayoutVar &, Attribute encoding, Operation *insertionPoint);
 ```
 
-- [ ] **Step 1: 写“零转换不是绝对优先”的红灯测试**
+- [X] **Step 1: 写“零转换不是绝对优先”的红灯测试**
 
 构造：
 
@@ -3812,23 +3884,25 @@ FailureOr<CostVector> evaluateConversionEdge(const LayoutConversionEdge &edge,
 
 预期选择 B。再构造主路径相同而 conversion 更重的 case，预期选择零 conversion。
 
+这里的 8 是原始示意值；实际 Task 24 回归使用合法的 64xf32 编码与 512 单位 shuffle 成本，验证 100/10 的主路径优先级以及同主路径时选择零转换。
+
 Run: `cmake --build build --target FriskLayoutUnitTests --parallel 32`。
 
-Expected: FAIL，solver 尚未枚举 edge resolution。
+历史红灯预期：solver 尚未枚举 edge resolution。实际 Task 23 已具备两个主路径成本方向的能力，本任务保留该回归，并以共享转换、常量重计算、8-op 切片与方案篡改测试证明新增能力的红灯。
 
-- [ ] **Step 2: 枚举 edge resolution**
+- [X] **Step 2: 枚举 edge resolution**
 
 对于 `Convertible` soft conflict 同时生成：共同布局、consumer-edge conversion、pure producer rematerialization。Hard seed 冲突不得通过 conversion 掩盖。
 
-- [ ] **Step 3: 计算 conversion 成本**
+- [X] **Step 3: 计算 conversion 成本**
 
 至少包含元素 bit 数、tile volume、是否跨 warp、是否需要 shared staging、barrier 数和所在 loop depth。未知 lowering 使用保守上界并标记 provenance，不能记为 0。
 
-- [ ] **Step 4: 限制 rematerialization**
+- [X] **Step 4: 限制 rematerialization**
 
 只允许 `MemoryEffectOpInterface` 证明无副作用、无 region、无随机/时钟语义、成本低于 conversion 的 backward slice。最大 slice op 数首版设为 8；超过时不枚举。
 
-- [ ] **Step 5: 验证选择与 IR 物化**
+- [X] **Step 5: 验证选择与 IR 物化**
 
 Run:
 
@@ -3840,9 +3914,11 @@ cmake --build build --target FriskLayoutUnitTests check-frisk --parallel 32
 
 Expected: 两个成本方向测试均 PASS；FileCheck 中 conversion 数和位置与 solution 一致。
 
-- [ ] **Step 6: 同步 conversion 设计并提交**
+- [X] **Step 6: 同步 conversion 设计**
 
 确认 `layout_inference_design.md` Section 8.7–8.9 与实际普通候选策略一致。
+
+- [ ] **Step 7: 用户确认后提交（不属于本轮自动执行）**
 
 ```bash
 git add include/Dialect/Frisk/Analysis lib/Dialect/Frisk/Analysis \
@@ -3850,7 +3926,169 @@ git add include/Dialect/Frisk/Analysis lib/Dialect/Frisk/Analysis \
 git commit -m "feat: solve layout conversion placement globally"
 ```
 
+#### 24.6 实际实现与边界说明
+
+实现沿用 Task 23 的 `LayoutSolution::conversions` 承载边界记录，无需重建 solver 公共结构；新增 `LayoutConversionChoice.h/.cpp` 负责选择与计划核验。`KeepCommonLayout` 表示赋值相同，无需生成记录；`Convert/Rematerialize` 每个实际 use 保留一条记录，同组 leader 标识实际共享的一个转换。`dump-analysis` 的 `conversions` 数量仍是边界记录数，不等于去重后的物理转换操作数。
+
+对固定赋值，同一组的转换源、目标和块相同，所以一个共享转换已经能服务整组。保留共享转换再增加克隆不会降低非负成本；因此只需比较“一次共享转换”和“逐 use 最便宜方案之和”，不需要枚举 `2^users` 个组合。只有第四字段严格更低的合法 slice 才参与；整体仍按九字段字典序比较。先选边界最优值，再参与原 exact/beam 的赋值评分；这是受限可分离模型的最优选择，不是通用 placement 的全局最优保证。
+
+数字例子：64 个 f32 元素，每端 64 个 physical carriers 的同 warp shuffle，估计 512 字节、0 barrier；同一块两个 consumer 共享一次仍为 512，不是 1024。单个常量克隆工作为 256，选择重计算；两个 consumer 各自克隆合计 512 时，共享转换凭较低资源/codeSize 或稳定保守 tie-break 胜出。跨 warp shared/未知路径另加 `4 * maxThreads * 2` 的同步惩罚，循环内边界总工作乘 `2^depth`。这些数字是成本模型单位，不是实测 cycle。
+
+分类预算为最多 65536 个逻辑元素、两端合计最多 262144 个 physical carriers；只对 lane=32 且相同 active-thread topology 的可规范化 BitLinear 映射做 owner 分类。其余已合法的转换使用带 `cta-staging-upper-bound-v1` 来源的保守估计，不把 unknown 当作零开销。超出预算不会触发巨大 owner 表枚举。
+
+重计算只复制原 consumer 同块内的白名单 slice，保持所有原操作及其其他 users；叶子和标量值须支配插入点，同一叶子在同一 slice 内只转换一次。跨块纯 producer 不复制，故循环体可以重算体内常量，但不能因“纯”而复制循环外 producer。循环 init/backedge/result 的既有类型和关系不变。克隆数值估计已统一放在 `LayoutCostModel.cpp`。
+
+独立复审已检查选择、cost、dominance、硬约束、克隆和事务边界；未发现 Critical/Important 问题，补充的四项覆盖/职责划分意见已修正并复审关闭。完整验收数字见 §24.7，不以中间测试结果代替。
+
+#### 24.7 最终验收（2026-09-27）
+
+| 验证范围                                     | 最终结果                                 |
+| -------------------------------------------- | ---------------------------------------- |
+| 指定构建目标（unit/CLI/FFI/4 个 CTest 程序） | 成功                                     |
+| 全量单元测试                                 | 287/287，36 suites，410.369 秒           |
+| 全量 lit                                     | 50/50                                    |
+| CTest                                        | 4/4                                      |
+| Python legacy normalization                  | 5/5                                      |
+| 旧生产接口隔离扫描                           | PASS                                     |
+| 独立复审及修正复审                           | APPROVE，无遗留 Critical/Important/Minor |
+| 差异空白检查                                 | `git diff --check` 通过                |
+
+实际命令（源目录执行）：
+
+```bash
+cmake --build build --target FriskLayoutUnitTests frisk-opt frisk_ffi \
+  frisk_attr_test frisk_reduce_layout_test frisk_layout_pass_test \
+  frisk_memory_effect_test --parallel 12
+build/unittests/Dialect/Frisk/FriskLayoutUnitTests \
+  --gtest_output=xml:/tmp/frisk-task24-final-unit.xml
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 \
+  /data0/xiebaokang/rocm-llvm-project/build/bin/llvm-lit -sv build/test
+ctest --test-dir build --output-on-failure
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 \
+  test/python/legacy_normalization_test.py --build-dir build
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 \
+  test/python/legacy_api_boundary_test.py --source-root . --build-dir build
+git diff --check
+```
+
+相对 Task 23 新增 15 个单元用例（12 个 choice/物化测试与成本覆盖增量）和 1 个 lit 文件。覆盖共享实际 SSA、共享转换优于多个廉价克隆、单常量/算术重计算、成功且去重的叶子转换、昂贵叶子拒绝、8/9 个唯一操作边界、hard seed、未知/昂贵操作拒绝、循环位置与外部 producer 隔离、i1/i16/i32 字节取整、分类预算回退、饱和、稳定选择与方案篡改回滚。既有 MMA/Reduce、9 变量核心及完整 Copy/Parallel/MMA/Reduce/store 回归仍通过。
+
+红灯与修正轨迹：初始共享/重计算/切片/方案核验测试按预期失败，成本分类与循环权重也先验证失败再实现。第一次全量回归发现旧 capture 测试仍要求两次转换，以及新证书校验抢先覆盖缺失转换诊断；现已将 capture 断言加强为“一次转换、相同 operand SSA、仍在原 parallel 块内”，并恢复具体缺失边/hard conflict 诊断优先级。定向 30/30 通过后，重新执行了上述最终全量 Gate，不把第一次失败运行算作通过。
+
+构建期间存在既有 Ninja `premature end of file; recovering` 警告并导致广泛重编译；指定目标最终正常构建。默认 all-target 的实验 `exp/layout/gemm_layout_tool.cpp` 仍引用退役的 `ParallelOp::inferLayout`，不属于本轮 Gate，未在 Task 24 扩展修复。成本仅为静态代理，没有执行 GPU benchmark 或更新 TileLang/Triton 固定快照。Task 24 修改尚未提交/推送。
+
 ### Task 25: 完成数据驱动的 SM90 WGMMA/TMA 布局契约
+
+#### 25.1 已确认设计：方案 A（2026-09-28）
+
+用户确认先写入具体契约，再进入实现与测试。直接在源目录实施，保留未提交的 Task 24 修改；本任务不自动 commit/push，不创建 worktree。状态：已按确认契约完成实现、独立复审与最终 Gate，证据见 §25.4–25.5；未提交/推送。
+
+**Goal:** 接通有来源的 SM90 目标规则、WGMMA/Copy 指令路径及 shape/address-aware 成本，并使选中的契约能在实际 IR 上独立复验。
+
+**Architecture:** 复用现有有限候选、四角色 InstructionContract tuple、CostVector 和事务式物化。Copy 的四角色为 source storage、destination storage、execution layout、instruction path；路径是独立的 Instruction 变量，不能按相同布局去重掉不同路径。MMA 的既有四角色和逐坐标证明保持不变。目标规则只在 SM90 层解释，通用求解器不判断芯片名称。
+
+**Tech Stack:** 当前固定 LLVM/MLIR 工具链、C++17、TableGen/MLIR attributes、GoogleTest、lit/FileCheck；硬件依据为 NVIDIA PTX 与 CUDA Tensor Map API。交付布局与指令契约，不交付完整 GPU async lowering 或性能结论。
+
+#### 25.2 全局实现契约
+
+- **目标解析：** `SM90TargetInfo` 从作用域内 NVVM target/chip/features、适用的 DLTI 设备属性与迁移期 `frisk.target` 读取信息。同作用域冲突、错误类型与不支持芯片必须报错；不能把 sm_90 静默提升为 sm_90a。无显式目标沿用普通布局的 SM90 默认环境，但 WGMMA 仍要求显式 architecture-specific 能力。字符串比较封装在 target adapter。
+- **WGMMA：** 本任务数据表覆盖 FP16/BF16 输入、FP32 累加、SS/RS、m64nNk16 atom 与已支持的 warp-group grid；固定 128 threads/warp-group，不限制整个 block 只能 128 threads。复用 canonical distributed fragment、真实 root-relative descriptor 和证明预算。TF32/I8 不新增，非法数学 MMA 不伪装成已实现的 SIMT fallback。
+- **Copy：** source/destination/execution/path 联合候选，路径为 TMA、cp.async、vector/scalar；已有 execution/vector/writer/layout 硬要求保持。TMA 首版为静态 whole-tile、非 interleave、单位 element stride 的 global→shared tiled copy；rank 规则覆盖 1–5，不能把 unsupported direction 当作 TMA。没有合法 TMA 时删除该候选，仍保留满足地址与 ownership 的普通 Copy。
+- **TMA：** 验证 dtype、rank、box（每维 1–256）、global byte strides、inner box bytes、独立对齐证据、none/32B/64B/128B swizzle 和真实 shared 地址映射；分别表示 global base、shared base 和 phase 约束，不把 128B 写成所有指针的统一要求。第一版不切分超 box 的 tile，不支持未知动态 descriptor；这些只排除 TMA，不自动排除正确的 Copy。mbarrier/proxy 的 lowering 义务显式保存在 binding 中，不把 metadata 当成已经插入的同步。
+- **cp.async：** 仅对 global→shared、同线程可证明的对齐连续 4/8/16-byte 分组开放，不能替代已指定更强 vector/ownership 要求。其他情形保留 vector/scalar 路径。
+- **静态 ragged：** 仅扩展 whole-tile Copy，静态正 extent，逻辑点与 padded carrier 域均受 65536 预算控制。执行 map 覆盖向上取二次幂的 carrier 域，实际有效范围来自原 Copy shape；每个实际元素恰有一个 elected writer，尾部 carrier 必须屏蔽。guarded shape 进入 Copy 契约和复验，不能作为普通无 guard Tensor encoding 使用。第一版 ragged 采用 scalar path，明确拒绝不相容的显式宽向量；不扩展动态 shape、部分 Copy、Fill 或 ragged MMA。
+- **成本：** `instructionPathAndWork` 按实际指令 atom/访问批次数与固定可解释 setup 工作计算；`memoryTransactions` 按地址分组统计 32B sector（未知 base phase 取保守值）；`bankConflictDegree` 按 warp/访问批次的 shared 4B bank 地址计算，读广播与不同地址冲突分开。成本是版本化静态代理，不能声称 cycle。MMA、Copy、Reduce 和普通 StorageAccess 各按实际执行位置计一次，不与 Task 24 边界工作重复收费。
+- **保守性：** 证明预算不足不能把未知路径当免费或宣称硬件绝对非法。成本饱和，不回绕；部分赋值使用不高估的下界。路径必须先合法，再比较成本。TMA/cp.async/vector 同一布局下是不同选择，不使用永远偏好某条路径的序号。
+- **复验：** Copy binding 必须包含版本、路径、支持域、向量/box/swizzle、guard 与同步义务；从原 SSA、实际 storage、execution map、target 重建，不相信序列化的成本或缓存标志。事务失败不改原模块。实际 IR 缺失、篡改、重复或冲突契约均拒绝。
+- **兼容：** 保留 Task 19–24 的硬约束、alias/SCF 语义和回滚；Task 26 的通用有序 relaxation、跨 region hoist 和共享 rematerialization 不计入本任务。
+
+规则来源：[CUDA tiled Tensor Map](https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__TENSOR__MEMORY.html)、[PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html)。只使用 SM90 支持的规则子集，不因最新版文档出现其他架构模式就自动加入。
+
+#### 25.3 实施步骤与验收清单
+
+使用 writing-plans、subagent-driven-development、TDD 和实现后独立复审。按责任分工，构建由主 agent 协调，防止多个 Ninja 同时修改 build。
+
+- [X] **25-A 目标与 WGMMA 表。** 新建 `SM90TargetInfo.h/.cpp`、`SM90InstructionTable.h/.cpp` 与 `SM90ContractTest.cpp`；修改既有 `SM90MmaLayoutProof.cpp`、`SM90GemmConstraints.cpp`、目标入口与 CMake。先写 FP16/BF16、SS/RS、128-thread 单位、major、sm_90/sm_90a、target 冲突测试，看到失败再接入表与目标解析；既有 MMA map/descriptor 回归必须保持。
+- [X] **25-B Copy 路径和 descriptor。** 新建 `SM90CopyConstraints.h/.cpp`、`SM90CopyContractTest.cpp`。扩展 Copy 收集为四角色 InstructionContract，增加 path 变量和 `frisk.copy_contract`；通用 tuple/support、graph invariant、物化/实际 verifier 不再假定所有 instruction 都是 MMA。先验证 TMA 合法、非法 alignment/box 保留 fallback、cp.async 4/8/16、硬属性与篡改失败。
+- [X] **25-C 静态 guarded Copy。** 修改 `OperationLayoutConstraints.cpp`、`ExecutionLayoutProof.cpp`、执行属性 verifier 和 distributed candidate 入口，新增 `GuardedCopyTest.cpp`。先用 3x5、7x18 与单元素轴证明旧实现拒绝，再实现 padded execution domain、有效域 mask、scalar guard 与复验；测试尾部遗漏/伪造/越界与明确宽向量冲突。
+- [X] **25-D 地址/形状成本。** 新建 `SM90CostModel.h/.cpp`、`SM90CostModelTest.cpp`，在 target evaluate 接入前三项。测试连续和跨 sector、同 bank 不同地址和读广播、不同 shape 的路径工作、未知 alignment 的上界、溢出与 partial lower bound；验证至少一项真实 solver 决策随成本变化，而不只调用独立评分函数。
+- [X] **25-E 工具与完整链。** 更新 `exp/layout/gemm_layout_tool.cpp` 和其 CMake，去除退役 `ParallelOp::inferLayout`，通过新 pipeline 生成实际 canonical layouts。新建 `test/Transforms/sm90-layout-contracts.mlir`，验证合法/非法/fallback、serialize/reparse/replay 与完整 Copy→MMA→Reduce→store；旧基准通过独立 oracle 对照，不恢复生产旧 API。
+- [X] **25-F Gate 与长期文档。** 同步设计文档和策略比较，逐项复审；执行指定构建、全量 unit/lit/CTest/Python 与 legacy API 隔离检查，记录确切结果。未通过项不标完成，不提交/推送。
+
+主要验证命令：
+
+```bash
+cmake --build build --target FriskLayoutUnitTests frisk-opt frisk_layout_tool --parallel 12
+build/unittests/Dialect/Frisk/FriskLayoutUnitTests --gtest_filter='SM90ContractTest.*:SM90CopyContractTest.*:GuardedCopyTest.*:SM90CostModelTest.*'
+build/unittests/Dialect/Frisk/FriskLayoutUnitTests --gtest_output=xml:/tmp/frisk-task25-final-unit.xml
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 /data0/xiebaokang/rocm-llvm-project/build/bin/llvm-lit -sv build/test
+ctest --test-dir build --output-on-failure
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 test/python/legacy_normalization_test.py --build-dir build
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 test/python/legacy_api_boundary_test.py --source-root . --build-dir build
+git diff --check
+```
+
+验收关键断言（与具体 fixture 配合）：
+
+```cpp
+EXPECT_EQ(selectedPath, "tma");                 // 合法 descriptor + 更低模型成本
+EXPECT_NE(fallbackPath, "tma");                // 未证明 TMA，不影响合法普通 Copy
+EXPECT_TRUE(failed(verifyMaterializedLayouts(module, target))); // 篡改实际 binding
+EXPECT_EQ(before, print(module));               // 失败事务保持原 IR
+EXPECT_LT(contiguous.cost.memoryTransactions, strided.cost.memoryTransactions);
+```
+
+#### 25.4 实际实现与评分口径
+
+代码已经接入以下路径，最终 Gate 结果在 §25.5 单独记录：
+
+1. `SM90TargetInfo` 统一解释 `frisk.target`、`nvvm.target`、GPU module targets 和适用 builtin module 的 DLTI GPU device。芯片声明取最近作用域，但 DLTI 独立查找并与该芯片核对，不因 GPU module 上有 target 就跳过外层设备约束。支持两个 NVPTX CUDA triple；显式 PTX 版本限定在固定工具链支持集，禁用/未知版本和相互冲突的声明报错。无 target 默认普通 SM90，不默认启用 WGMMA。
+2. `SM90InstructionTable` 固化已有 FP16/BF16×SS/RS×N={8,16,32,64,128,256} 的 m64nNk16 规则，共 24 行。block 支持 128/256/512/1024 threads，每 warp-group 固定 128。表筛选之后仍逐点验证 fragment、packing、major、真实根地址和 descriptor；不是用“命中表项”代替证明。
+3. `SM90CopyConstraints` 为 source storage、destination storage、execution、path 构造四角色关系，物化 `frisk.copy_contract`。binding 包括 path、target、vector_bytes、valid_shape、guarded、issuer、completion；TMA 另有 box/global_strides/source_offset/destination_offset/swizzle_bytes/interleave。普通向量取满足硬要求且已证明的最大 1/2/4/8/16B 宽度；cp.async 只接受 4/8/16B、Global→Shared 与相应 PTX 能力。TMA 首版 dtype 为 F16/BF16/F32；不能证明的路径删除，正确普通路径保留。
+4. `proveGuardedExecutionVectorAccess` 共用原有 footprint 检查，仅用实际 shape 为内存地址建索引。3×5 使用 4×8 carrier，7×18 使用 8×32 carrier；尾部没有访问地址。1×8、1×1 用零 output bits 表达单位轴，不额外填充；一般 GF2 空矩阵 API 未扩大。ragged Copy 的 vector_bytes 必须为 1，Fill/dynamic/partial Copy 支持域不变。
+5. `SM90CostModel` 在 Task 24 静态资源/边界成本之上增加前三项，通用 solver 不解释 SM90 名称。MMA 工作量是 group×M/N/K repeat 的 atom 数；Reduce 是输入元素数减输出元素数的合并工作代理；StorageAccess 根据实际 execution ownership 分组。该版本没有把 Reduce 内部同步、scratch 生命周期或硬件 overlap 当作已精确建模。
+
+Copy 工作代理 `sm90-shape-work-v1`：普通 Copy 按真实 load+store warp issue 数；cp.async 按 source issue 数加固定 2 单位提交/等待工作；TMA 按 `4 + ceil(tileBytes/1024)` 估计固定 setup 与 bulk 工作。4、2、1024 是版本化代理参数，不是 latency 或保证的机器指令计数。32×64 F32、128B/1024B 根对齐的 fixture 中，宽 16B 普通 Copy 为 32 单位，cp.async 为 18，TMA 为 12，因此选 TMA；8×16 F32 同类 fixture 中三者分别为 2、3、5，选普通向量。不是给 TMA 一个永远最小的序号。
+
+地址评分 `warp-issue-32B-sectors-v1` 在每个 warp/register-vector batch 中按实际地址统计 Global sector；TMA 统计整块地址集合。未知根对齐相位枚举所有与保证一致的相位并取上界。Shared 评分 `shared-128B-phase-32x4B-distinct-word-conflicts-v2` 将 8B/16B 每线程访问分别分为 16/8 lane 的独立 128B 阶段，每阶段累计 `max(distinct words per bank)-1`；同 word 读取广播不重复计数，不能将一个连续 float4 warp 的四个独立阶段误算为 4-way bank conflict。packed 写使用 distinct-word 带宽代理，不承担写竞态证明（ownership/地址证明负责）。大于 16B 的原生整数类型只给保守代理，不声称原生指令 lowering。
+
+下界保留静态资源值、将前三项和未定边界代价置零；不能提前假定尚未选择的 Copy 路径。各访问本地计数有枚举上限，跨约束求和仍经饱和 `addLayoutCosts`。`costCoverage()` 标明代理版本与未建模 latency/cache/overlap。
+
+工具 `exp/layout/frisk_layout_tool` 已改用完整事务 pipeline，返回真实 canonical storage/distributed/MMA 属性与 IR；返回 Tensor 使 MMA 不被无用代码消除。支持 SS/RS、FP16/BF16、SM90a，输出 schema 为 `frisk-canonical-layout-v1`。旧 `--ldmatrix`/`--lane-vector` 仅发退役提示，不伪造指令保证；只接受单 CTA grid。Python 展示入口已适配，不再把另一套 PyTorch benchmark 当作当前布局性能。生产隔离检查也覆盖该工具，旧算法只在独立测试 oracle 中对照。
+
+#### 25.5 验证与复审记录（2026-09-28）
+
+先验证缺少目标 API、Copy path/binding、非零成本、ragged 支持、canonical swizzle 的失败，再实施。独立审查发现并修复：GPU target 遮蔽适用 DLTI、NVPTX triple 前缀误判、宽 Shared 访问跨 128B 阶段误计 bank；相应测试均已 red→green。工具 smoke 增加实际属性断言，捕获并修复“进程成功但 MMA 被优化删除”的空输出。
+
+第一轮完整单元回归暴露 Copy 新属性未进入 normalize 白名单，以及地址成本接入后旧双消费者测试仍要求零转换；已分别修正，并加强为“恰好一次 shuffle 且 Global sector 少于共同布局”的断言。最终完整构建成功，325/325 unit、51/51 lit、4/4 CTest、5/5 Python normalization、新工具 SS/RS/目标拒绝/输出存活 smoke、包含新工具的旧接口生产隔离检查全部通过。单元测试使用 GoogleTest 原生四分片，分别 82/81/81/81 项，均无失败；不是用定向测试代替全量。仍未执行 GPU benchmark，没有新增运行时性能承诺。
+
+```bash
+cmake --build build --target FriskLayoutUnitTests frisk-opt frisk_layout_tool -j 16
+cmake --build build -j 16
+for shard in 0 1 2 3; do
+  GTEST_TOTAL_SHARDS=4 GTEST_SHARD_INDEX=$shard \
+    build/unittests/Dialect/Frisk/FriskLayoutUnitTests \
+      --gtest_output=xml:/tmp/frisk-task25-final-unit-$shard.xml
+done
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 \
+  /data0/xiebaokang/rocm-llvm-project/build/bin/llvm-lit -sv build/test
+ctest --test-dir build --output-on-failure
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 \
+  test/python/legacy_normalization_test.py --build-dir build
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 \
+  test/python/legacy_api_boundary_test.py --source-root . --build-dir build
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 \
+  test/python/sm90_layout_tool_test.py --build-dir build
+git diff --check
+```
+
+相对 Task 24 新增 38 个单元用例：目标/规则表 12、Copy 11、guard 6、地址评分 8、完整 Copy 成本 1；新增 1 个 lit 文件。包括 TMA rank 1–5 与三种 dtype、rank 6/box 512/不合格 inner granularity/40B stride/错误方向/dtype fallback、cp.async 4/8/16B 实际对齐、明确宽向量冲突、descriptor offset 与 guard/完成义务篡改，以及实际 IR 重建。地址测试有精确值：连续 f32 Global 4 个 sector，未知相位保守 5，32B stride 为 32；Shared 同 bank 不同 word 31，读广播 0，连续 8/16B 向量各阶段均为 0。既有独立 legacy oracle 和完整 Copy→Parallel→MMA→Reduce→Global store/重跑/回滚测试保留通过。
+
+三轮独立复审（目标表、guard foundation、整体验收及成本修复复审）已关闭所有重要问题。剩余非阻塞覆盖建议是增加非零且对齐的 alias 起点正例；当前已验证真实 root-relative 计算、地址相位门槛和 descriptor offset 篡改拒绝，不将缺少额外正例写成已测试。Ninja 仍有既有 `premature end of file; recovering` 警告，完整 all-target 已正常完成；此前实验工具的退役接口构建错误已消除。当前源目录 main 的 Task 24/25 修改未 commit/push。
+
+计划中的 `--target=sm_90a --block-m=128 --block-n=128 --block-k=64 --threads=128 --a-space=shared --b-space=shared --dtype=fp16 --ldmatrix` 工具命令也已成功执行，输出经 JSON 检查确有两个 storage layout、MMA contract、accumulator encoding 和可观察的返回结果。`--ldmatrix` 输出退役提示，不代表已选择 ldmatrix 指令。
+
+以下保留原始任务清单；具体实施以上述已确认契约为准。原计划将已存在的 `SM90LayoutTarget.h` 标为 Create，应为 Modify；TF32/I8 枚举不代表这些 MMA 路径已实现。
 
 **Files:**
 
@@ -3890,7 +4128,7 @@ struct TMAContract {
 };
 ```
 
-- [ ] **Step 1: 写已知合法/非法契约红灯测试**
+- [X] **Step 1: 写已知合法/非法契约红灯测试**
 
 至少覆盖 BF16/FP16 WGMMA、A/B major mode、128-thread warp-group、32B/64B/128B swizzle、128B base alignment、TMA box/granularity、ragged fallback。
 
@@ -3898,23 +4136,23 @@ Run: `cmake --build build --target FriskLayoutUnitTests --parallel 32`。
 
 Expected: FAIL，规则表/成本尚不完整。
 
-- [ ] **Step 2: 固化 target 查询**
+- [X] **Step 2: 固化 target 查询**
 
 `SM90LayoutTarget` 从 `#nvvm.target`/DLTI 查询 chip/features；迁移期允许读取 `frisk.target = "sm_90"`，但立即规范化为 target object。通用 Analysis 不允许比较字符串。
 
-- [ ] **Step 3: 实现 WGMMA candidate expansion**
+- [X] **Step 3: 实现 WGMMA candidate expansion**
 
 每条 contract 展开为 accumulator、dot operand、shared storage canonical maps；展开后调用通用 verifier。MMA Attr 只是 contract view，必须能返回 canonical `DistributedEncodingAttr`。
 
-- [ ] **Step 4: 实现 TMA/Copy candidates**
+- [X] **Step 4: 实现 TMA/Copy candidates**
 
 TMA 不合法时保留 cp.async/vector copy candidate；不能把 fallback 当 hard error。Swizzle/padding 必须同时计入 allocation size、bank 和 descriptor legality。
 
-- [ ] **Step 5: 实现 shape-aware target cost**
+- [X] **Step 5: 实现 shape-aware target cost**
 
 成本来自实际 tile volume、transaction、bank、barrier 和资源估计，不使用一个对所有 shape 固定的“WGMMA 永远优先”常数。Static contract 未命中时只删除对应 candidate，不影响仍正确的 fallback。
 
-- [ ] **Step 6: 与现有 layout tool/legacy baseline 差分**
+- [X] **Step 6: 与现有 layout tool/legacy baseline 差分**
 
 Run:
 
@@ -3923,13 +4161,13 @@ cmake --build build --target FriskLayoutUnitTests frisk_layout_tool check-frisk 
 ./build/unittests/Dialect/Frisk/FriskLayoutUnitTests \
   --gtest_filter='SM90ContractTest.*'
 ./build/exp/layout/frisk_layout_tool \
-  --target=sm_90 --block-m=128 --block-n=128 --block-k=64 \
+  --target=sm_90a --block-m=128 --block-n=128 --block-k=64 \
   --threads=128 --a-space=shared --b-space=shared --dtype=fp16 --ldmatrix
 ```
 
 Expected: tests PASS；核心 baseline canonical map 等价；非法 TMA case 仍有合法 fallback。
 
-- [ ] **Step 7: 提交 SM90 规则库**
+- [ ] **Step 7: 提交 SM90 规则库（未执行：本轮明确不自动 commit/push，等待用户另行要求）**
 
 ```bash
 git add include/Dialect/Frisk/Target lib/Dialect/Frisk/Target test unittests
@@ -3937,6 +4175,99 @@ git commit -m "feat: add SM90 layout contract library"
 ```
 
 ### Task 26: 实现 controlled relaxation、conversion hoist 和受控重计算
+
+> **当前状态：方案 A 已完成实现、独立复审与完整验收，实际支持边界见 §26.4，结果见 §26.5。Task25 的“Task26 尚未实施”是此前验收快照，不代表本节最新状态。未 commit/push。**
+
+#### 26.1 已确认设计：方案 A（2026-09-28）
+
+用户确认先将契约写入设计，再进入实现与测试。直接在源目录 main 工作，保留 Task24/25 未提交修改，不创建 worktree，不自动 commit/push。下方旧清单作为历史意图保留，具体以本节契约为准；完成标记已依据最终验收更新。
+
+**Goal:** 在不放宽硬语义的前提下，提供可诊断的有序候选扩展、安全 conversion hoist 和求解阶段计费的共享重计算。
+
+**Architecture:** 普通候选和显式转换/重计算先联合求解；失败用结构化状态分类。仅可证明的空候选域进入从原始图快照开始的独立重试。改写保留 Task24 的有限切片与计划核验，转换优化使用独立事务和实际 IR 验证。
+
+**Tech Stack:** 现有 LLVM/MLIR、C++17、GoogleTest、lit/FileCheck。使用 writing-plans、TDD、subagent-driven-development 与独立代码复审；测试构建统一协调。
+
+#### 26.2 全局契约
+
+1. **普通求解优先。** Task25 的 TMA/cp.async/vector、guarded Copy，以及已有 padding/replication 都保留普通候选身份，不能为制造回退路径而移除。普通方案成功时零 relaxation 尝试。
+2. **失败分类。** 空候选域、硬约束冲突、证明 unknown/unsupported、目标错误、预算耗尽、beam 不完整分别处理；只有有证明依据的空域允许重试。硬编码、SameLayout、alias、ownership、线程数、显式 vector 要求和真实 allocation 容量均不可更改。
+3. **独立有序重试。** 顺序为 Replication、StoragePaddingOrNarrowerVector、GuardedRagged、TMAFallback、WGMMAFallback。每次基于原始图，不带入前次新增候选；准备结束后冻结域，传播只删减。不支持或已经在普通候选内的阶段明确记录，不重复宣称新增能力。WGMMA 没有已实现替代路径时返回 unsupported，不生成虚假 SIMT 契约。
+4. **目标扩展边界。** 新增候选必须通过现有目标/容量/硬关系证明。首版局部 replication 采用有限倍增候选，仍满足既定活跃线程拓扑与唯一写入者；padding 仅使用真实容量内的布局，不扩容 allocation；窄向量不得低于显式硬要求。通用引擎不识别 SM90 芯片字符串。
+5. **记录。** 每次尝试记录阶段、触发变量/约束、原因、新增候选数量、结局；选中方案记录最终 CostEstimate。原问题无解时无基准成本，不能伪造 incrementalCost；有明确基准时以分别非负的 increase/decrease 表示变化，禁止无符号回绕。release IR 不写非必要 debug attr。
+6. **安全提升。** 有限白名单 pure elementwise、已支持且可证明的 broadcast/extend 布局关系可作转换前移；依赖必须支配新位置，不能越过 effects/barrier/未知 region/ownership 边界。循环提升只处理 source 在循环外、执行语义已证明安全的转换；不能仅凭 Pure 移动 shuffle/Shared 通信跨越控制流。无执行域证明时保守保留原位置，不改变 iter_arg/result 关系。改写必须通过实际布局验证并有非劣成本依据。
+7. **共享重计算。** 保留 Task24 的白名单、同块和最多 8 个不同操作限制。相同源、目标布局、切片及可用依赖的多个 use，可共享一次已选克隆；输入转换和切片只计费一次。共享选择进入 solver 计划和计划核验，物化只执行计划，不能事后无条件克隆。跨块/region 共享克隆不扩展。
+8. **原子性。** optimizer 独立运行也先克隆模块，检查 dominance、MLIR verifier 和 actual-layout verifier，再提交；失败保持原 IR。cleanup 不承担修复错误推断的责任。重复执行稳定，无指数克隆。
+
+实现时进一步明确：编码本身也是硬 seed，不能由“没有额外属性”推断可改写。物化只有在原结果未编码、调用方明确启用后续优化时才生成临时 `frisk.inferred_result_layout` 授权；优化器核对它与当前编码一致，结束前移除。默认独立 materialize/infer 不输出该标记；完整事务 pipeline 在内存中传递它。不支持的 broadcast 不新增操作语义；已有 arith extend 使用明确白名单。Shared/shuffle 不跨循环推测执行。
+
+#### 26.3 实施清单与接口
+
+> 执行：按 subagent-driven-development 分工；主 agent 负责 relaxation 与集成、构建和 Gate，独立子任务负责转换提升、共享克隆及复审。用户指定的源目录与长期文档位置覆盖技能的 worktree/独立文档默认值。
+
+- [X] **26-A 结构化求解失败与有序扩展。** 新建 `include/Dialect/Frisk/Analysis/LayoutRelaxation.h`、`lib/Dialect/Frisk/Analysis/LayoutRelaxation.cpp`、`unittests/Dialect/Frisk/Layout/LayoutRelaxationTest.cpp`；修改 `LayoutSolver.h`、`LayoutTarget.h`、`LayoutCandidateSolver.cpp`、`LayoutInfer.cpp`、SM90 target 和 CMake。先验证正常解不重试、预算/unknown/hard conflict 不重试、独立快照与顺序，再实现并回归。
+
+```cpp
+enum class LayoutSolveFailureKind {
+  None, InvalidInput, EmptyDomain, HardConflict, Unsupported,
+  SearchBudget, SearchIncomplete, CostFailure
+};
+struct LayoutSolveFailure {
+  LayoutSolveFailureKind kind = LayoutSolveFailureKind::None;
+  LayoutVarID variable = UINT32_MAX;
+  LayoutConstraintID constraint = UINT32_MAX;
+  std::string reason;
+};
+// 原有调用保持兼容：追加可选输出指针，不依赖诊断字符串分类。
+// solveLayoutGraph(graph, target, options, LayoutSolveFailure *failure = nullptr)
+// attemptControlledRelaxation(graph, target, options, records, failure)
+```
+
+- [X] **26-B 安全 conversion hoist。** 修改 `lib/Dialect/Frisk/Transforms/OptimizeLayoutConversions.cpp`，新增 `test/Transforms/hoist-layout-conversion.mlir` 和独立单元测试。先证明现有 pass 不提升，再实现白名单/成本检查/线程内循环提升/原子验证；负例覆盖 memory/barrier、未知 region、通信转换、非支配输入和 hard encoding。不得把任意 Pure 都视作可移动。
+- [X] **26-C 共享已选重计算。** 修改 `LayoutConversionChoice.cpp`、`MaterializeLayouts.cpp` 与相关单元测试，新建 `test/Transforms/layout-relaxation.mlir`。先断言多个 use 应共享同一 SSA 克隆失败，再在同块组比较共享转换、独立修复和共享重计算三种计划，更新核验与物化缓存。负例覆盖源/目标不同、hard seed、跨块、切片上限与篡改 leader。
+- [X] **26-D 集成与完整 Gate。** 先构建指定目标并运行定向 unit/lit，后运行全量 unit/lit/CTest/Python/tool/API 隔离。独立复审每个实现块和整体契约，修复重要问题后重跑覆盖测试。同步 `layout_inference_design.md`、`layout_inference_strategy_comparison.md` 与本节实际记录；不将未执行项目标为通过。
+
+定向与最终命令：
+
+```bash
+cmake --build build --target FriskLayoutUnitTests frisk-opt frisk_layout_tool -j 12
+build/unittests/Dialect/Frisk/FriskLayoutUnitTests --gtest_filter='LayoutRelaxationTest.*:LayoutConversionChoiceTest.*:LayoutConversionHoistTest.*'
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 /data0/xiebaokang/rocm-llvm-project/build/bin/llvm-lit -sv build/test
+ctest --test-dir build --output-on-failure
+build/unittests/Dialect/Frisk/FriskLayoutUnitTests
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 test/python/legacy_normalization_test.py --build-dir build
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 test/python/legacy_api_boundary_test.py --source-root . --build-dir build
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 test/python/sm90_layout_tool_test.py --build-dir build
+git diff --check
+```
+
+#### 26.4 实际实现边界
+
+- **失败分类与重试。** `LayoutSolveFailure` 不依赖诊断字符串。普通图先验证不变量、准备联合指令/Reduce 支持表，再传播与求解。某处为空不能跳过其他分量的错误；同一分量内仍对非空残余图执行有预算的联合搜索，不能把逐边有支持当作整体有解。残余图仅调用部分赋值成本下界，不为缺失端点的转换/指令计算完整成本，也不产出最终解。无法投影的部分 n 元约束保守返回 Unsupported。未知证明、硬 seed 冲突、预算耗尽、beam 不完整和成本失败均不触发重试。
+- **五级调度不等于五种新增硬件能力。** 每一级从原始快照开始，失败不污染调用方图。SM90 实际新增至多四个有限 replication 提案，寄存器位数相对最小值增加 1/2，保持线程数、覆盖和写入者契约，carrier 数不超过 65536；普通候选中已有的 padding/窄向量、guarded Copy、TMA/cp.async/vector 不重新标成“松弛成果”。指令/Reduce 联合表端点及显式硬编码不由通用扩展器修改；没有新 allocation 扩容或 WGMMA→SIMT lowering。
+- **可核验记录。** 记录触发变量/约束、阶段、提案数、无新候选/拒绝/选中以及原因；选中时附最终九维成本。无可行 baseline 时 `baselineCost` 为空，打印 `baseline=unavailable`，不做无符号成本相减。耗尽时重放原始诊断及附注，并追加重试摘要。
+- **转换前移。** 只接受紧邻的、单结果单 use、一个唯一 Tensor 输入的便宜 elementwise/arith extend；必须有物化器对原本无编码结果的内部授权，显式编码不能被改写。要求依赖支配、相同 shape、成本非劣和实际布局复验；不新建 broadcast 语义。循环提升仅接受循环外来源的线程内 Register 交换，不提升 shuffle/Shared 通信，不越过 effect/barrier/未知 region/Frisk ownership 域。
+- **共享重计算。** 同源、同目标布局、同块的多个 use 比较共享转换、独立修复与共享重计算。共享方案严格改善相关成本才选中，持平保留转换；仍限已有白名单和最多 8 个不同操作。leader/follower、切片与位置由 verifier 重算核对；物化缓存同一实际 SSA，叶子转换和克隆只生成、计费一次。不同源/目标/块不合并。
+- **事务与清理。** 独立 optimizer 也在模块克隆上操作，通过 MLIR 与实际布局验证后才提交；失败不改变原 IR。完整 pipeline 内传递临时授权，结束移除；默认独立 infer/materialize 不泄漏授权标记。未开展 GPU 性能测试，不把静态成本改进等同于运行时间收益。
+
+#### 26.5 验证与复审记录
+
+执行顺序为设计契约 → 失败测试 → 实现 → 定向回归 → 分块及整体复审 → 全量验收。测试不依赖 GPU；有限域测试使用真实求解器，SM90 replication 正例使用真实 encoding 与目标验证器。普通 Copy 的 bulk/guard/fallback lit 另检查没有 relaxation 记录；未用此测试冒充新的硬件回退实现。
+
+复审发现并补回归的问题包括：早遇空域跳过其他分量错误、二元关系 Unknown 被折叠为冲突、空域使无关指令表未准备、已 finalized 图被修改后未经不变量检查、以及同分量中逐边可行但联合不可行的环。最后一项用 `{p,q}`、`{q,r}`、`{p,r}` 的 SameLayout 环复现；修复为有预算的残余联合搜索。随后补测残余 Convertible 的目的端为空时不得误用完整成本 API。耗尽诊断单独保存原始位置和附注，避免后续失败提案覆盖原始证据。
+
+共享重计算覆盖一次计费/一次克隆/同 SSA、叶子转换去重、leader/位置篡改回滚、不同源/目标/块不共享，以及原有硬 seed/8-op 上限。转换提升覆盖单输入/extend/Register 循环正例和显式编码、双输入、通信、effect/barrier、未知 region、非支配输入、MLIR/实际布局验证失败不提交等反例。
+
+**最终结果（2026-09-28）：**
+
+- 显式构建 `FriskLayoutUnitTests frisk-opt frisk_layout_tool` 和默认 all 目标均成功；默认 all 不含 unit 目标，不能用其成功代替单测程序重建。
+- 定向 56/56：17 relaxation、16 conversion choice、11 hoist、12 solver。全量单元测试四分片 90+89+89+89=**357/357**，XML 的 failures/errors 均为 0。新增 Convertible fixture 最终使用真实 SM90 encoding，直接检查原图返回 EmptyDomain、修复后成功；不把 StringAttr 占位 encoding 的错误拒绝当成有效验收。
+- **53/53 lit、4/4 CTest、5/5 Python normalization**；SM90 tool 的 SS/RS 可观察结果与非法目标/多 CTA 拒绝、旧生产接口隔离检查全部通过。现有大 tile MMA、Copy→Parallel→MMA→Reduce→store 整链与 replay 回归保持通过。
+- B/C 分块复审和 A 修复后复审、最终整体源码复审均无剩余 Critical/Important 问题；`git diff --check` 通过。未执行 GPU benchmark、完整异步 lowering 或上游框架性能比较。
+
+全量 unit 使用 `GTEST_TOTAL_SHARDS=4 GTEST_SHARD_INDEX=0/1/2/3` 分别运行测试程序，并写独立 XML；与不分片运行覆盖同一组测试。生产代码最终构建后运行所有分片，测试夹具修正后重建并重跑受影响分片及全部定向测试。日志位于 `/tmp/frisk-task26-final-unit-{0,1,2,3}.{log,xml}`、`/tmp/frisk-task26-focused-final4.log`、`/tmp/frisk-task26-final-lit2.log`；这些临时文件仅作本次证据，长期依据为本节命令、仓库测试及结果记录。
+
+以下为原始清单，WGMMA fallback 和增量成本等表述由上述契约收紧：
 
 **Files:**
 
@@ -3964,7 +4295,7 @@ FailureOr<LayoutSolution> attemptControlledRelaxation(
     SolverOptions options, SmallVectorImpl<RelaxationRecord> &records);
 ```
 
-- [ ] **Step 1: 写 relaxation 顺序红灯测试**
+- [X] **Step 1: 写 relaxation 顺序红灯测试**
 
 覆盖：普通 conversion 候选存在时不进入 relaxation；TMA alignment 不满足选择 cp.async；ragged shape 选择 guarded candidate；WGMMA contract 合法时不得为减少 conversion 回退 SIMT。
 
@@ -3972,32 +4303,38 @@ Run: `cmake --build build --target FriskLayoutUnitTests --parallel 32`。
 
 Expected: FAIL，relaxation records 不存在。
 
-- [ ] **Step 2: 实现严格有序 relaxation**
+- [X] **Step 2: 实现严格有序 relaxation**
 
 仅当普通 candidate domain 为空时依次尝试：replication、padding/窄 vector、guarded ragged、TMA fallback、最后 WGMMA illegal fallback。每一步从原始 graph 快照重建 domain，不能累积未选松弛。
 
-- [ ] **Step 3: 记录原因和增量成本**
+- [X] **Step 3: 记录原因与可核验成本（按确认契约修订，不伪造不可行基准）**
 
 ```cpp
 struct RelaxationRecord {
   RelaxationKind kind;
-  LayoutConstraintID trigger;
-  CostVector incrementalCost;
+  LayoutVarID variable = UINT32_MAX;
+  LayoutConstraintID trigger = UINT32_MAX;
+  uint64_t addedCandidates = 0;
+  RelaxationOutcome outcome = RelaxationOutcome::NoNewCandidates;
   std::string reason;
+  std::optional<CostEstimate> baselineCost;
+  std::optional<CostEstimate> selectedCost;
 };
 ```
 
 诊断/debug IR 可打印 records；release IR 不保留非必要 debug attr。
 
-- [ ] **Step 4: 实现 conversion hoist**
+- [X] **Step 4: 实现 conversion hoist（按 §26.2/26.4 的安全子集）**
 
-允许越过 pure elementwise、broadcast/extend 和 loop-invariant producer；不得越过 memory effects、未知 region、barrier 或 ownership boundary。Hoist 前后都运行 dominance 和 verifier。
+实现已授权的单输入 pure elementwise/extend 前移和 Register loop-invariant conversion 提升；当前没有可用 Tensor broadcast 模型，不新增其语义。不得越过 memory effects、未知 region、barrier 或 ownership boundary；支配、成本与实际布局核验后才提交。
 
-- [ ] **Step 5: 实现受控 rematerialization rewrite**
+- [X] **Step 5: 实现受控 rematerialization rewrite**
 
 只重写 solver 已选择 `Rematerialize` 的 slice；使用 `IRMapping`，共享已有 rematerialized value，避免指数复制；完成后删除死 conversion 并运行 canonicalizer。
 
-- [ ] **Step 6: 验证 relaxation/hoist**
+Task 26 复用 Task 24 同块、每 slice 最多 8 个操作的已选重计算，在求解评分、计划核验和物化缓存中补齐安全的跨 use 共享；不重新无条件搜索/克隆，叶子转换和克隆只计费一次。
+
+- [X] **Step 6: 验证 relaxation/hoist**
 
 Run:
 
@@ -4009,7 +4346,7 @@ cmake --build build --target FriskLayoutUnitTests check-frisk --parallel 32
 
 Expected: PASS；每个 case 的 relaxation kind、conversion count 和位置稳定。
 
-- [ ] **Step 7: 同步设计并提交**
+- [ ] **Step 7: 同步设计并提交（设计已同步；commit/push 未获本轮授权，保留未执行）**
 
 ```bash
 git add lib/Dialect/Frisk test unittests guoqiao/layout_inference_design.md
@@ -4033,7 +4370,83 @@ Expected: exhaustive 小图 oracle、全局成本选择、SM90 contracts、conve
 
 ## M6：正确性、差分测试与性能验收
 
+### M6.1 已确认方案 A 与实施顺序（2026-10-09）
+
+**Goal:** 为现有布局系统建立可复现的性质、差分、真实 conversion 执行与性能证据，不借验收扩大生产语义或削弱已有硬约束。
+
+**Architecture:** Task27 建立独立性质 oracle、确定性与失败复现；Task28 在隔离的固定版本 TileLang 环境导出语义，Frisk 在无 TileLang 运行依赖的测试中读取 corpus；Task29 聚合真实统计、CPU benchmark 和经过实际 adapter 的 GPU conversion 路径，按明确适用域判定 Gate。三个 Task 顺序推进，每个 Task 单独进行代码/契约复审，修复重要问题后再进入下一项。
+
+**Tech Stack:** 现有 C++17、LLVM/MLIR、GoogleTest、lit/FileCheck、LLVM JSON；隔离 Python/TileLang 参考环境；可选 CUDA 12.8、SM90 与 compute-sanitizer。默认构建不增加 CUDA 或 TileLang 依赖。
+
+源目录直接实施，保留 Task24–26 及报告的未提交修改，不使用 Frisk worktree，不自动 commit/push。长期方案直接维护本文、设计总文档和策略比较文档；原各 Task 的提交步骤只在用户另行授权后执行。
+
+**审计起点：** Task26 的记录为 357 unit / 53 lit / 4 CTest / 5 Python normalization；这不是本轮已重跑的结果。2026-10-08 只读环境检查确认两张 H100 PCIe、compute capability 9.0、driver 580.178.04、nvcc 12.8。沙箱内 NVML 不可访问，沙箱外只读查询成功；实际 GPU 测试仍需对应执行权限。固定 TileLang `5e149e31674658f94779c7d0c6039549a1853123` 源码已找到，但缺少子模块初始化及构建产物。`TestLayoutConversionLowering.cpp` 仍有 Tensor↔vector 的 `UnrealizedConversionCastOp`，不能当成已完成可执行 lowering。
+
+### M6.2 三处原提纲修订
+
+1. **256 的含义。** 与 §23.4 一致，去重/硬剪枝后的组合数不超过 256 才默认精确搜索，超过则 beam32；每组件每次尝试最多 65536 次扩展。分别记录单变量域、组件组合乘积、frontier 和扩展数，不把它们混成 `peakComponentCandidates`。乘积溢出单独标记，不静默截断到 256；指令/alias/Reduce 自身证明预算不因此放宽。
+2. **差分并不要求支持上游全部功能。** 共同支持域比较实际坐标语义；Frisk 明确不支持的 dtype-changing view、一般非二次幂 Tensor/broadcast、PartialFragment 等作为单独的 expected-rejection 用例，核对既有边界和诊断，不悄悄实现新语义。合法的多个同值持有者不是错误；重复载体记录、冲突载体映射和非法写入者才是错误。
+3. **编译占比必须有真实分母。** 对受支持可执行用例，计时覆盖输入 IR 到最终可加载 GPU 产物的实际编译流程；分子包含该次流程的布局候选准备、传播/搜索、物化、布局优化及验证，不仅是 solver。外部依赖构建、测试、故意等待、无关 kernel 编译和 GPU 执行不进入分母。没有完整编译路径的用例只报告各阶段耗时，不能写成 10% 门槛通过。
+
+3% runtime 回退、10% 布局编译占比门槛不变。若实测失败，记录失败、定位并在已批准范围内改进；不得通过修改阈值、删除失败用例或伪造 baseline 让 Gate 变绿。
+
+### M6.3 性质与差分的共同证据规则
+
+- 测试生成器固定 seeds `{1, 7, 42, 20260816}`；输出 seed、case 编号、稳定变量/约束身份及首个反例，不输出地址，不依赖 DenseMap 顺序。
+- GF(2) 矩阵性质使用独立逐位枚举检查，不用同一生产 compose/inverse 实现同时生成期望与被测结果。不可逆或非满行秩必须拒绝相应 inverse/rightInverse 请求，不能丢弃失败样例只保留成功矩阵。
+- 小图 oracle 独立枚举完整赋值，核验全部硬关系和九维成本。exact 或未发生截断的搜索才检查固定域最优性；有截断的 beam 仅承诺合法性和稳定结果，不能把它未找到解当成已证明无解。
+- 图扰动仅改变变量/约束/候选的插入顺序，保留稳定语义身份；不能通过随意交换有依赖或有副作用的 IR 操作构造“等价程序”。canonical 输出排除时间、地址和枚举顺序噪声，但不能去掉实际赋值、binding 或边界计划差异。
+- 缩减只接受保持同一结构化 failure signature 的合法重放用例。稳定尝试删除 constraint、variable、candidate 至不动点，得到在这些单步删除操作下的 1-minimal 结果，不承诺全局最小。无悬空 SSA/use/alias/region 端点；重编号后仍保留可比的稳定身份；非法图不能替代原始语义反例。
+- corpus 内容必须来自运行 pinned TileLang 语义对象后的枚举。拒绝用 Frisk 输出填充期望值、从当前默认 site-packages 导入另一版本、或手抄公式冒充实际导出。独立 reference 环境不写入用户现有 TileLang checkout。
+
+### M6.4 GPU 与基线的共同证据规则
+
+- `inferred_*` 必须由 Frisk 输入和实际 conversion adapter 产生；先消除占位 Tensor/vector 桥接，使用真实 tile load/store 与每线程 vector 传输，再 lower 到可执行 GPU 产物。不得用第二套手写 CUDA 分配公式替代 adapter；生成链需记录输入、编译命令和产物 hash。
+- `reference_*` 为独立实现，与 inferred 路径共用输入、输出解释和校验器；身份、warp shuffle、跨 warp Shared exchange 三类至少各有一个实际执行用例。先验证输出，再做 memcheck/racecheck/synccheck；工具缺失、权限失败或 case 未执行均不是通过。
+- Shared 路径保留已证明的唯一写入者、容量、对齐和 uniform barrier 义务。不能仅验证最终输出就声称无 race/OOB，不能将某个测试的无错误推广到任意程序。
+- GPU 热身 100 次、测量 1000 次；CPU solver 热身 5 次、测量 30 次。记录原始样本、median/p95、硬件 UUID/驱动/toolkit、编译 flags、时钟策略和是否有其他负载。计时区间不打印 IR；正确性/安全工具时间不混入性能时间。
+- baseline 来自相同环境下独立 reference kernel 的测量；环境或 case manifest 不匹配返回不可比较，不自动覆盖 baseline。首次记录保留为待复审证据，经过性能评审后才能作为接受基线；缺失基线不填 0，也不把 inferred 首次结果作为 reference。
+- 当前源码有未提交修改，仅记录 Git HEAD 不足以复现，产物记录须同时包含相关源码/输入/配置的内容摘要。使用独立 Release 构建目录 `build-m6-release`，不把现有 Debug `build` 原地改成 Release；不自动更改 GPU 时钟、功耗或终止他人进程。
+- WGMMA/TMA 只有静态契约的路径不纳入虚构 runtime 基线；其静态验证状态与 conversion adapter 的真实 GPU 状态分开列出。
+
+### M6.5 完成条件与记录方式
+
+- [x] 用户确认方案 A 和上述原提纲口径修订。
+- [x] 同步本文、设计总文档与比较文档中的契约口径。
+- [x] Task27 实现、局部回归与独立复审完成。
+- [x] Task28 真实导出、重导出字节一致、比较/预期拒绝测试及独立复审完成。
+- [x] Task29 CPU、GPU 正确性/安全、runtime、适用域完整编译占比及独立复审完成。
+- [x] 全量构建/CTest/lit/unit/Python/API 隔离重跑；逐项填写 `guoqiao/layout_inference_acceptance.md`。
+
+验收记录每项必须为 PASS、FAIL、BLOCKED 或明确的 OUT_OF_SCOPE，附命令、适用 case、原始产物和原因。OUT_OF_SCOPE 仅用于事先排除的生产能力，不能用于掩盖 M6 必需的三个 conversion case 或真实 TileLang 导出未运行。总体 M6 Gate 缺一项证据即保持未完成，不因 CPU 通过、工具代码写完或 GPU 可见而标完成。
+
 ### Task 27: 建立 property、随机图和确定性测试
+
+#### 27.1 本轮实施契约
+
+本 Task 不新建第二套生产布局推断器。测试复用 `GF2Matrix`、布局 map 接口、`solveLayoutGraph`、`attemptControlledRelaxation` 和 verifier；独立 oracle 仅在测试支持库中存在。
+
+实施分为三个可独立验收的单元：
+
+1. **27-A 代数性质。** 新增 `LayoutPropertyTest.cpp`，对每个 seed 至少生成 32 个最多 8 input bits 的矩阵/布局样例，枚举有限输入核验恒等、组合、逆、右逆、canonicalize 幂等与 Product 分阶段求值。覆盖奇异矩阵、非满射及形状不匹配的拒绝，输出最小坐标反例。修改单元测试 CMake 后先确认缺失测试能力或故意破坏性质能触发失败，再补齐测试/必要修复并运行局部测试。
+2. **27-B solver 与确定性。** 新增 `LayoutSolverPropertyTest.cpp`；每 seed 至少 16 张最多 8 vars/16 constraints 的小图，最多 4 candidates/var（穷举最多 65536 赋值）。每图 20 次打乱插入顺序，对照独立 oracle；精确 oracle 测试显式配置足够搜索预算，另设默认 exact256/beam32/65536 边界用例。覆盖 empty、hard conflict、Unknown、SearchBudget、SearchIncomplete、CostFailure，保持 Task26 的重试资格。新增 diagnostics/determinism lit，检查稳定诊断和跨进程布局 IR 字节一致。
+3. **27-C 重放与缩减。** 新增 `tools/layout-reduce/{CMakeLists.txt,layout-reduce.cpp}` 及相邻的测试支持序列化/缩减模块、`LayoutFailureReductionTest.cpp`。输入包含 schema、seed、options、稳定变量/候选/关系描述和 failure signature；需要 SSA/use/alias/region 信息时同时保存宿主 MLIR，以稳定操作路径重建引用，禁止序列化指针。共同 parser 服务 unit 和 CLI，不复制解析逻辑；不支持的 payload 明确拒绝，不能丢弃字段后声称可重放。测试覆盖 round-trip、错误 schema/引用、不同失败类别不得替换、缩减幂等和删除不再能缩小。
+
+缩减的原提纲接口保留为内部算法入口，但工具必须同时拥有宿主 IR 和序列化元数据；仅返回含裸指针的 graph 不是完整文件格式。所有删除操作先重建并验证图，再运行 oracle/失败谓词。必要的支持代码放在 `tools/layout-reduce/` 的独立 library target，不将测试 target 或假成本模型链接进生产 `FriskAnalysis`。
+
+典型回归断言为：
+
+```cpp
+// GF2Matrix::compose 的方向是 lhs(rhs(x))。
+ASSERT_TRUE(succeeded(composed));
+EXPECT_EQ(composed->apply(x), lhs.apply(rhs.apply(x)));
+// 生产 solver 的 exact 结果对比独立全赋值枚举，而不是第二次调用生产 solver。
+ASSERT_TRUE(succeeded(solution));
+EXPECT_FALSE(solution->cost.cost < oracleCost);
+EXPECT_FALSE(oracleCost < solution->cost.cost);
+```
+
+局部命令使用下方 Step5；补充 `--gtest_filter='LayoutFailureReductionTest.*'` 及 CLI round-trip lit。诊断中的空原始域允许以结构化 `EmptyDomain` 加变量/provenance 记录表达，不伪造一个从未存在的“被拒候选”。
 
 **Files:**
 
@@ -4043,6 +4456,10 @@ Expected: exhaustive 小图 oracle、全局成本选择、SM90 contracts、conve
 - Create: `test/Transforms/layout-determinism.mlir`
 - Create: `tools/layout-reduce/CMakeLists.txt`
 - Create: `tools/layout-reduce/layout-reduce.cpp`
+- Create: `tools/layout-reduce/LayoutFailureCase.h`
+- Create: `tools/layout-reduce/LayoutFailureCase.cpp`
+- Create: `unittests/Dialect/Frisk/Layout/LayoutFailureReductionTest.cpp`
+- Modify: `unittests/Dialect/Frisk/Layout/CMakeLists.txt`
 - Modify: `tools/CMakeLists.txt`
 
 **Interfaces:**
@@ -4062,7 +4479,7 @@ reduceFailingLayoutGraph(const LayoutConstraintGraph &graph,
                          function_ref<bool(const LayoutConstraintGraph &)> fails);
 ```
 
-- [ ] **Step 1: 写会暴露顺序问题的随机测试**
+- [x] **Step 1: 写会暴露顺序问题的随机测试**
 
 固定 seeds `{1, 7, 42, 20260816}`，生成最多 8 input bits、8 vars、16 constraints 的可枚举小图；对每张图执行 20 次稳定 shuffle，并比较 canonical solution dump。
 
@@ -4070,7 +4487,7 @@ Run: `cmake --build build --target FriskLayoutUnitTests --parallel 32`。
 
 Expected: 在最小化工具和完整确定性保障实现前，测试应至少缺少目标或失败。
 
-- [ ] **Step 2: 增加代数 properties**
+- [x] **Step 2: 增加代数 properties**
 
 必须验证：
 
@@ -4083,15 +4500,15 @@ canonicalize(canonicalize(A)) == canonicalize(A)
 Product evaluation == outer/inner staged evaluation
 ```
 
-- [ ] **Step 3: 增加 solver properties**
+- [x] **Step 3: 增加 solver properties**
 
-小图与 exhaustive solver 比较合法性和最小 CostVector；所有 hard constraint 在 solution 上重新执行；空 domain 必须有至少一个 rejection/provenance record。
+小图与独立穷举 oracle 比较合法性和最小 CostVector，最优性断言仅适用于 exact/未截断搜索；所有 hard constraint 在 solution 上重新执行；空 domain 必须有结构化失败与变量/provenance 记录，不能凭空编造候选拒绝。
 
-- [ ] **Step 4: 实现失败图最小化**
+- [x] **Step 4: 实现失败图最小化**
 
-按稳定顺序尝试删除 constraint、var、candidate，保留仍触发同一 failure signature 的最小子图；输出可被 unit test parser 重新加载的文本，不输出地址。
+按稳定顺序尝试删除 constraint、var、candidate，保留合法且仍触发同一 failure signature 的子图，迭代至 1-minimal；输出可被共享 parser 重新加载的文本，不输出地址，不承诺全局最小。
 
-- [ ] **Step 5: 验证 diagnostics 和 determinism**
+- [x] **Step 5: 验证 diagnostics 和 determinism**
 
 Run:
 
@@ -4103,27 +4520,57 @@ cmake --build build --target FriskLayoutUnitTests layout-reduce check-frisk --pa
 
 Expected: 所有固定 seed PASS；重复执行 canonical output 字节相同。
 
-- [ ] **Step 6: 提交 property suite**
+- [ ] **Step 6: 提交 property suite（本轮不自动执行，等待另行授权）**
 
 ```bash
 git add unittests test tools
 git commit -m "test: add layout property and determinism coverage"
 ```
 
+#### 27.2 实施与独立复审（2026-10-09）
+
+已新增代数、solver、失败重放三组共 16 项单测以及 diagnostics/determinism/reduce 三项 lit。四 seeds 各 32 个矩阵、32 个 Product 样例逐点枚举；四 seeds 各 16 张有限图，每图 20 次插入顺序扰动，以独立全赋值 oracle 比较九维成本，另外分别检查九字段可决定最优值、默认 exact/beam 边界和非重试失败。精确 oracle 专用配置不改变生产默认预算。
+
+`evaluateLayoutMap` 是已有私有求值器的公开包装，不新增布局语义。失败工具 schema1 明确限定 `finite-same-require-v1`，最多 8 vars/16 hard SameLayout 或 RequireEncoding/4 字符串候选；零成本测试 target 与生产库隔离。CLI 与单测共享 parser，保存宿主 MLIR、稳定身份和结构化 failure signature。指令表、SSA/use/alias/region、Convertible 或硬件成本载荷明确拒绝，不宣称完整 GPU 图可重放。所有合法单步删除迭代至 1-minimal，不承诺全局最小。
+
+局部证据：`cmake --build build --target FriskLayoutUnitTests layout-reduce check-frisk --parallel 12` exit0，56/56 lit。独立复审发现 raw reducer 重建时可能丢失候选 ordinal，已先用两个红灯反例复现，再保留稳定候选身份，并检查重建起点及最终返回图仍满足谓词；增加第三个规范化敏感拒绝测试。修复后包含 16 项新增测试的 45/45 focused unit 和 3/3 受影响 lit 通过，复审结论 spec/quality PASS。日志 `/tmp/frisk-task27-review-{red,green-unit,green-lit}.log`，复审 `/tmp/frisk-m6-task27-review.md`。随后主代理全量重跑 373/373 unit（四分片 94+93+93+93）及 56/56 lit 均 exit0，日志 `/tmp/frisk-task27-full-unit-{0,1,2,3}.{log,xml}`、`/tmp/frisk-task27-full-lit.log`。Task27 已完成；Task28/29 和 M6 最终 Gate 仍未完成，未 commit/push。
+
 ### Task 28: 建立固定 TileLang 语义差分 corpus
+
+#### 28.1 本轮实施契约
+
+本 Task 必须真实构建并执行 pinned TileLang，不以源码阅读或从 Frisk 生成的 JSON 代替语义导出。采用隔离 reference checkout、隔离 Python 环境和精确依赖版本；执行前核对 HEAD、工作区状态、submodule revision、Python 模块路径和实际加载 native library 路径。不修改用户现有 TileLang checkout，也不把 TVM/TIRX 链入 Frisk。
+
+首版 schema 使用版本 2，替代下方历史 v1 提纲；必需字段为 `schema_version`、完整 `tilelang_commit`、依赖 revisions、exporter/source digest、cases。每 case 必须记录稳定 name、operation/shape/dtype、carrier extents、枚举后的 distributed/storage bit coordinates，以及 `frisk_expectation`：
+
+- `equivalent`：Frisk 构建实际布局/契约并枚举对比，不能直接把 corpus 坐标作为 Frisk 的输出。比较 coverage、逻辑持有者集合、同值 copy group、有效域及按所声明策略选出的 writer。存在多个合法 owner 策略时比较策略兼容性，不伪造上游没有暴露的 writer 选择。
+- `reject`：记录既有不支持原因及稳定诊断类别；Frisk 必须实际拒绝对应输入，不能仅因 JSON 标注 reject 就算通过。单独统计，不计入语义等价通过数。
+
+输入和结果的完成值/部分贡献必须区分。PartialFragment 若仅用于 expected-rejection，不要求 Frisk 新增表示；不能将 addends 作为普通副本比较。reader 拒绝重复 case、重复物理 carrier、同一 carrier 冲突映射、越界 bit offset、错误覆盖及写入者，但允许由明确同值 copy group 解释的多个逻辑点持有者。
+
+实施步骤与 Gate：
+
+1. **28-A reader 与反例。** 新增 corpus reader/测试支持模块及 `TileLangDifferentialTest.cpp`，先用 schema 错误、revision 错误、carrier 冲突、合法复制、位偏移越界的最小 JSON 做失败/成功测试；parser 不执行 JSON 中的命令或路径。
+2. **28-B exporter 与真实 corpus。** 新增 `export_tilelang_layouts.py`；在单独子进程导入 pinned 模块，逐项构造下面 Step3 的用例、枚举、排序后写 JSON。审计日志另存，时间戳和临时绝对路径不进入 canonical corpus。两次导出用 `cmp` 比较完全一致；失败不覆盖已有 corpus。
+3. **28-C Frisk 差分与范围记录。** 共享支持域至少覆盖 FP16/BF16 SM90 GEMM、linear/transpose/32B/64B/128B Shared、Copy vector width、dim0/1 Reduce 和静态 guarded Copy；其余类别逐项判定等价或预期拒绝，不能遗漏。首个不一致输出 logical/carrier 坐标、bit offset 或 owner 反例。完成 `guoqiao/tilelang_layout_reference.md`，记录采用与不采用的语义、重导出命令和升级规则。
+
+测试在不安装 TileLang 的普通 Frisk CI 中读取已经审计的静态 JSON；exporter 的来源验证/错误路径另以 Python 测试覆盖。若固定版本暂时构建不出，Task28 保持 BLOCKED，不提交手填 corpus 冒充完成。
 
 **参考版本决策（2026-09-12）：** 本任务尚未执行。以下 schema/exporter/命令的拟定主基线升级为本轮审计的 `5e149e3`；这不是已经更新或运行了 corpus。旧 `6623b12` 可另存带版本标签的历史回归，不混入新版 schema。PartialFragment/combine 语义若纳入 corpus，须先扩展 schema 区分 addends 与同值 copy groups；不得继续仅以 replication 数字代表全部语义。
 
 **Files:**
 
 - Create: `tools/layout-reference/export_tilelang_layouts.py`
+- Create: `unittests/Dialect/Frisk/Layout/TileLangCorpus.h`
+- Create: `unittests/Dialect/Frisk/Layout/TileLangCorpus.cpp`
+- Create: `test/python/tilelang_exporter_test.py`
 - Create: `test/Dialect/Frisk/layout/Inputs/tilelang_layout_corpus.json`
 - Create: `unittests/Dialect/Frisk/Layout/TileLangDifferentialTest.cpp`
 - Create: `guoqiao/tilelang_layout_reference.md`
 
 **Interfaces:**
 
-- Corpus schema：
+- 历史 corpus schema v1 提纲（实现使用 §28.1 的 v2，下面的空数组不是可接受的验收数据）：
 
 ```json
 {
@@ -4146,15 +4593,15 @@ git commit -m "test: add layout property and determinism coverage"
 
 测试只读取提交到仓库的 JSON，不要求 CI 安装 TileLang。
 
-- [ ] **Step 1: 写 corpus reader 红灯测试**
+- [x] **Step 1: 写 corpus reader 红灯测试**
 
-测试拒绝 schema 版本错误、commit 不匹配、重复 logical point owner 和越界 storage offset。
+测试拒绝 schema 版本错误、commit 不匹配、重复物理 carrier/冲突映射和越界 storage bit offset；由同值 copy group 明确解释的合法多个 owner 必须接受。
 
 Run: `cmake --build build --target FriskLayoutUnitTests --parallel 32`。
 
 Expected: FAIL，corpus/reader 尚不存在。
 
-- [ ] **Step 2: 实现固定版本 exporter**
+- [x] **Step 2: 实现固定版本 exporter**
 
 脚本启动时执行：
 
@@ -4171,7 +4618,7 @@ if actual != expected:
 
 Exporter 输出枚举语义，不输出 TileLang Attr 文本或 Python 对象 repr；JSON key 排序、数字格式稳定。
 
-- [ ] **Step 3: 生成首批 corpus**
+- [x] **Step 3: 生成首批 corpus**
 
 至少包含：
 
@@ -4187,34 +4634,28 @@ unused/floating fragment
 owner compatibility
 ```
 
-不得直接从 `/home/baopeihua/tilelang` 当前 checkout 导入模块，也不假定其中已有新版对象。在独立 reference clone 中获取 pinned commit，再创建 detached worktree；clone 的 main 不作为语义参考，exporter 必须检查 worktree 的精确 `HEAD`。以下路径是任务实施时新建的示例，已存在时先检查而非覆盖：
+不得直接从 `/home/baopeihua/tilelang` 当前 checkout 导入模块，也不假定其中已有新版对象。在独立 reference clone 中 checkout pinned commit，不创建 Frisk 或参考 worktree；exporter 必须检查精确 `HEAD`、依赖和实际加载路径。以下路径是任务实施时新建的示例，已存在时先检查而非覆盖：
 
 ```bash
 git clone --no-checkout https://github.com/tile-ai/tilelang.git \
-  /tmp/tilelang-layout-reference-repo
-git -C /tmp/tilelang-layout-reference-repo worktree add --detach \
-  /tmp/tilelang-layout-reference-5e149e3 \
+  /tmp/frisk-m6-tilelang-reference
+git -C /tmp/frisk-m6-tilelang-reference checkout --detach \
   5e149e31674658f94779c7d0c6039549a1853123
 python tools/layout-reference/export_tilelang_layouts.py \
-  --tilelang /tmp/tilelang-layout-reference-5e149e3 \
+  --tilelang /tmp/frisk-m6-tilelang-reference \
   --revision 5e149e31674658f94779c7d0c6039549a1853123 \
   --output test/Dialect/Frisk/layout/Inputs/tilelang_layout_corpus.json
 ```
 
-Expected: exporter 成功，第二次执行产生完全相同文件。生成和审计结束后可执行：
+Expected: 完成固定依赖构建后的 exporter 成功，第二次执行产生完全相同文件。reference checkout 保留用于复核，不自动删除。上述命令仅展示版本与导出入口，完整依赖构建命令在实际 reference 文档中记录，不能省略构建而宣称运行成功。
 
-```bash
-git -C /tmp/tilelang-layout-reference-repo worktree remove \
-  /tmp/tilelang-layout-reference-5e149e3
-```
+Exporter 还必须把 pinned checkout 插入独立 Python 进程的首个 import path，并拒绝从系统 site-packages 导入 TileLang；启动日志打印实际模块/native library 路径和 commit，文档审计时一并核对。
 
-Exporter 还必须把 pinned worktree 插入独立 Python 进程的首个 import path，并拒绝从系统 site-packages 导入 TileLang；启动日志打印实际导入模块路径和 commit，文档审计时一并核对。
-
-- [ ] **Step 4: 实现语义比较**
+- [x] **Step 4: 实现语义比较**
 
 Frisk 对每个 case 枚举 canonical map，比较 coverage、logical ownership、replication、writer owner 和 storage bit offset。允许不同构造文本，只比较语义；失败打印首个 carrier/logical coordinate 反例。
 
-- [ ] **Step 5: 运行差分测试**
+- [x] **Step 5: 运行差分测试**
 
 Run:
 
@@ -4224,9 +4665,9 @@ cmake --build build --target FriskLayoutUnitTests --parallel 32
   --gtest_filter='TileLangDifferentialTest.*'
 ```
 
-Expected: corpus 全部 PASS。
+Expected: 所有 equivalent case 语义比较 PASS，所有 reject case 的实际拒绝符合预期；两类分别报告，不把拒绝项计成已支持功能。
 
-- [ ] **Step 6: 记录参考策略并提交**
+- [x] **Step 6: 记录参考策略（文档已完成；以下 commit 等待另行授权，未执行）**
 
 `guoqiao/tilelang_layout_reference.md` 记录 commit、schema、重新生成命令、采用/拒绝的语义和更新审计流程。
 
@@ -4237,7 +4678,72 @@ git add tools/layout-reference test/Dialect/Frisk/layout/Inputs \
 git commit -m "test: add pinned TileLang layout corpus"
 ```
 
+#### 28.2 实施结果（2026-10-09，独立复审通过）
+
+隔离参考 `/tmp/frisk-m6-tilelang-reference` 已真实构建并运行 pinned TileLang `5e149e31674658f94779c7d0c6039549a1853123`、TVM `907a88c8791ccf33b9874821bc875e7abf624367` 及全部固定递归依赖。原用户 TileLang checkout 未修改；独立 venv 使用 FFI 0.1.12，并逐项核验 Python 依赖、实际加载模块及 native library 路径/摘要。默认 Frisk 构建仅使用静态 JSON，无 TileLang/TVM 链接依赖。
+
+实际 corpus 共 23 个 case：20 个等价比较、3 个真实拒绝，覆盖四个 FP16/BF16 WGMMA A/C、五种 Shared、三种 Copy vector width、两个 Reduce 轴的输入/结果、owner/floating/unused、静态 guarded Copy，以及非二次幂 Tensor、dtype view、PartialFragment 的拒绝边界。Copy/Reduce/guard/floating 使用 native LayoutInference；GEMM 使用 native emitter。floating 比较上游推断结果和 Frisk 显式 canonical map，不宣称默认选择策略相同；unused 测试明确 seed 的保留。writer 是显式兼容策略，不伪称上游固定选出了该 writer。
+
+reader 严格检查 schema/revision、完整载体覆盖、同值 copy groups、partial addends、位地址、writer 及资源边界；Frisk 布局由独立构造和实际 proof 验证，坐标表仅作期望数据。局部 9/9 C++ tests（其中一个枚举全部 23 case）、12/12 无 site-packages Python tests、5/5 CTest 及旧生产接口隔离检查通过。全量 382/382 unit（96+96+95+95）及 56/56 lit 通过，日志 `/tmp/frisk-task28-full-unit-{0,1,2,3}.{log,xml}`、`/tmp/frisk-task28-full-lit.log`。
+
+独立复审发现 exporter 在 audit 写入失败或输出路径重叠时可能破坏旧 corpus。先以回归测试复现，修复为校验目标身份、暂存并 fsync 两份输出、先发布 audit、最后替换 corpus；清理错误不会在替换 corpus 后误报导出失败。不承诺两个文件的原子事务：最后的 corpus rename 失败时旧 corpus 保留，较新的 audit 可由摘要识别不匹配。复审 spec/quality PASS，无未关闭的重要问题，见 `/tmp/frisk-m6-task28-review.md`。
+
+修复后再次执行两次真实导出，corpus 和 audit 分别 `cmp` exit0；最终 corpus SHA-256 `bb4a69f647305e9017ecdbb063e87a1a4cf39ec33cf5ee77ec0dd3936842fd44`，exporter SHA-256 `5ebad2735a4fa6368b4901dd518fee73fcc4aa7ff2f9e204b134f68cac9e7453`。源码、依赖、命令和范围见 `guoqiao/tilelang_layout_reference.md`；修复与导出证据 `/tmp/frisk-m6-task28-i1-*.log` 和 `/tmp/frisk-m6-tilelang-export.audit.json`。Task28 完成，不代表 GPU benchmark 或 M6 最终 Gate 通过；未 commit/push。
+
 ### Task 29: 建立性能、编译开销守门并完成系统验收
+
+#### 29.1 本轮实施契约
+
+本 Task 分为四个可单独验收的单元；下方原 Steps 是目录级清单，本节明确计量和执行边界。
+
+**29-A 统计与 CPU benchmark。** 修改 `LayoutInfer.cpp`、`LayoutCandidateSolver.cpp`、`LayoutSolver.h`、`Passes.td` 及具名 pipeline 的选项传递；新增 `LayoutStatistics.h/.cpp`、`LayoutStatisticsTest.cpp` 和 `test/Transforms/layout-statistics.mlir`。统计以同一输入的一次尝试/最终计划为边界，重试有独立 attempt 记录，不把原始候选、重试提案和选中域混加。公开以下无歧义字段：
+
+```cpp
+struct LayoutStatistics {
+  uint64_t variables = 0, constraints = 0, components = 0;
+  uint64_t preparedCandidates = 0, prunedCandidates = 0;
+  uint64_t peakVariableDomain = 0;
+  uint64_t peakComponentCombinations = 0;
+  bool componentProductOverflow = false;
+  uint64_t peakFrontierStates = 0, expandedStates = 0;
+  uint64_t conversionUseEdges = 0, uniqueConversions = 0;
+  uint64_t rematerializationUseEdges = 0, uniqueRematerializations = 0;
+  uint64_t conversionBytes = 0;
+  uint64_t estimatedBankConflicts = 0, estimatedMemoryTransactions = 0;
+  std::chrono::nanoseconds solveTime{0};
+};
+```
+
+`preparedCandidates` 为该 attempt 搜索前去重后的域总量，`prunedCandidates` 为该 attempt 准备快照到搜索域的实际删减；原始生成提案数、各阶段传播/搜索/物化/优化/验证耗时另记录在 JSON 的 preparation/attempts/timings 对象。组件组合数是域乘积而非内存中的候选计数，溢出使用 flag/字符串或空数值表达，不回绕。frontier 统计实际保留的 frontier，MRV probes 和扩展节点单独计数。
+
+转换 use 边数与实际唯一转换数分开；共享转换/共享重计算按经核验的 leader 去重计费，不将两个 use 当成两次物理搬运。失败 JSON 含结构化 failure kind 和稳定变量/约束身份，不捏造成功解、零成本或完成比例。
+
+输出选项为 infer pass 的 `stats-file`，示例 `--frisk-infer-layouts='stats-file=/tmp/frisk-m6-stats.json'`；完整 pipeline 显式传递同一选项。默认不写文件；完整 pipeline 的统计区分已求解、已物化和已提交，不能在后续失败时留下“最终成功”记录。临时文件写完再替换指定输出，写入失败是可诊断错误，不影响原 IR；不新增未经用户选择的隐式落盘路径。
+
+CPU benchmark 使用含 10/50/100/250 个实际布局相关操作的固定 IR corpus，包含小组件和真实相连的 producer/use 图；不把 250 个孤立常量当成唯一大图样例。分别测收集、候选准备、求解与完整布局 pipeline，预热 5 次、测量 30 次，报告 median/p95、稳定解 hash、组合数、frontier 和扩展数。打印/JSON 序列化在计时区间外，生产默认搜索配置不为跑分改成单候选或绕过证明。
+
+**29-B 最小可执行 conversion adapter。** 修改 `lib/Conversion/FriskLayoutToGPU/TestLayoutConversionLowering.cpp` 及必要的相邻 helper，补真实 tile load/store 到每线程 vector 的 ABI；新增 `test/Conversion/layout-conversion-executable.mlir`、adapter 回归单测和 benchmark 生成入口。生成入口保存原始 Frisk IR、adapter 结果、lower 后 IR 与最终 PTX/cubin 的 hash、生成命令和编译 flags。它可以复用现有 `planRedistribution`，但 inferred 路径必须运行实际 adapter 生成逻辑，不能只调用 planner 后手写另一套 kernel。
+
+最小首批 runtime case 均为静态单 CTA F32，分别覆盖 identity、32-thread warp shuffle、至少 64-thread 的跨 warp Shared exchange；补充已有 payload transport 支持类型的数值/位模式回归，但不因此承诺这些类型都有完整性能 baseline。适配器输入只能是已验证布局/容量/线程拓扑，最终 GPU 编译产物不得残留 Tensor/vector `UnrealizedConversionCastOp`、未解析 Frisk 布局或占位调用。无完整 lowering 的 MMA/TMA 不进入该测试生成入口。
+
+参考 kernel 必须独立于 inferred adapter 的源/目的查找表，按明确坐标定义实现并由相同语义校验器比较。使用非全零、非全同值的输入区分元素，验证多组固定 seeds、边界值及合法复制；不能用常量数据掩盖错误映射。Shared scratch 正确计量与对齐、唯一 writer、uniform barrier 由静态检查加 GPU memcheck/racecheck/synccheck 联合验证。若 adapter 因动态 lookup 导致慢于 reference，应定位并优化该受限 adapter，而非将 reference 改慢。
+
+**29-C runner、基线与完整编译。** 新增 `benchmark/layout/run_layout_benchmarks.py` 和独立 Python runner 测试。runner 接受 solver 和 conversion 工具输出，验证 schema、case manifest、环境、成功状态、非空样本、正的有限时间值、重复 case、产物 provenance。每个适用 case 单独计算：
+
+```python
+runtime_ok = inferred_median_ns / reference_median_ns <= 1.03
+compile_ok = layout_pipeline_ns / full_compile_ns <= 0.10
+```
+
+runtime 逐 case 判定，不用所有 kernel 的平均值掩盖某项回退。布局计时包含收集/准备/传播/搜索/重试/物化/转换优化/布局验证；完整编译从同一 Frisk 输入进入编译驱动开始，到其 GPU 产物生成完成结束。两者属于相同编译样本，工具预先构建；禁止在分母加入依赖安装、reference 编译、故意等待、GPU 执行或无关工作。默认使用无产物缓存命中的独立编译，若使用缓存，另建有明确标签的实验，不能混算。
+
+`--cpu-only --check` 模式报告局部 Gate，不要求 GPU baseline；非 CPU-only 的 `--check` 模式要求全部预先列明的 GPU case、产物、安全与编译证据，缺项返回未完成而不是默认通过。runner 测试通过固定的人工 JSON 输入覆盖恰好 1.03/0.10、超过阈值、环境不匹配、缺失基线、零时间、NaN/Infinity、case 缺失和推断/参考来源混淆；这些测试数据不得进入真实 baseline。
+
+`sm90_layout_baseline.json` 仅在 reference 实测及评审后生成/更新，不预置虚构的 runtime 数字；先保存待审原始结果。GPU 选择使用明确设备，记录 UUID/时钟策略及后台负载，参考/推断交替测量降低漂移；不通过自动调时钟或杀进程获取“稳定环境”。如果 H100 忙碌或权限受限，记录具体限制，不把跨环境数据拿来凑门槛。
+
+**29-D 完整 Gate 与长期记录。** 新增 `guoqiao/layout_inference_acceptance.md`；逐个 Global Constraint 映射测试/命令、源码与输入 digest、结果和未覆盖范围。全量 unit/lit/CTest/Python、生产 legacy API 隔离必须重新运行。同步设计/比较文档时，仅报告真实测量支持的结论，不将固定 TileLang 语义对齐解释为比 TileLang/Triton 更快。任何安全、3% 或适用域 10% 失败都保留 FAIL，M6 不标完成。
+
+局部执行顺序：统计/runner 红灯 → 最小实现与 CPU 局部绿灯 → adapter 无桥接及位模式回归 → 生成真实 GPU 路径 → 输出/安全检查 → reference/inferred 性能与完整编译 → 独立复审 → 全量 Gate。下方命令中的 Python 均使用项目对应环境；不能在缺依赖时静默改用系统中的另一个 TileLang。
 
 **Files:**
 
@@ -4246,11 +4752,22 @@ git commit -m "test: add pinned TileLang layout corpus"
 - Create: `lib/Dialect/Frisk/Analysis/LayoutStatistics.cpp`
 - Modify: `lib/Dialect/Frisk/Analysis/CMakeLists.txt`
 - Modify: `lib/Dialect/Frisk/Transforms/LayoutInfer.cpp`
+- Modify: `include/Dialect/Frisk/Transforms/Passes.td`
+- Modify: `lib/Dialect/Frisk/Transforms/PassPipelines.cpp`
+- Modify: `include/Dialect/Frisk/Analysis/LayoutSolver.h`
+- Modify: `lib/Dialect/Frisk/Analysis/LayoutCandidateSolver.cpp`
+- Modify: `lib/Conversion/FriskLayoutToGPU/TestLayoutConversionLowering.cpp`
+- Create: `unittests/Dialect/Frisk/Layout/LayoutStatisticsTest.cpp`
+- Create: `test/Transforms/layout-statistics.mlir`
+- Create: `test/Conversion/layout-conversion-executable.mlir`
+- Create: `test/python/layout_benchmark_runner_test.py`
 - Create: `benchmark/CMakeLists.txt`
 - Create: `benchmark/layout/CMakeLists.txt`
 - Create: `benchmark/layout/solver/CMakeLists.txt`
 - Create: `benchmark/layout/solver/layout_solver_bench.cpp`
 - Create: `benchmark/layout/conversion/CMakeLists.txt`
+- Create: `benchmark/layout/conversion/generate_conversion_cases.cpp`
+- Create: `benchmark/layout/conversion/compile_conversion_case.py`
 - Create: `benchmark/layout/conversion/layout_conversion_bench.cu`
 - Create: `benchmark/layout/run_layout_benchmarks.py`
 - Create: `benchmark/layout/baseline/sm90_layout_baseline.json`
@@ -4262,24 +4779,14 @@ git commit -m "test: add pinned TileLang layout corpus"
 - Produces：
 
 ```cpp
-struct LayoutStatistics {
-  uint64_t variables;
-  uint64_t constraints;
-  uint64_t components;
-  uint64_t generatedCandidates;
-  uint64_t prunedCandidates;
-  uint64_t peakComponentCandidates;
-  uint64_t conversions;
-  uint64_t conversionBytes;
-  uint64_t estimatedBankConflicts;
-  uint64_t estimatedMemoryTransactions;
-  std::chrono::nanoseconds solveTime;
-};
+// 采用 §29.1 的 LayoutStatistics。
+// prepared/pruned/domain/combinations/frontier/expanded 分开记录；
+// unique conversion/rematerialization 与 use edge 数分开记录。
 ```
 
-Pass option `-frisk-layout-stats-file=<path>` 输出稳定 JSON；默认不写文件。
+Infer pass option `--frisk-infer-layouts='stats-file=<path>'` 输出稳定 JSON；完整 pipeline 显式传递，默认不写文件。除 `timings` 等明确测量字段外，相同输入输出应字节一致。
 
-- [ ] **Step 1: 写 statistics 红灯测试**
+- [x] **Step 1: 写 statistics 红灯测试**
 
 用固定小图检查 vars/constraints/candidates/conversions 数量和稳定 JSON key；连续两次运行除时间字段外完全一致。
 
@@ -4287,11 +4794,11 @@ Run: `cmake --build build --target check-frisk --parallel 32`。
 
 Expected: FAIL，statistics option 尚不存在。
 
-- [ ] **Step 2: 实现统计和 solver microbenchmark**
+- [x] **Step 2: 实现统计和 solver microbenchmark**
 
-`layout_solver_bench` 使用固定 corpus，分别测 10、50、100、250 Op graph；预热 5 次、测量 30 次，报告 median/p95、candidate peak 和解 hash。不得在计时区间打印 IR。
+`layout_solver_bench` 使用固定真实 IR corpus，分别测 10、50、100、250 个布局相关 Op；预热 5 次、测量 30 次，报告 median/p95、单域/组合/frontier 峰值及扩展数和解 hash。不得在计时区间打印 IR；不以孤立常量掩盖相连图开销，见 §29.1。
 
-- [ ] **Step 3: 实现可选 CUDA conversion microbenchmark**
+- [x] **Step 3: 实现可选 CUDA conversion microbenchmark**
 
 CMake option：
 
@@ -4304,7 +4811,7 @@ option(FRISK_ENABLE_CUDA_BENCHMARKS
 
 顶层仅在 `FRISK_ENABLE_CUDA_BENCHMARKS=ON` 时执行 `enable_language(CUDA)` 并加入 conversion 子目录；默认 CPU/CI 构建不得依赖 CUDA toolkit。
 
-- [ ] **Step 4: 实现 benchmark runner 和 baseline 比较**
+- [x] **Step 4: 实现 benchmark runner 和 baseline 比较（22 项 Python 测试、独立复审通过；实际 GPU 基线仍待 Step 6）**
 
 Runner 读取/写入：
 
@@ -4317,11 +4824,11 @@ Runner 读取/写入：
 }
 ```
 
-baseline JSON 中 conversion/runtime 数值必须来自同一固定环境下的 `reference_*` kernel，不能把新 solver 首次运行结果自封为基线。比较规则：正确性失败立即退出；已有 lowering 的 `inferred_*` 对相应 `reference_*` median 回退超过 3% 失败；布局推断占完整编译时间超过 10% 失败；peak component candidates 超过 256 失败。时间噪声在 3% 内视为持平。
+baseline JSON 中 conversion/runtime 数值必须来自同一固定环境下的 `reference_*` kernel，不能把新 solver 首次运行结果自封为基线。正确性失败立即退出；已有 lowering 的 `inferred_*` 对相应 `reference_*` median 回退超过 3% 失败；适用用例的布局 pipeline 占真实完整编译时间超过 10% 失败。候选组合超过 256 仅触发 beam32，不自动算失败；验证实际搜索模式、frontier 与扩展预算，预算耗尽不能冒充正确性通过。时间噪声在 3% 内视为持平，环境不匹配则不可比较。
 
 本计划的 runtime 守门范围只覆盖 conversion adapter 和仓库中已经存在、能走新布局 pipeline 的 kernel；尚无 WGMMA/TMA lowering 的路径只做静态 contract/cost 验证，不伪造 runtime 数据。
 
-- [ ] **Step 5: 运行 CPU/solver 验收**
+- [x] **Step 5: 运行 CPU/solver 验收**
 
 Run:
 
@@ -4329,35 +4836,34 @@ Run:
 cmake --build build --target frisk_layout_solver_bench check-frisk FriskLayoutUnitTests --parallel 32
 python benchmark/layout/run_layout_benchmarks.py \
   --solver build/benchmark/layout/solver/frisk_layout_solver_bench \
-  --baseline benchmark/layout/baseline/sm90_layout_baseline.json \
-  --check
+  --cpu-only --check
 ```
 
-Expected: correctness/compile-time/candidate gates PASS。
+Expected: CPU correctness、确定性及搜索模式/预算 Gate PASS，输出阶段耗时；本命令本身不提供 GPU 安全/runtime 或完整编译占比通过证据。
 
-- [ ] **Step 6: 在 SM90 环境运行 conversion/runtime 验收**
+- [x] **Step 6: 在 SM90 环境运行 conversion/runtime 验收**
 
 Run:
 
 ```bash
-cmake -S . -B build -G Ninja \
+cmake -S . -B build-m6-release -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DMLIR_DIR=/data0/xiebaokang/rocm-llvm-project/build/lib/cmake/mlir \
   -DFRISK_ENABLE_CUDA_BENCHMARKS=ON
-cmake --build build --target frisk_layout_conversion_bench --parallel 32
+cmake --build build-m6-release --target frisk_layout_conversion_bench --parallel 12
 python benchmark/layout/run_layout_benchmarks.py \
-  --conversion build/benchmark/layout/conversion/frisk_layout_conversion_bench \
+  --conversion build-m6-release/benchmark/layout/conversion/frisk_layout_conversion_bench \
   --record-reference \
-  --output-baseline benchmark/layout/baseline/sm90_layout_baseline.json
+  --output-baseline /tmp/frisk-sm90-layout-reference-pending.json
 python benchmark/layout/run_layout_benchmarks.py \
-  --conversion build/benchmark/layout/conversion/frisk_layout_conversion_bench \
+  --conversion build-m6-release/benchmark/layout/conversion/frisk_layout_conversion_bench \
   --baseline benchmark/layout/baseline/sm90_layout_baseline.json \
   --check
 ```
 
-Expected: 第一条 runner 命令在记录 GPU/driver/clock/flags 后生成 reference baseline；第二条 GPU correctness PASS，且受支持 case 不超过已批准回退阈值。baseline 的新增或更新必须由性能评审确认；没有 SM90 机器时不得生成 baseline，也不得把本步骤标记完成。
+Expected: 第一条 runner 命令仅在尚不存在的独立路径保存 pending reference，不会生成 accepted baseline，也不能覆盖已存在文件。须先独立核验参考来源、环境、安全、原始样本和内容摘要，再保持实测数据不变、将评审状态设为 accepted 并保存到仓库基线文件；第二条命令才能正式判定 runtime Gate。2026-10-10 的实际接受记录及摘要见验收文档。没有 SM90 机器或未完成性能评审时不得将本步骤标记完成。
 
-- [ ] **Step 7: 执行完整最终验证**
+- [x] **Step 7: 执行完整最终验证**
 
 Run:
 
@@ -4376,11 +4882,11 @@ git diff --check
 
 Expected: 所有构建、CTest、lit、unit tests 和 diff check PASS。
 
-- [ ] **Step 8: 编写验收记录并同步设计**
+- [x] **Step 8: 编写验收记录并同步设计**
 
 `layout_inference_acceptance.md` 必须列出每个 Global Constraint 的证据命令、结果、未覆盖项和后续 WGMMA/TMA lowering 边界。若实测要求改变阈值，必须先获得架构评审再修改设计文档，不能为让 benchmark 通过而直接放宽。
 
-- [ ] **Step 9: 提交性能守门和验收记录**
+- [ ] **Step 9: 提交性能守门和验收记录（本轮不自动执行，等待另行授权）**
 
 ```bash
 git add include/Dialect/Frisk/Analysis lib/Dialect/Frisk/Analysis \
@@ -4389,41 +4895,64 @@ git add include/Dialect/Frisk/Analysis lib/Dialect/Frisk/Analysis \
 git commit -m "test: gate layout correctness and performance"
 ```
 
+#### 29.2 历史实施检查点（2026-10-10，最终结果见 §29.3）
+
+以下保留当时的失败和阶段性判断，不表示当前仍有这些未完成项；后续结果不覆盖或删除早期证据。
+
+- runner 已完成 schema/逐 case 阈值/来源一致性/原始证据保留及基线保护，22 项 Python 测试与独立复审通过。新参考数据只能写到独立的 pending 文件，不能自动覆盖 accepted baseline；汇总输出也不能与基线路径或其别名重合。
+- GPU adapter/驱动代码的局部复审已通过：显式拒绝非 Global 地址空间，补充 4 项 adapter 单元测试、6 项存储契约入口提升测试和 4 项编译驱动测试。首次性能数据之后新增了测量窗口前后负载快照与构建清单绑定；最终基线须使用修订后工具重新运行和评审，不能直接把代码复审通过等同于基线接受。
+- 统计与 CPU benchmark 已实现并通过局部独立复审，最新 12 项统计测试通过。修复覆盖失败分类、外部收集器生命周期、最终冲突身份，以及未排序调用者图与已排序求解图之间的错误身份映射；失败时不修改调用者图。早先一次“10 项通过”的记录使用了加强断言前的二进制；加强后的测试曾因预期 `EmptyDomain` 与实际 `HardConflict` 不符而失败，现分别测试真实 coordinator 冲突身份，以及最终失败记录不覆盖 attempt 历史，未为适配测试改变生产分类。
+- 第一份 Debug CPU 探索结果已完整生成，10/50/100/250 个相连操作 corpus 均有 30 个测量样本和稳定结果 hash；2026-10-10 用 runner 重放检查得到 `PARTIAL_PASS`。原始数据 `/tmp/frisk-task29-solver.json`，重放结果 `/tmp/frisk-m6-task29-exploratory-cpu-gate.json`。这是修复前二进制的探索证据，不能替代最终版本的性能验收，也不能用于 10% 完整编译占比结论。
+- 显式 executable adapter 已将真实 tile load/store 接入每线程传输，11 个 identity/shuffle/Shared、payload 与复制用例通过真实 cubin 执行，以及 memcheck/racecheck/synccheck。首轮原始数据 `/tmp/frisk-task29-conversion-gpu1-escalated.json`，逐次产物位于 `build-m6-release/benchmark/layout/conversion/measurements/run-l2h8x_r0/`。三个必测用例的同轮 inferred/reference median 比值分别为 1.000、0.99206、1.000；参考数据尚待独立复审，不能据此宣称正式 runtime Gate 已验收。
+- 首轮三个必测用例的布局 pipeline / 完整编译占比分别为 **12.14%、12.05%、20.24%，均 FAIL**；实际 runner 结果 `/tmp/frisk-task29-gpu-first-gate.json` 保留失败。继续定位重复证明开销，不改变 10% 门槛，不增加无关分母工作。尚无接受的 GPU baseline，最终全量回归和验收记录仍待完成，M6 保持未完成。
+- 仿射求值局部优化后的第一轮无并行构建干扰 compile-only 数据 `/tmp/frisk-task29-conversion-optimized1.json` 为 **4.11%、3.86%、7.25%**；布局阶段分别 3.28/3.45/6.30 ms。优化消除逐点属性构造，保留证明与枚举预算；算术边界回归、最终二进制 GPU 重测和全量验收仍在进行，因此该轮不标记最终 Gate 通过。
+
+#### 29.3 最终验收结果（2026-10-10）
+
+- 统计/solver benchmark、runner、可执行 adapter/编译驱动及仿射求值优化均通过独立代码与契约复审。最终完整构建成功，**405/405 unit、58/58 lit、7/7 Debug CTest** 通过；Release 的入口提升 CTest 1/1（内部 6 项）通过，Python 规范化 5/5、旧 API 生产隔离和 SM90 工具 SS/RS/输出存活/拒绝检查通过。完整单元分片为 102+101+101+101，无失败、错误或 disabled 用例。
+- 首轮编译占比失败定位为有限仿射坐标求值反复构造属性的开销。改成带溢出检查的直接整数求值，未删证明、未缩减枚举/搜索预算、未改变分母工作。7 项算术边界测试通过；三个必测用例优化前后的输入、布局 IR、adapter IR、PTX/cubin 逐字节一致。Shared 后端包装中的一次计时元数据差异单独记录，不被解释为生成代码变化。
+- 最终真实 H100 运行：11 个正确性/位模式/复制用例、33 次 memcheck/racecheck/synccheck 通过。三个必测用例的 inferred/reference median 比值为 **1.007874、1.000000、1.008333**，布局 pipeline / 同样本完整编译为 **3.798968%、3.973393%、6.667194%**。两次另外的无缓存完整编译重复均通过，最大占比 7.165%。阈值仍为 3% 和 10%。
+- 独立性能评审接受最终 reference 的原始数据；`benchmark/layout/baseline/sm90_layout_baseline.json` 仅改变 pending→accepted 状态，不修改样本。使用最终 CPU/GPU JSON 及此基线重放 runner，solver/runtime/compile/overall 全部 PASS。CPU 10/50/100/250 个实际操作的最终独立测量、原始样本及阶段 median/p95 均保留，生产配置保持 exact256/beam32/65536。
+- 逐 Global Constraint 的命令、来源/输入/产物摘要、测试结果、历史 FAIL 和未交付范围见 `guoqiao/layout_inference_acceptance.md`。整体源码及最终文档复审通过，无 Critical/Important 问题；两项非阻塞建议保留记录：更多有符号算术边界测试、导出器预期拒绝测试的 stderr 降噪。
+- 完整 WGMMA/TMA/mbarrier 指令 lowering 仍不在本轮范围；没有声称 Frisk 比 TileLang/Triton 更快。源目录 main 直接实施，未 commit/push，未创建 worktree，原用户修改保留。
+
 ### M6 Gate
 
 必须具备以下证据：
 
 ```text
 CTest/lit/unit/property 全部通过
-TileLang 固定 corpus 全部通过
+TileLang 固定 corpus 真实导出且可重现；equivalent 与 expected-rejection 分别通过
 相同输入重复编译产生相同布局 IR
 race/OOB/invalid ownership/unresolved var 为 0
-常规 component candidates <= 256
-beam width = 32
-布局推断编译时间占比 <= 10%
+exactCombinationLimit = 256；超限使用 beam width = 32，不截断候选到 256
+每组件每次尝试扩展 <= 65536；域/组合/frontier/扩展分别统计
+适用用例布局 pipeline / 真实完整编译时间 <= 10%；无完整路径只报告阶段耗时
 受支持 SM90 runtime case 中位回退 <= 3%
 尚无 lowering 的 WGMMA/TMA 路径仅声明静态契约通过
 ```
 
-任一项缺少证据时，布局系统不能标记完成。
+任一必需项缺少证据时，布局系统不能标记完成。必须包含实际 adapter 的 identity/shuffle/Shared GPU 正确性、安全和 runtime 证据；不能以 OUT_OF_SCOPE 或 CPU-only PASS 代替这三个必需 case。
 
 ---
 
 ## 3. 最终 Definition of Done
 
-- [ ] M0–M6 的全部 Gate 均有最新命令输出。
-- [ ] `frisk-layout-pipeline` 对所有受支持 Frisk kernel 生成合法、已解析、可验证的布局 IR。
-- [ ] 生产源码中不存在 `inferLayout(builder, DenseMap<Value, Attribute>&)`。
-- [ ] Local/Register 的生产 IR 不再以 local MemRef 作为求解载体。
-- [ ] Distributed/Storage layout 映射方向、Attr 字段和 verifier 与设计文档一致。
-- [ ] Hard conflict 输出 provenance chain 和坐标反例。
-- [ ] 多 consumer 可以选择共同布局、conversion 或 rematerialization。
-- [ ] conversion 是普通成本候选，且不会被零转换绝对优先规则压制。
-- [ ] SM90 WGMMA/TMA/shared swizzle contracts 有正反例测试。
-- [ ] TileLang 固定语义 corpus、property tests 和顺序确定性测试通过。
-- [ ] CPU/solver 与 SM90 conversion/runtime 性能守门通过。
-- [ ] `guoqiao/layout_inference_design.md`、对比文档、实施计划和验收记录不存在语义冲突。
-- [ ] 完整 WGMMA/TMA lowering 的未交付边界在验收记录中明确保留。
+以下完成状态限定于本文已声明的支持域及验收矩阵，不代表任意 kernel 或完整 WGMMA/TMA lowering 已获验证。
+
+- [x] M0–M6 的全部 Gate 均有最新命令输出。
+- [x] `frisk-layout-pipeline` 对所有受支持 Frisk kernel 生成合法、已解析、可验证的布局 IR。
+- [x] 生产源码中不存在 `inferLayout(builder, DenseMap<Value, Attribute>&)`。
+- [x] Local/Register 的生产 IR 不再以 local MemRef 作为求解载体。
+- [x] Distributed/Storage layout 映射方向、Attr 字段和 verifier 与设计文档一致。
+- [x] Hard conflict 输出 provenance chain 和坐标反例。
+- [x] 多 consumer 可以选择共同布局、conversion 或 rematerialization。
+- [x] conversion 是普通成本候选，且不会被零转换绝对优先规则压制。
+- [x] SM90 WGMMA/TMA/shared swizzle contracts 有正反例测试。
+- [x] TileLang 固定语义 corpus、property tests 和顺序确定性测试通过。
+- [x] CPU/solver 与 SM90 conversion/runtime 性能守门通过。
+- [x] `guoqiao/layout_inference_design.md`、对比文档、实施计划和验收记录不存在语义冲突。
+- [x] 完整 WGMMA/TMA lowering 的未交付边界在验收记录中明确保留。
 
 ## 4. 计划执行方式
 
@@ -4432,7 +4961,7 @@ beam width = 32
 1. 运行该任务局部测试；
 2. 运行所在里程碑已有回归；
 3. 检查设计文档漂移；
-4. 提交独立 commit；
+4. 用户授权后提交独立 commit（本轮按源目录工作约定不自动 commit/push）；
 5. 进行一次 spec compliance review 和一次 code quality review；
 6. 只有 review 通过才进入下一个 Task。
 

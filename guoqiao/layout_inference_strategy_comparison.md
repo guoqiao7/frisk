@@ -1,5 +1,33 @@
 # Triton、TileLang 与 Frisk 布局推断对比及 Frisk 架构决策
 
+> **M6 完成（2026-10-10）：Task27–29 已实施并通过分项复审，最终全量回归通过。固定 TileLang 的 20 个共同域等价比较与 3 个实际拒绝通过；真实 GPU conversion 的 11 个正确性用例及 33 次 sanitizer 检查通过。Task29 经不删减证明的仿射求值优化，最终布局编译占比为 3.80%/3.97%/6.67%，runtime 比值不超过 1.00834，独立 reference 基线已接受。首轮 FAIL 保留为历史证据，整体源码及最终文档复审通过。这不构成比 TileLang/Triton 更快或完整推断策略等价的结论；口径及摘要见实现计划 §29.3 和验收文档。**
+
+### M6 已确认的比较与证据规则
+
+1. **版本和来源可核验。** TileLang 保持 `5e149e31674658f94779c7d0c6039549a1853123`，Triton 保持本文原固定快照，不自动追踪最新 main。TileLang 参考必须在隔离环境真实构建/运行并记录依赖及加载路径；禁止从 Frisk 结果反填 corpus 或把手工翻译公式冒充上游实际输出。
+2. **比较语义，不要求实现相同。** schema v2 分开记录逻辑覆盖、carrier 所有权、同值 copy group、完成值/部分贡献、写入策略和存储 bit offset。多个合法持有者不等于重复写入；对上游未定义的 writer 选择只核对明确策略的兼容性，不宣称两边策略完全相同。
+3. **支持与拒绝分开报告。** 共同支持域进行 `equivalent` 比较；Frisk 尚不支持的 dtype-changing view、一般非二次幂 Tensor/broadcast 或 PartialFragment 做真实 `reject` 测试，不计作等价支持，也不为追平 corpus 扩大生产语义。保留不采用某项上游语义的依据。
+4. **确定性和最优性的证据不同。** 256 是 exact→beam 的组合阈值，不是候选硬上限；beam32/扩展预算65536 保持。独立小图 oracle 验证 exact/未截断解，截断 beam 不承诺最优或穷尽无解。测试的是 Frisk 自身契约，不由此推出比上游更优。
+5. **性能结论必须经过实际生成链。** H100 conversion 对照必须运行 Frisk adapter 生成的 inferred 路径与独立 reference kernel，不能用静态 CostVector 或两份手写 CUDA 替代。3% 回退及适用域 10% 完整编译占比维持；没有完整 codegen 的 MMA/TMA 只报告静态契约，无需也不得伪造 runtime。通过这些门槛只证明固定 case/环境的结果，不证明总体优于 TileLang/Triton。
+
+Task27 完成时的历史检查点（2026-10-09）：已新增独立逐位代数 oracle、全赋值九维成本 oracle、插入顺序/跨进程确定性测试及有限失败缩减工具，包含 16 项新增测试的 45 项局部 unit 与全量 56 项 lit 通过，并通过独立复审。缩减文件只支持明确的 `finite-same-require-v1` 测试域，不能重放任意 GPU/alias/region 图。此证据用于核验 Frisk 自身稳定性与失败分类，不是与 TileLang/Triton 的语义差分或性能优势证据；当时真实 corpus 和 GPU 验收尚待 Task28/29，现已完成。
+
+下文记录 Task28 实际 corpus 范围及对齐/拒绝项；Task29 的运行环境、性能结果和验收命令见实现计划 §29.3 及 `layout_inference_acceptance.md`。已批准的比较方法与实测结论分别记录，不将有限共同域证据推广为整个框架的性能或推断策略等价结论。
+
+Task28 实测结果（2026-10-09，独立复审通过）：已真实构建固定 TileLang/TVM 并从实际 native 对象及 LayoutInference 导出 23 个 case，20 个共同域语义比较通过，3 个 Frisk 现有拒绝边界通过，两次最终导出字节一致。包含 FP16/BF16 WGMMA A/C、Shared linear/transpose/32B/64B/128B、4B/8B/16B Copy、dim0/1 Reduce、guarded Copy、合法复制以及 floating/显式 unused 布局。拒绝项为非二次幂一般 Tensor、dtype-changing view、PartialFragment；不计入已支持功能。Copy/Reduce 采用明确源布局 seed；floating 的参考推断结果与 Frisk 显式 map 比较，不表示两边默认优选策略相同。writer 使用兼容合法策略，不伪称上游选择了特定 writer。reader/exporter 的 9 项 C++、12 项 Python 测试通过，全量 382 unit / 56 lit / 5 CTest 通过；导出发布缺陷经回归修复并复审关闭。真实坐标对齐只支持这些固定 case 的契约结论，未测 kernel runtime，不证明速度领先。可复现命令、native 路径/摘要和升级规则见 [固定参考说明](./tilelang_layout_reference.md)，实现记录见计划 §28.2。
+
+> Task26 方案 A 已完成（2026-09-28）：357 unit / 53 lit / 4 CTest / 5 Python normalization、SM90 工具及旧生产接口隔离检查通过，独立复审的重要问题已关闭。保留 Task25 普通候选竞争，仅可证明空域进入独立快照有序扩展；预算/unknown/硬冲突不作为松弛理由。共享重计算在求解计划中计费，转换提升受硬编码来源、执行域、dominance 与实际 IR 复验限制。本轮差异化关注可核验失败分类及优化计划/真实改写的一致性，不把 fallback、hoist 或 rematerialization 本身称为独有创新。不刷新上游快照、不声称 GPU 性能优势；具体验收见实现计划 §26.5，未 commit/push。
+
+Task26 的比较口径进一步收紧为三个可核验机制（实际边界见实现计划 §26.4）：
+
+- **失败有类型，重试不改变硬语义。** 普通候选先求解；只有可证明空域进入原始快照上的有序扩展。其他分量或同分量非空残余图的硬冲突、unknown、预算/beam 失败不能借空域被忽略。SM90 新增的是有限 replication 提案，不宣称已有 WGMMA→SIMT fallback。
+- **提升有授权和执行域边界。** 原本无编码的结果由物化器授予内部重写许可；显式编码继续是 hard seed。单输入 elementwise/extend 前移及线程内循环不变转换要求 dominance、成本非劣和 actual-layout 验证；不推测执行 shuffle/Shared 通信。
+- **共享重计算先选择计费，再生成一次。** 同块同源同目标的多个 use 比较共享转换、独立修复、共享克隆；选择计划含 leader 和切片，实际改写核对计划并复用同一 SSA。可证明静态重复搬运/克隆计费减少，但未证明 GPU 运行时间领先。
+
+这些不是对 TileLang/Triton “不存在对应优化”的断言。与固定快照的差异仍是 Frisk 将失败分类、有限候选、成本化边界计划、实际 IR 复验和事务提交组合为可追溯闭环；上游结论沿用已有审计证据，不在本任务推测其最新 main 行为。
+
+> 历史增量（2026-09-28）：Task 25 的 SM90 规则/Copy 路径/guard/地址评分已实现，325 unit / 51 lit / 4 CTest / 5 Python normalization 及工具、隔离检查通过；重要复审问题已关闭。新增能力见下文 Task 25 小节和实现计划 §25.4–25.5。未刷新 TileLang/Triton 快照，未做 GPU 性能比较，未 commit/push。
+
 > 最新验收（2026-09-27）：Task 23 已完成，正式 exact/beam 求解器与静态 CostVector 接入，272 unit / 49 lit / 4 CTest / 5 Python 及独立复审通过，旧 9/8 变量集成缺口已补齐。本轮未刷新上游快照、未做性能对比、未提交或推送。
 
 > 文档性质：技术对比 + Frisk 架构决策记录
@@ -44,9 +72,11 @@
 
 本轮以 Frisk 工作区（main `9bc8349`＋未提交 Task 22）为起点，未刷新或运行 TileLang/Triton。起点审计核实了旧 bootstrap 的 8 变量/4 候选限制、转换数优先及未被调用的 target CostVector；当时 `LayoutConversionEdge` 的字节/同步字段没有实际填充值。Task 23 现已替换该求解器并接通静态成本，不把此前“已有代价结构体”表述为“当时已有性能求解器”。
 
-用户确认的固定候选域小组件 exact、大组件确定性 beam 已实现，明确区分穷尽无可证明方案、beam 未找到解和搜索预算耗尽，并保留操作级证明、实际 IR 复验与模块事务。具体契约及验收见[实现计划 §23](./layout_inference_implementation_plan.md#task-23-实现连通分量候选求解和-costvector)，独立复审与 272 unit / 49 lit / 4 CTest / 5 Python、生产接口隔离扫描均通过；本轮未 commit/push。
+用户确认的固定候选域小组件 exact、大组件确定性 beam 已实现，明确区分穷尽无可证明方案、beam 未找到解和搜索预算耗尽，并保留操作级证明、实际 IR 复验与模块事务。具体契约及验收见[实现计划 §23](./layout_inference_implementation_plan.md#task-23-实现连通分量候选求解和-costvector)，独立复审与 272 unit / 49 lit / 4 CTest / 5 Python、生产接口隔离扫描均通过。Task 22/23 后续已提交并推送至 `origin/main`，Task 24 的工作基线为 `36df49f`。
 
-可追踪的设计重点是：候选组合选择与硬件合法性证明分离；搜索不完整不能冒充非法性证明；联合 SSA/use、Storage、MMA tuple 和 Reduce pair 的既有关系求解；CostVector 区分已建模静态项和未来硬件估计。Beam/exact、字典序代价及稳定排序本身不是创新性证明，也不能由此宣称比固定快照的上游系统更快或更优。Task 24/25 的 placement/rematerialization 与完整 SM90 成本仍不在本任务范围内。
+可追踪的设计重点是：候选组合选择与硬件合法性证明分离；搜索不完整不能冒充非法性证明；联合 SSA/use、Storage、MMA tuple 和 Reduce pair 的既有关系求解；CostVector 区分已建模静态项和未来硬件估计。Beam/exact、字典序代价及稳定排序本身不是创新性证明，也不能由此宣称比固定快照的上游系统更快或更优。Task 24/25 的 placement/rematerialization 与完整 SM90 成本不属于 Task 23。
+
+**Task 24 方案 A（2026-09-27，已完成）：** 在完整布局赋值评分期间比较同块共享 conversion 和最多 8 个便宜纯操作的 rematerialization，记录可验证的计划后事务式物化。与上文固定快照的 Triton backward rematerialization 相比，本任务强调边界选择在赋值评分中可见，以及 SSA/use 与既有双域硬约束一同验证；不声称“重计算”本身是 Frisk 独创。首版不跨 block/region/loop 提升，成本为带来源与循环深度权重的静态代理，不是完整 SM90 性能模型。最终独立复审及 287 unit / 50 lit / 4 CTest / 5 Python、旧接口隔离扫描均通过，命令、修正轨迹与边界见实现计划 §24.7；本轮未提交/推送，未运行上游框架或 GPU benchmark。
 
 本轮实际差异：选择以硬关系连通分量为范围，输出实际 Attribute assignment、指令/归约 binding 和逐 use conversion；小图 exact、大图有界 beam，失败区分无可证明方案、截断未找到解与预算耗尽。已有 32→128 活跃线程子集转换继续合法，成本取两端最大线程覆盖；Shared 别名只按根最大占用末端计一次。这与旧 Frisk 局部 layoutMap 更新不同，但并不证明上游缺少全局分析或代价选择。9 变量核心及 Copy/Parallel128/MMA/Reduce/Global 写回已在 25 项集成回归中成功；全量 Gate 及精确命令见实现计划 §23.9。
 
@@ -794,15 +824,23 @@ frisk-normalize-layout-ir
 | 传播方式 | strict + BFS common + free root search | anchor → descendants propagation，多轮 pass | strict + 双向 fixed-point + component candidate solve |
 | 反向推断 | TileOp 可依据已知 buffer 推另一端 | inferSrcEncoding / backward rematerialization；SCF 穿越有边界 | 一等能力；consumer contract 可反推 producer/storage |
 | Alias/view | 同 data 分组、位宽感知 reshape，非任意 slice 证明 | memdesc view + 独立物理 BufferRegion 分析 | Task 18 显式坐标关系 + 全部同-root pairs 的 storage hard constraints；支持子集与 Unknown 明确 |
-| 多 consumer | 尽量找到一个共同 Buffer 布局 | 可保留局部不同 encoding，以 conversion 分隔 | 联合比较共享布局、边界 conversion、rematerialization |
+| 多 consumer | 尽量找到一个共同 Buffer 布局 | 可保留局部不同 encoding，以 conversion 分隔 | Task 24 在赋值评分中比较同块共享转换与各 use 的受限重计算，不跨 region 共享 |
 | 冲突处理 | containment、swizzle merge、free root；仍冲突则失败 | heuristic 选 encoding并插 conversion | hard conflict 诊断；soft conflict 进入全局候选选择 |
 | Conversion | 不是通用核心抽象 | 显式 ConvertLayout，随后多轮优化 | 显式且是求解变量；求解后统一物化 |
-| 成本重点 | 默认 spill/register；可选 I/O-aware component attempt 评分 | pass-local hardware heuristic + conversion cleanup | 指令路径、访存、bank conflict、conversion、资源联合评估（M5） |
+| 成本重点 | 默认 spill/register；可选 I/O-aware component attempt 评分 | pass-local hardware heuristic + conversion cleanup | Task 23/24 的边界工作、资源和循环深度代理，加 Task 25 的 atom/Copy 工作、32B sector、按 128B 阶段统计的 bank 代理；不是 cycle 模型 |
 | Region/loop | TIR loop/annotation、reducer epoch 语境验证；非通用 SSA join 图 | if/for/while 正向传播/重写；while 区分双 tuple，反向 remat 有边界 | M3 SCF 语义 + Task 18 显式边与有限域收敛统计 |
 | 验证 | Analyzer/ICHECK/专用 validator | MLIR verifier + target-specific checks | MLIR verifier + 数学证书 + provenance diagnostic |
 | 代数 | PrimExpr/IndexMap/Fragment/PartialFragment，部分 CuTe 访问代数 | encoding + LinearLayout；已有 padding/linear 组合 | Affine outer × GF(2) inner，实际支持范围见 §6.1 |
 | Target 耦合 | TileOp/layout 与 TVM CUDA lowering 紧密 | target-specific encoding/pass 较多 | 通用 solver 与 SM90 rule/adapter 分层 |
 | 默认失败策略 | 找不到共同布局时冲突 | 插 conversion 或 target fallback | 先全局选成本最低合法解；无普通解才受控 fallback |
+
+### Task 25 方案 A 实现增量（2026-09-28）
+
+既有 FP16/BF16 WGMMA 证明已整理成 24 条目标规则；Copy 新增独立 TMA/cp.async/vector 路径变量，与 source storage、destination storage、execution 联合求解。binding 同时记录 descriptor、guard 和未来 lowering 的同步义务，并从物化后实际 SSA/地址独立重建。静态 3×5 等 Copy 使用二次幂 carrier 和原始有效域保护，首版只走 scalar；不等同于 TileLang 动态通用布局能力。
+
+前三项地址/形状代价现已接入真实 solver，而非离线评分：同类已对齐 fixture 中 32×64 F32 Copy 选 TMA，8×16 选普通向量；转置存储的独立消费者可以为减少 sector 接受一次 shuffle。硬约束先排除非法高速路径，随后才比较工作量与转换代价。未知对齐相位保守处理；Shared bank 按硬件独立 128B 阶段计数，读广播不等同于不同地址冲突。
+
+可验证的区分点是 **双域＋指令路径的联合关系、有限域证据、事务物化与实际 IR 复验**，不是声称 TMA、swizzle、guard 或成本模型本身独有。具体支持域、代理公式、325 unit 等 Gate 见实现计划 §25.1–25.5。完整 GPU lowering、动态 ragged、通用 relaxation、运行时收益及大规模编译成本仍待后续验证；此次没有扩大对固定 TileLang/Triton 快照的能力结论。
 
 ## 8. 同一个 SM90 WGMMA 数据流在三者中的处理
 
@@ -909,11 +947,11 @@ solver 比较整条 critical path 的 WGMMA/TMA 命中、global transaction、ba
 | H1：坐标化 alias 与 SSA region 关系在同一 hard-constraint 图内协作 | 对比 TileLang buffer 兼容闭包及 Triton 分离的布局传播/物理区域分析；比较作用范围，不说对方没有坐标分析 | Task 18 坐标 alias/显式边已编码，支持受限静态域；尚无性能结论 | 偏移/步长/降秩、三视图冲突、真实回边重调度；actual-only verifier 无隐藏 assignment。Tensor/storage 经访问关系协作，不代表任意跨域组合全覆盖 |
 | H2：可审计的有限域终止与冲突解释 | 公开冻结候选数、实际删除数、queue pops、degree 上界，关联 seed→alias/region→冲突 | Task 18 worklist/stats、finite origins、proof cache 已编码 | 插入顺序扰动下 assignment/统计相同；重复 pass IR 相同；真实事件逐项对账，Unknown 拒绝。该性质是当前受限实现的工程差异，不是对上游整体的否定 |
 | H3：组合代数扩大受支持布局域而保持证明一致 | 比较具体 Affine/GF(2) 组合域与 TileLang IndexMap/CuTe、Triton padded/linear 的交集及差集 | M1 代数已有，pass 子集受限 | 同坐标语义、coverage/injectivity/owner 与反例；非零 offset XOR 必须正确处理 carry。若只换一种文本表达，不构成新增能力 |
-| H4：布局、指令路径和 conversion placement 联合选择改善结果 | 与固定 pipeline/attempt policy 比较合法候选及最终代价，不假定全局最优 | M3 只最少新增转换；M5 成本/路径选择未实现 | 固定硬件/输入/编译选项，报告 runtime、访存、bank、寄存器/共享内存和编译时间；超出计划回退阈值或无收益则不宣称性能优势 |
+| H4：布局、指令路径和 conversion placement 联合选择改善结果 | 与固定 pipeline/attempt policy 比较合法候选及最终代价，不假定全局最优 | Task 23 有界搜索、Task 24 同块边界评分、Task 25 Copy 路径和物理地址评分已有真实选择用例；尚未验证完整 SM90 路径性能或 GPU 收益 | 固定硬件/输入/编译选项，报告 runtime、访存、bank、寄存器/共享内存和编译时间；超出计划回退阈值或无收益则不宣称性能优势 |
 
-语义差分是验证方法，不是独创性结论。旧 Frisk/旧 TileLang 仅为已知正确子集的回归 oracle；新版机制、历史 bug 修正须用独立的坐标/owner/address 不变量及行为变更记录核验，不能为了“和旧版一致”保留错误。Task 28 将建立新版固定 corpus，目前尚未生成或运行。
+语义差分是验证方法，不是独创性结论。旧 Frisk/旧 TileLang 仅为已知正确子集的回归 oracle；新版机制、历史 bug 修正须用独立的坐标/owner/address 不变量及行为变更记录核验，不能为了“和旧版一致”保留错误。Task28 已建立并运行固定版本 corpus，20 个等价比较和 3 个实际拒绝分别通过；具体支持域及策略差异见本文 M6 摘要，不能推广为任意上游布局或性能等价。
 
-本阶段实现 H1/H2 的受限 Task 18 切片并提供可复查测试，不扩展 GEMM/Reduce、cost solver、硬件 lowering，也不承诺本轮已经证明研究创新。whole-root alignment 前置契约若被 Pure/DCE 删除，后续 actual verifier 会保守拒绝；`infer → canonicalize → infer` 的证据生命周期限制已由回归记录，跨任意规范化的 durable contract 留待 Task 22。
+Task 18 审计时点的历史边界：当时只实现 H1/H2 的受限切片，不扩展 GEMM/Reduce、cost solver、硬件 lowering；whole-root alignment 前置契约若被 Pure/DCE 删除，actual verifier 会保守拒绝。此后 Task 19–24 的实际增量见本文摘要；Task 22 已提供受支持 normalization/pipeline 的持久根契约，不能再把上述历史限制当作当前全部功能，也不由这些工程增量推断研究独创性或性能收益。
 
 ## 11. Frisk 架构决策
 

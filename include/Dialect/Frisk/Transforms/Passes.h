@@ -6,12 +6,17 @@
 
 namespace mlir::frisk {
 struct SolverOptions;
+struct LayoutStatisticsReport;
+enum class LayoutStatisticsScope { Standalone, Pipeline };
 
 #define GEN_PASS_DECL
 #include "Dialect/Frisk/Transforms/Passes.h.inc"
 
 std::unique_ptr<Pass> createFriskInferLayoutsPass();
-std::unique_ptr<Pass> createFriskInferLayoutsPass(const SolverOptions &options);
+std::unique_ptr<Pass> createFriskInferLayoutsPass(const SolverOptions &options,
+                                              bool authorizeInternalOptimization = false,
+                                              LayoutStatisticsReport *statistics = nullptr,
+                                              LayoutStatisticsScope scope = LayoutStatisticsScope::Standalone);
 std::unique_ptr<Pass> createNormalizeLayoutIRPass();
 std::unique_ptr<Pass> createOptimizeLayoutConversionsPass();
 std::unique_ptr<Pass> createTestLowerLayoutConversionsPass();

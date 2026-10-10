@@ -20,6 +20,7 @@ private:
 
 LogicalResult materializeDistributedLayouts(
     Operation *root, const LayoutConstraintGraph &graph,
-    const LayoutSolution &solution, ArrayRef<LayoutConversionEdge> conversions);
+    const LayoutSolution &solution, ArrayRef<LayoutConversionEdge> conversions,
+    bool authorizeInternalOptimization = false);
 } // namespace mlir::frisk
 #endif

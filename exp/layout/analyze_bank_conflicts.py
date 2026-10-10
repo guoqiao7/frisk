@@ -188,7 +188,7 @@ def main() -> None:
       default=default_tool_path(),
       help="Path to frisk_layout_tool (default: %(default)s)",
   )
-  parser.add_argument("--target", default="sm_80", help="Target arch (e.g. sm_80)")
+  parser.add_argument("--target", default="sm_90a", help="Target arch (WGMMA requires sm_90a)")
   parser.add_argument(
       "--shape",
       type=parse_shape,
@@ -226,6 +226,14 @@ def main() -> None:
   args = parser.parse_args()
 
   result = run_tool(args)
+  if result.get("schema") == "frisk-canonical-layout-v1":
+    print(f"Target: {result['target']}, threads: {result['threads']}")
+    print("MMA contract:", result["mma_contract"])
+    print("Accumulator:", result["accumulator_encoding"])
+    for index, layout in enumerate(result["storage_layouts"]):
+      print(f"Storage {index}: {layout}")
+    print("Static contracts only; no legacy bank heuristic or GPU throughput claim.")
+    return
   config = result.get("config", {})
   print_config(config)
   for entry in result.get("layouts", []):

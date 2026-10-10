@@ -25,7 +25,7 @@ module attributes {frisk.target = "sm_90"} {
 
 // -----
 
-// expected-error@+1 {{frisk-infer-layouts supports only NVIDIA SM90/SM90a targets}}
+// expected-error@+1 {{sm90-target: malformed, unsupported or conflicting target declarations}}
 module attributes {frisk.target = "gfx90a"} {
   func.func @unsupported_target() {
     return

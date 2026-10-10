@@ -15,6 +15,8 @@ def FriskInferLayouts : Pass<"frisk-infer-layouts", "::mlir::ModuleOp"> {
   let constructor = "mlir::frisk::createFriskInferLayoutsPass()";
   let dependentDialects = ["::mlir::frisk::FriskDialect"];
   let options = [
+    Option<"statsFile", "stats-file", "std::string", "\"\"",
+           "Atomically write attempt-local layout statistics JSON">,
     Option<"analysisOnly", "analysis-only", "bool", "false",
            "Collect, solve and verify layouts without modifying IR">,
     Option<"dumpAnalysis", "dump-analysis", "bool", "false",
@@ -36,7 +38,9 @@ def TestLowerLayoutConversions : Pass<"frisk-test-lower-layout-conversions", "::
   let summary = "Test-only static single-CTA layout redistribution adapter";
   let constructor = "mlir::frisk::createTestLowerLayoutConversionsPass()";
   let options = [Option<"scratchBudget", "scratch-budget", "uint64_t", "49152",
-    "Conservative adapter workgroup byte budget (not the SM90 maximum)">];
+    "Conservative adapter workgroup byte budget (not the SM90 maximum)">,
+    Option<"executable", "executable", "bool", "false",
+    "Lower verified rank-one global tile load/conversion/store kernels without tensor bridges">];
 }
 
 #endif // FRISK_PASSES

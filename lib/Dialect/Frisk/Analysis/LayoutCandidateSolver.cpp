@@ -1,6 +1,10 @@
 #include "Dialect/Frisk/Analysis/LayoutSolver.h"
+#include "Dialect/Frisk/Analysis/LayoutStatistics.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/DenseSet.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
 #include "Dialect/Frisk/Analysis/LayoutCostModel.h"
+#include "Dialect/Frisk/Analysis/LayoutConversionChoice.h"
 #include "Dialect/Frisk/Analysis/InstructionLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/ReductionLayoutConstraints.h"
 #include "mlir/IR/Diagnostics.h"
@@ -55,7 +59,28 @@ getHardConstraintComponents(const LayoutConstraintGraph &graph) {
 
 FailureOr<LayoutSolution>
 solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
-                 SolverOptions options) {
+                 SolverOptions options, LayoutSolveFailure *why,
+                 LayoutAttemptStatistics *statistics) {
+  LayoutSolveFailure localFailure;
+  if (!why) why = &localFailure;
+  LayoutSolution solution;
+  bool solved = false;
+  auto start = LayoutClock::now();
+  if (statistics && !statistics->prepared) prepareLayoutStatistics(graph, *statistics);
+  auto finish = llvm::make_scope_exit([&] {
+    if (!statistics) return;
+    statistics->statistics.solveTime += std::chrono::nanoseconds(layoutElapsedNS(start));
+    uint64_t remaining = 0;
+    for (const auto &var : graph.getVariables()) {
+      llvm::DenseSet<Attribute> unique;
+      for (const auto &candidate : var.candidates) unique.insert(candidate.value);
+      remaining += unique.size();
+    }
+    statistics->statistics.prunedCandidates = statistics->statistics.preparedCandidates - remaining;
+    if (!solved) finishLayoutStatistics(graph, *why, nullptr, *statistics);
+  });
+  *why = {LayoutSolveFailureKind::InvalidInput, UINT32_MAX, UINT32_MAX,
+          "invalid graph or solver options"};
   const bool validOptions = options.beamWidth && options.maxExpandedStates &&
                             options.exactCombinationLimit;
   if (graph.getVariables().empty()) {
@@ -64,8 +89,10 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
       llvm::errs() << "invalid layout solver options or empty graph invariants\n";
       return failure();
     }
-    LayoutSolution empty;
-    return empty;
+    *why = {};
+    if (statistics) finishLayoutStatistics(graph, *why, &solution, *statistics);
+    solved = true;
+    return solution;
   }
   if (!graph.getVariables().front().shapedType &&
       !graph.getVariables().front().anchor) {
@@ -88,10 +115,12 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
          (c.kind == ConstraintKind::ReductionLayout && !c.reduction))) {
       emitError(loc) << "layout solver does not support hard constraint '"
                      << stringifyConstraintKind(c.kind) << "'";
+      *why = {LayoutSolveFailureKind::Unsupported, UINT32_MAX, c.id,
+              "unsupported hard constraint"};
       return failure();
     }
 
-  LayoutSolution solution;
+  LayoutSolveFailure emptyFailure;
   auto product = [](uint64_t value, uint64_t factor, bool &overflow) {
     if (factor && value > UINT64_MAX / factor) {
       overflow = true;
@@ -99,10 +128,34 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
     }
     return value * factor;
   };
-  for (const auto &component : getHardConstraintComponents(graph)) {
+  for (auto component : getHardConstraintComponents(graph)) {
+    bool emptyComponent = false;
     LayoutSolution::ComponentStatistics stats;
     stats.root = component.front();
     stats.beamWidth = options.beamWidth;
+    auto finishComponent = llvm::make_scope_exit([&] {
+      if (!statistics) return;
+      auto &aggregate = statistics->statistics;
+      ++aggregate.components;
+      aggregate.expandedStates += stats.expanded;
+      aggregate.peakFrontierStates = std::max(aggregate.peakFrontierStates, stats.peakFrontier);
+      aggregate.peakComponentCombinations = std::max(aggregate.peakComponentCombinations, stats.combinations);
+      aggregate.componentProductOverflow |= stats.productOverflow;
+      for (auto domain : stats.domains)
+        aggregate.peakVariableDomain = std::max<uint64_t>(aggregate.peakVariableDomain, domain);
+      statistics->mrvProbes += stats.mrvProbes;
+      statistics->expandedNodes += stats.expandedNodes;
+      llvm::json::Array domains;
+      for (auto domain : stats.domains) domains.push_back(domain);
+      statistics->components.push_back(llvm::json::Object{
+        {"root", graph.getVariable(stats.root).stableName},
+        {"combinations", stats.productOverflow ? llvm::json::Value(nullptr) : llvm::json::Value(stats.combinations)},
+        {"productOverflow", stats.productOverflow}, {"domains", std::move(domains)},
+        {"mode", stats.usedBeam ? "beam" : "exact"}, {"beamWidth", stats.beamWidth},
+        {"expanded", stats.expanded}, {"peakFrontier", stats.peakFrontier},
+        {"mrvProbes", stats.mrvProbes}, {"expandedNodes", stats.expandedNodes},
+        {"exhaustive", stats.exhaustive}});
+    });
     SmallVector<LayoutConstraintID> constraints;
     SmallVector<unsigned> degree(graph.getVariables().size(), 0);
     for (const auto &c : graph.getConstraints())
@@ -121,6 +174,19 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
         return layoutCandidateKey(a.value) < layoutCandidateKey(b.value);
       });
       SmallVector<LayoutCandidate> kept;
+      LayoutSolveFailure rejection{LayoutSolveFailureKind::EmptyDomain, id,
+                                  UINT32_MAX, "empty input domain"};
+      if (var.candidatePreparationUnsupported)
+        rejection = {LayoutSolveFailureKind::Unsupported, id, UINT32_MAX,
+                     "candidate preparation rejected an unsupported target encoding"};
+      // A missing mandatory seed is not permission to invent another encoding.
+      for (auto cid : constraints) {
+        const auto &c = graph.getConstraint(cid);
+        if (c.kind == ConstraintKind::RequireEncoding &&
+            llvm::is_contained(c.vars, id))
+          rejection = {LayoutSolveFailureKind::HardConflict, id, cid,
+                       "mandatory encoding has no legal candidate"};
+      }
       for (const auto &candidate : var.candidates) {
         if (llvm::any_of(kept, [&](const auto &c) {
               return c.value == candidate.value;
@@ -142,6 +208,11 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
                   succeeded(verifyLayoutStorageCapacity(graph, var, candidate.value));
         }
         LayoutConstraintID rejected = UINT32_MAX;
+        // A failed target/capacity decoder has no three-valued proof here.
+        // Treat it as unsupported, never as proven emptiness for relaxation.
+        LayoutSolveFailureKind rejectedKind = valid
+            ? LayoutSolveFailureKind::EmptyDomain
+            : LayoutSolveFailureKind::Unsupported;
         DenseMap<LayoutVarID, Attribute> single;
         single[id] = candidate.value;
         if (valid)
@@ -151,30 +222,113 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
             if (!satisfiesLayoutConstraint(graph, c, single, false)) {
               valid = false;
               rejected = cid;
+              rejectedKind = LayoutSolveFailureKind::HardConflict;
               reason = "hard constraint not proven: ";
               reason += stringifyConstraintKind(c.kind).str();
               if (isSupportedUnaryLayoutConstraint(c.kind)) {
                 auto proof = proveUnaryLayoutConstraint(graph, c, candidate.value);
                 reason += ": " + proof.reason;
+                rejectedKind = proof.status == ProofStatus::Unknown
+                    ? LayoutSolveFailureKind::Unsupported
+                    : LayoutSolveFailureKind::EmptyDomain;
               }
               break;
             }
           }
         if (valid) kept.push_back(candidate);
-        else solution.rejections.push_back(
-            {id, layoutCandidateKey(candidate.value), reason, rejected});
+        else {
+          solution.rejections.push_back(
+              {id, layoutCandidateKey(candidate.value), reason, rejected});
+          if (rejection.kind == LayoutSolveFailureKind::EmptyDomain ||
+              rejectedKind == LayoutSolveFailureKind::Unsupported)
+            rejection = {rejectedKind, id, rejected, reason};
+        }
       }
       var.candidates = std::move(kept);
       if (var.candidates.empty()) {
-        emitError(getVariableLoc(var)) << "no proven layout candidate for "
-            << var.stableName << " (hard constraints not proven): "
-            << (solution.rejections.empty() ? "empty input domain"
-                                           : solution.rejections.back().reason);
-        return failure();
+        if (rejection.kind != LayoutSolveFailureKind::EmptyDomain) {
+          *why = rejection;
+          emitError(getVariableLoc(var)) << "no proven layout candidate for "
+              << var.stableName << " (hard constraints not proven): " << rejection.reason;
+          return failure();
+        }
+        if (emptyFailure.kind == LayoutSolveFailureKind::None) emptyFailure = rejection;
+        emptyComponent = true;
       }
       stats.domains.push_back(var.candidates.size());
       stats.combinations = product(stats.combinations, var.candidates.size(),
                                     stats.productOverflow);
+    }
+    // Still inspect every other component: an empty domain must not hide an
+    // unsupported decoder, hard conflict, incomplete search or exhausted budget.
+    if (emptyComponent) {
+      // Audit the remaining binary subdomains in this component as well. An
+      // empty neighbour cannot hide an unsupported address/transform proof.
+      // The same finite search budget bounds this residual proof work.
+      for (auto cid : constraints) {
+        const auto &c = graph.getConstraint(cid);
+        if (!isSupportedLayoutRelation(c.kind) || c.vars.size() < 2) continue;
+        auto lhs = c.vars.front();
+        for (auto rhs : llvm::drop_begin(c.vars)) {
+          const auto &a = graph.getVariable(lhs).candidates;
+          const auto &b = graph.getVariable(rhs).candidates;
+          if (a.empty() || b.empty()) continue;
+          bool supported = false, unknown = false;
+          for (const auto &x : a) {
+            for (const auto &y : b) {
+              if (stats.expanded == options.maxExpandedStates) {
+                *why = {LayoutSolveFailureKind::SearchBudget, stats.root, cid,
+                        "search-budget-exceeded in residual domain audit"};
+                emitError(loc) << why->reason;
+                return failure();
+              }
+              ++stats.expanded;
+              auto proof = proveLayoutRelation(graph,c,lhs,x.value,rhs,y.value);
+              supported |= proof.status == ProofStatus::Proven;
+              unknown |= proof.status == ProofStatus::Unknown;
+              if (supported) break;
+            }
+            if (supported) break;
+          }
+          if (!supported) {
+            *why = {unknown ? LayoutSolveFailureKind::Unsupported
+                            : LayoutSolveFailureKind::HardConflict,
+                    lhs,cid,"nonempty residual relation has no proven support"};
+            emitError(loc) << why->reason;
+            return failure();
+          }
+        }
+      }
+      // Pairwise support is not joint feasibility (for example an inconsistent
+      // equality cycle). Run the same bounded search on the nonempty residual
+      // component, retaining complete constraints and the budget already spent.
+      // Partially missing n-ary constraints cannot be projected generically.
+      for (auto cid : constraints) {
+        const auto &c = graph.getConstraint(cid);
+        auto present = llvm::count_if(c.vars, [&](auto id) {
+          return !graph.getVariable(id).candidates.empty();
+        });
+        if (present > 1 && present < c.vars.size()) {
+          *why = {LayoutSolveFailureKind::Unsupported, stats.root, cid,
+                  "cannot prove partial n-ary residual constraint"};
+          emitError(loc) << why->reason;
+          return failure();
+        }
+      }
+      llvm::erase_if(constraints, [&](auto cid) {
+        return llvm::any_of(graph.getConstraint(cid).vars, [&](auto id) {
+          return graph.getVariable(id).candidates.empty();
+        });
+      });
+      llvm::erase_if(component, [&](auto id) {
+        return graph.getVariable(id).candidates.empty();
+      });
+      if (component.empty()) continue;
+      stats.combinations = 1;
+      stats.productOverflow = false;
+      for (auto id : component)
+        stats.combinations = product(stats.combinations,
+            graph.getVariable(id).candidates.size(), stats.productOverflow);
     }
     stats.usedBeam = stats.combinations > options.exactCombinationLimit ||
                      stats.productOverflow;
@@ -186,6 +340,7 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
     // Cache complete relation checks by immutable canonical-domain indices.
     // Partial tuple/pair support checks remain attribute keyed.
     std::map<std::vector<unsigned>, bool> relationCache;
+    bool unknownRelation = false;
     auto viable = [&](const State &s) {
       for (auto cid : constraints) {
         const auto &c = graph.getConstraint(cid);
@@ -199,6 +354,18 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
         if (found != relationCache.end()) ok = found->second;
         else {
           ok = satisfiesLayoutConstraint(graph, c, s.assignment.values, false);
+          if (!ok && c.kind != ConstraintKind::InstructionContract &&
+              c.kind != ConstraintKind::ReductionLayout &&
+              llvm::all_of(c.vars, [&](auto id) { return s.assignment.values.count(id); })) {
+            if (isSupportedUnaryLayoutConstraint(c.kind))
+              unknownRelation |= proveUnaryLayoutConstraint(graph, c,
+                  s.assignment.values.lookup(c.vars.front())).status == ProofStatus::Unknown;
+            else if (isSupportedLayoutRelation(c.kind))
+              for (auto id : llvm::drop_begin(c.vars))
+                unknownRelation |= proveLayoutRelation(graph, c,
+                    c.vars.front(), s.assignment.values.lookup(c.vars.front()),
+                    id, s.assignment.values.lookup(id)).status == ProofStatus::Unknown;
+          }
           relationCache.emplace(std::move(key), ok);
         }
         if (!ok) return false;
@@ -210,23 +377,13 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
       auto cost = complete ? target.evaluate(graph, s.assignment)
                            : target.lowerBound(graph, s.assignment);
       if (failed(cost)) return failure();
-      for (auto cid : constraints) {
-        const auto &c = graph.getConstraint(cid);
-        if (c.kind != ConstraintKind::Convertible) continue;
-        Attribute from = s.assignment.values.lookup(c.vars[0]);
-        Attribute to = s.assignment.values.lookup(c.vars[1]);
-        if (!from || !to || layoutEncodingsEqual(from, to)) continue;
-        LayoutConversionEdge edge;
-        edge.use = c.use;
-        edge.sourceEncoding = from;
-        edge.targetEncoding = to;
-        edge.resolution = EdgeResolutionKind::Convert;
-        edge.constraint = cid;
-        auto conversion = evaluateLayoutConversionCost(
-            graph.getVariable(c.vars[0]), from, to, edge);
-        if (failed(conversion)) return failure();
-        *cost = addLayoutCosts(*cost, *conversion);
-        if (edges && !c.existingConversion) edges->push_back(edge);
+      // Boundary choices may later share a conversion or replace it with a
+      // cheap clone. Zero is a safe partial bound; per-use charges are not.
+      if (complete) {
+        auto choices = chooseLayoutConversions(graph, s.assignment, target);
+        if (failed(choices)) return failure();
+        *cost = addLayoutCosts(*cost, choices->cost);
+        if (edges) llvm::append_range(*edges, choices->edges);
       }
       s.bound = *cost;
       return success();
@@ -241,6 +398,7 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
     initial.key.assign(component.size(), UINT32_MAX);
     SmallVector<State> frontier;
     frontier.push_back(std::move(initial));
+    stats.peakFrontier = 1;
     for (size_t depth = 0; depth < component.size(); ++depth) {
       SmallVector<State> next;
       for (const auto &state : frontier) {
@@ -255,12 +413,15 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
           const auto &domain = graph.getVariable(id).candidates;
           for (unsigned ci = 0; ci < domain.size(); ++ci) {
             if (stats.expanded == options.maxExpandedStates) {
+              *why = {LayoutSolveFailureKind::SearchBudget, stats.root,
+                      UINT32_MAX, "search-budget-exceeded"};
               emitError(getVariableLoc(graph.getVariable(stats.root)))
                   << "search-budget-exceeded: expanded=" << stats.expanded
                   << ", limit=" << options.maxExpandedStates;
               return failure();
             }
             ++stats.expanded;
+            ++stats.mrvProbes;
             State child = state;
             child.key[index] = ci;
             child.assignment.values[id] = domain[ci].value;
@@ -276,7 +437,11 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
           if (children.empty()) break;
         }
         for (auto &child : children) {
-          if (failed(evaluate(child, depth + 1 == component.size()))) {
+          ++stats.expandedNodes;
+          if (failed(evaluate(child, !emptyComponent &&
+                                     depth + 1 == component.size()))) {
+            *why = {LayoutSolveFailureKind::CostFailure, stats.root,
+                    UINT32_MAX, "layout cost evaluation failed"};
             emitError(loc) << "layout cost evaluation failed; not a free solution";
             return failure();
           }
@@ -289,22 +454,47 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
         next.resize(options.beamWidth);
       }
       frontier = std::move(next);
+      stats.peakFrontier = std::max<uint64_t>(stats.peakFrontier, frontier.size());
       if (frontier.empty()) break;
     }
     stats.exhaustive = stats.beamDiscarded == 0;
     if (frontier.empty()) {
+      *why = {unknownRelation ? LayoutSolveFailureKind::Unsupported
+                : stats.exhaustive ? LayoutSolveFailureKind::HardConflict
+                              : LayoutSolveFailureKind::SearchIncomplete,
+              stats.root, UINT32_MAX,
+              unknownRelation ? "unknown binary layout relation proof"
+                : stats.exhaustive ? "no feasible proven assignment"
+                               : "beam discarded alternatives"};
       emitError(getVariableLoc(graph.getVariable(stats.root)))
-          << (stats.exhaustive ? "no feasible proven layout assignment"
+          << (unknownRelation ? "unsupported: unknown binary layout relation proof"
+                : stats.exhaustive ? "no feasible proven layout assignment"
                               : "search-incomplete: beam discarded alternatives");
       return failure();
     }
+    // A residual assignment proves only joint feasibility, not a complete
+    // component solution. Its missing conversion/instruction endpoints cannot
+    // be priced by the complete-assignment API; only partial lower bounds above
+    // are meaningful. The deferred EmptyDomain still rejects the original graph.
+    if (emptyComponent) continue;
     auto &best = frontier.front();
-    if (failed(evaluate(best, true, &solution.conversions))) return failure();
+    if (failed(evaluate(best, true, &solution.conversions))) {
+      *why = {LayoutSolveFailureKind::CostFailure, stats.root, UINT32_MAX,
+              "selected boundary cost evaluation failed"};
+      return failure();
+    }
     stats.cost = best.bound;
     solution.cost = addLayoutCosts(solution.cost, best.bound);
     for (auto id : component)
       solution.assignments[id] = best.assignment.values.lookup(id);
-    solution.components.push_back(std::move(stats));
+    solution.components.push_back(stats);
+  }
+  if (emptyFailure.kind != LayoutSolveFailureKind::None) {
+    *why = emptyFailure;
+    const auto &var = graph.getVariable(why->variable);
+    emitError(getVariableLoc(var)) << "no proven layout candidate for "
+        << var.stableName << " (hard constraints not proven): " << why->reason;
+    return failure();
   }
   llvm::sort(solution.conversions, [&](const auto &a, const auto &b) {
     return graph.getConstraint(a.constraint).stableUseKey <
@@ -322,6 +512,9 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
       solution.instructionBindings[c.id] = tuple->binding;
     }
   }
+  *why = {};
+  if (statistics) finishLayoutStatistics(graph, *why, &solution, *statistics);
+  solved = true;
   return solution;
 }
 

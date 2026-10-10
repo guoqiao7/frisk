@@ -1,4 +1,6 @@
 #include "Dialect/Frisk/Analysis/LayoutSolver.h"
+#include "Dialect/Frisk/Analysis/LayoutStatistics.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "Dialect/Frisk/Analysis/OperationLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
 #include "Dialect/Frisk/Analysis/StorageRootContracts.h"
@@ -344,8 +346,16 @@ LayoutConstraintBuilder::lookup(Value value, LayoutKind kind) const {
 
 FailureOr<LayoutConstraintGraph>
 collectLayoutConstraints(Operation *root, LayoutTarget &target,
-                         LayoutCollectionMode mode) {
+                         LayoutCollectionMode mode, LayoutStatisticsReport *statistics) {
+  auto collectionStart = LayoutClock::now();
+  auto phaseStart = collectionStart;
+  bool preparing = false;
   LayoutConstraintGraph graph;
+  auto recordTiming = llvm::make_scope_exit([&] {
+    if (!statistics) return;
+    statistics->timings[preparing ? "preparation_ns" : "collection_ns"] += layoutElapsedNS(phaseStart);
+    statistics->rawGeneratedProposals = graph.getCandidatePreparationStatistics().generatedProposals;
+  });
   LayoutConstraintBuilder builder(graph);
   DenseMap<Value, SmallVector<LayoutVarID>> viewsBySource;
   SmallVector<Value> sourceOrder;
@@ -414,6 +424,9 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
     return failure();
   if (mode == LayoutCollectionMode::RelationsOnly)
     return graph;
+  if (statistics) statistics->timings["collection_ns"] += layoutElapsedNS(collectionStart);
+  preparing = true;
+  phaseStart = LayoutClock::now();
 
   if (failed(target.prepareInstructionCandidates(graph)))
     return failure();
@@ -456,6 +469,7 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
             for (const LayoutCandidate &sourceCandidate : sourceCandidates) {
               FailureOr<Attribute> projected = projectLayoutCandidate(
                   graph, constraint, sourceID, sourceCandidate.value, targetID);
+              if (succeeded(projected)) ++graph.getCandidatePreparationStatistics().generatedProposals;
               if (failed(projected) ||
                   llvm::any_of(targetVar.candidates,
                                [&](const LayoutCandidate &known) {
@@ -495,10 +509,13 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
       continue;
     SmallVector<LayoutCandidate> candidates;
     target.enumerateCandidates(var, candidates);
+    graph.getCandidatePreparationStatistics().generatedProposals += candidates.size();
     for (const LayoutCandidate &candidate : candidates) {
-      if (failed(target.verifyCandidate(var, candidate.value,
-                                        root->getLoc())) ||
-          llvm::any_of(var.candidates, [&](const LayoutCandidate &known) {
+      if (failed(target.verifyCandidate(var, candidate.value, root->getLoc()))) {
+        var.candidatePreparationUnsupported = true;
+        continue;
+      }
+      if (llvm::any_of(var.candidates, [&](const LayoutCandidate &known) {
             return known.value == candidate.value;
           }))
         continue;
@@ -522,7 +539,8 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
              std::make_pair(rhs.stableOrdinal, layoutCandidateKey(rhs.value));
     });
     updateState(var);
-    if (var.state == LayoutState::Conflict) {
+    if (var.state == LayoutState::Conflict &&
+        mode != LayoutCollectionMode::InitializeForRelaxation) {
       if (var.anchor)
         var.anchor->emitError("no valid target layout candidates for ")
             << var.stableName;

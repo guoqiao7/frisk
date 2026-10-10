@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
+#include "Dialect/Frisk/Analysis/LayoutRelaxation.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "Dialect/Frisk/IR/FriskAttributes.h"
 #include "gtest/gtest.h"
@@ -162,7 +163,11 @@ TEST_F(LayoutCandidateSolverTest, BeamLosingOnlySolutionReportsIncomplete) {
   ScopedDiagnosticHandler capture(&context, [&](Diagnostic &d) {
     llvm::raw_string_ostream(errors) << d; return success();
   });
-  EXPECT_TRUE(failed(solveLayoutGraph(graph,target,options)));
+  SmallVector<RelaxationRecord> records;
+  LayoutSolveFailure why;
+  EXPECT_TRUE(failed(attemptControlledRelaxation(graph,target,options,records,&why)));
+  EXPECT_EQ(why.kind, LayoutSolveFailureKind::SearchIncomplete);
+  EXPECT_TRUE(records.empty());
   EXPECT_NE(errors.find("search-incomplete"),std::string::npos) << errors;
   EXPECT_EQ(errors.find("no feasible"),std::string::npos);
   options.beamWidth=8;
@@ -320,9 +325,9 @@ TEST_F(PhysicalSolverTest, BetterMainComputationBeatsZeroConversions) {
   EXPECT_EQ(s->assignments.lookup(0),z);
   ASSERT_EQ(s->conversions.size(),1u);
   EXPECT_EQ(s->cost.cost.instructionPathAndWork,0u);
-  EXPECT_EQ(s->cost.cost.conversionBytesAndSync,768u);
+  EXPECT_EQ(s->cost.cost.conversionBytesAndSync,512u); // Proven warp shuffle, no CTA barrier.
   EXPECT_EQ(s->conversions[0].bytes,512u);
-  EXPECT_EQ(s->conversions[0].synchronizationCost,2u);
+  EXPECT_EQ(s->conversions[0].synchronizationCost,0u);
   EXPECT_TRUE(succeeded(verifySolvedLayoutGraph(graph,*s,target,b.getUnknownLoc())));
 }
 
@@ -334,7 +339,7 @@ TEST_F(PhysicalSolverTest, EqualMainCostChoosesLowerConversionBytes) {
   auto s=solveLayoutGraph(graph,target);
   ASSERT_TRUE(succeeded(s));
   EXPECT_EQ(s->assignments.lookup(0),z);
-  EXPECT_EQ(s->cost.cost.conversionBytesAndSync,768u);
+  EXPECT_EQ(s->cost.cost.conversionBytesAndSync,512u);
 }
 
 TEST_F(PhysicalSolverTest, ExistingConversionChargedOnceWithoutReinsertion) {
@@ -345,7 +350,7 @@ TEST_F(PhysicalSolverTest, ExistingConversionChargedOnceWithoutReinsertion) {
   auto s=solveLayoutGraph(graph,target);
   ASSERT_TRUE(succeeded(s));
   EXPECT_TRUE(s->conversions.empty());
-  EXPECT_EQ(s->cost.cost.conversionBytesAndSync,768u);
+  EXPECT_EQ(s->cost.cost.conversionBytesAndSync,512u);
   EXPECT_EQ(s->cost.cost.codeSize,1u);
 }
 } // namespace

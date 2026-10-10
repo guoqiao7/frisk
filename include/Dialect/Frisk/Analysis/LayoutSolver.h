@@ -9,6 +9,8 @@
 #include "mlir/IR/Value.h"
 
 namespace mlir::frisk {
+struct LayoutAttemptStatistics;
+struct LayoutStatisticsReport;
 
 struct LayoutSolution {
   DenseMap<LayoutVarID, Attribute> assignments;
@@ -21,6 +23,7 @@ struct LayoutSolution {
     uint64_t rawCombinations = 1, combinations = 1;
     uint64_t expanded = 0, hardRejected = 0, beamDiscarded = 0;
     uint64_t deduplicated = 0;
+    uint64_t peakFrontier = 0, mrvProbes = 0, expandedNodes = 0;
     bool rawProductOverflow = false, productOverflow = false;
     bool usedBeam = false, exhaustive = false;
     unsigned beamWidth = 0;
@@ -42,9 +45,21 @@ struct SolverOptions {
   uint64_t maxExpandedStates = 65536;
 };
 
+enum class LayoutSolveFailureKind {
+  None, InvalidInput, EmptyDomain, HardConflict, Unsupported,
+  SearchBudget, SearchIncomplete, CostFailure
+};
+struct LayoutSolveFailure {
+  LayoutSolveFailureKind kind = LayoutSolveFailureKind::None;
+  LayoutVarID variable = UINT32_MAX;
+  LayoutConstraintID constraint = UINT32_MAX;
+  std::string reason;
+};
+
 FailureOr<LayoutSolution>
 solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
-                 SolverOptions options = {});
+                 SolverOptions options = {}, LayoutSolveFailure *why = nullptr,
+                 LayoutAttemptStatistics *statistics = nullptr);
 void printLayoutSolutionStatistics(const LayoutConstraintGraph &graph,
                                    const LayoutSolution &solution,
                                    LayoutTarget &target, llvm::raw_ostream &os);
@@ -86,11 +101,17 @@ private:
   uint64_t nextStableOrdinal = 0;
 };
 
-enum class LayoutCollectionMode { InitializeCandidates, RelationsOnly };
+enum class LayoutCollectionMode {
+  InitializeCandidates, RelationsOnly,
+  // Keep empty ordinary domains for the structured relaxation coordinator.
+  // Unsupported instruction/alias proofs still fail collection normally.
+  InitializeForRelaxation
+};
 
 FailureOr<LayoutConstraintGraph> collectLayoutConstraints(
     Operation *root, LayoutTarget &target,
-    LayoutCollectionMode mode = LayoutCollectionMode::InitializeCandidates);
+    LayoutCollectionMode mode = LayoutCollectionMode::InitializeCandidates,
+    LayoutStatisticsReport *statistics = nullptr);
 
 /// Extends the graph before finalization, including structured Tensor joins.
 LogicalResult collectDistributedLayoutConstraints(

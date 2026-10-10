@@ -164,6 +164,7 @@ LogicalResult initializeStorageAliasCandidates(
     proposalRoot.stableName = info.rootKey;
     SmallVector<LayoutCandidate> proposals;
     target.enumerateCandidates(proposalRoot, proposals);
+    stats.generatedProposals += proposals.size() + 1; // Includes the proved linear root template.
     llvm::erase_if(proposals, [](const auto &candidate) { return candidate.stableOrdinal == 0; });
     proposals.insert(proposals.begin(), {*linear, kInvalidProvenanceID, 0});
     for (auto proposal : proposals) {

@@ -1,5 +1,9 @@
 # Frisk SM90 MLIR-native 布局推断系统设计
 
+> **M6 完成（2026-10-10）：方案 A 的 Task27→28→29 已实施并通过分项复审。最终 405 unit、58 lit、7 CTest 及 Python/API 隔离通过；11 个真实 GPU 正确性用例和 33 次 sanitizer 通过，三个必测 conversion 的 runtime/完整编译占比门槛通过，参考基线已独立评审接受。整体源码及最终文档复审通过。exact256/beam32/65536、共同语义域及真实计时口径保持不变；证据见实现计划 §29.3 和验收文档，不推广为任意 kernel 性能或对 TileLang/Triton 的优势。**
+
+> 最新实现（2026-09-28）：Task 26 方案 A 已完成可诊断的独立重试、安全转换提升与共享重计算；357 unit / 53 lit / 4 CTest / 5 Python normalization、SM90 工具及生产隔离检查通过，独立复审的重要问题已关闭。具体契约与实际支持边界见 §8.9 和实现计划 §26.1–26.5。仍无完整异步 GPU lowering 或性能领先结论；源目录 main 修改未 commit/push。
+
 > 最新验收（2026-09-27）：Task 23 已完成，272 unit / 49 lit / 4 CTest / 5 Python 与独立复审通过；完整 MMA→Reduce→Global store 和含 Copy/Parallel 的整链成功，历史 9/8 变量缺口已补齐，详见 §22。本轮未提交或推送。
 
 > 状态：MLIR-native 双域 IR 架构已确认（原架构候选“方案 C”）
@@ -586,6 +590,8 @@ MLIR DataFlow Framework 可以处理 region/branch/callgraph 的可达性和程�
 
 ### 8.7 阶段 F：候选生成与剪枝
 
+Task 24 方案 A 已实现并验收，实施契约见实现计划 §24.1–24.4、最终 Gate 见 §24.7：首版 edge 候选覆盖同块 consumer conversion、同源同目标共享 conversion、最多 8 个便宜纯操作的 backward slice 重计算；不跨 block/region/loop 提升。以下硬件候选全集仍是总体设计，不表示 Task 24 实现了 Task 25/26。
+
 对仍未解析的每个连通分量，由 SM90 target rules 生成有限候选：
 
 - Distributed：blocked、warp-striped、lane-striped、fully-replicated、MMA result/dot operand compatible；
@@ -598,6 +604,8 @@ MLIR DataFlow Framework 可以处理 region/branch/callgraph 的可达性和程�
 生成后立即执行 hard pruning：shape 不整除时生成 guarded/ragged candidate，而不是错误地假设整除；指令内层 tile 不满足时删除候选；TMA alignment/box 条件不满足时保留 cp.async/SIMT fallback。
 
 ### 8.8 阶段 G：全局代价选择
+
+Task 24 将完整布局赋值的边界方案按同源/同目标/同块分组求解，再与原赋值成本相加；部分赋值的边界下界为 0。第四项扩展为边界修复成本，既计搬运/同步也计克隆工作及叶子转换；主计算路径仍使用第一项，不能只给重计算增加第一项而让转换恒为 0。循环位置使用 `2^depth` 静态权重，非 trip count 或硬件 cycle。组间不共享克隆，不宣称一般程序的全局最优或运行性能优势。
 
 以 layout constraint graph 的连通分量为优化单元。首版使用“传播剪枝 + 动态规划/beam search”，不引入通用 ILP。代价采用字典序向量，而不是一个难以校准的总分：
 
@@ -619,6 +627,16 @@ CostVector = (
 首先用 hard constraint 排除不合法候选，再联合评估指令路径、实际工作量、访存、bank conflict、conversion、寄存器和 occupancy。conversion 是强成本项，但不是绝对禁止项：如果一个受控 conversion 能让主计算命中明显更优的 WGMMA/TMA 路径，它可以优于零 conversion 的低性能方案。对无法可靠静态预测的近似相等候选使用稳定 tie-break；后续可接 autotuning，但不能让结果依赖遍历顺序。
 
 ### 8.9 阶段 H：受控 relaxation/free mode
+
+Task26 方案 A 已确认并完成实施与验收，具体契约及结果见实现计划 §26.1–26.5。Task25 已有的 guarded Copy、TMA/cp.async/vector 路径及合法 padding/replication 保留普通候选身份；不得为制造回退而先禁止这些路径。只有可证明空候选域才进入独立快照上的有序扩展；预算耗尽、beam 不完整、unknown、硬语义冲突不作为松弛依据。WGMMA 的替代计算路径尚未实现，因此最后一级只给 unsupported 诊断，不宣称已有 SIMT fallback。原问题无可行基准时记录最终成本，不将其标为增量。
+
+Task26 同时将共享重计算纳入 Task24 同块边界方案选择；安全 conversion hoist 必须验证 dominance、硬布局关系、执行域与成本，不因 ConvertLayoutOp 标记 Pure 就移动潜在 shuffle/Shared 通信跨越控制流。optimizer 独立调用同样使用模块事务与实际布局复验。以下顺序是策略顺序，不意味着所有目标已实现全部替代路径。
+
+实际实现边界见实现计划 §26.4：SM90 新增有限 replication 提案；其余已覆盖策略继续留在普通候选集中，WGMMA 替代路径不生成虚假契约。空域诊断先审计其他分量及同分量内非空残余图的联合可行性，保留 Unknown/预算/beam 区分，不能以逐边支持替代联合搜索。没有可行 baseline 时只记录最终成本和尝试原因。
+
+转换前移需核对物化器的临时 `frisk.inferred_result_layout` 授权，只修改原本未编码的结果；默认独立 infer/materialize 不生成授权，优化结束删除它。当前 elementwise/extend 前移限紧邻、单 use、一个唯一 Tensor 输入；循环提升仅限循环外来源的 Register 交换，不移动 shuffle/Shared 通信。共享重计算选择在 solver 中比较并计费，同块同源同目标多个 use 共用经核验的 leader、切片与实际 SSA；保留 8-op 上限、支配关系和硬 seed 限制。
+
+Task 24 不实现本阶段的候选松弛。重计算不得改变 mandatory encoding、SameLayout 或硬件契约；不安全/超出 8-op 上限的 slice 不枚举，仍可使用原有合法转换。
 
 显式 conversion 和 rematerialization 已经是阶段 F/G 的普通候选，不以“零转换方案不存在”为启用条件。只有普通候选域经过 hard pruning 后为空，才进入受控松弛，顺序为：
 
@@ -791,6 +809,8 @@ Reduce 规则由 `(input layout, axes, combiner, output shape)` 推导：
 
 ## 10. SM90 Target Rule Library
 
+Task 25 方案 A 已于 2026-09-28 实施并通过单元、lit、CTest/Python 与独立复审，实际记录见实现计划 §25.4–25.5。交付范围为显式目标解析、既有 FP16/BF16 WGMMA 规则表化、TMA/cp.async/vector/scalar Copy 路径联合选择、静态 guarded whole-tile Copy 和地址/形状成本。Copy 路径作为 Instruction 变量，与 source/destination/execution 组成四角色契约，最终 binding 在实际 IR 中独立复验。全局/Shared/swizzle-phase 对齐分别建模；无证明的高速路径被排除，普通正确路径保留。完整异步指令 lowering、动态 ragged 与通用 relaxation 不属于本轮交付。
+
 ### 10.1 结构
 
 建议将规则拆成数据表和少量生成器：
@@ -889,7 +909,7 @@ NVIDIA 对 compute capability 9 的 TMA swizzle 给出了 32B/64B/128B 模式及
 - 默认候选若相对固定手写 baseline 有稳定回退，应禁用该选择并保留基准数据，直到代价模型修正。
 - 创新布局先通过 feature flag 和 benchmark 白名单，再成为默认。
 - 固定环境下，现有 codegen 支持的 kernel 中位运行时间回退不得超过 3%。
-- 常规连通分量候选上限为 256、首版 beam width 为 32；布局推断占完整编译时间应不超过 10%，超限时必须输出 component 和候选统计。
+- 按 Task23 和 M6 已确认契约，去重/硬剪枝后的组件组合数不超过 256 时默认精确搜索，超过则使用 beam width 32，每组件每次尝试最多 65536 次候选扩展。256 不是变量域或组件候选硬上限；分别统计域、组合乘积、frontier 和扩展数。对具备真实完整编译路径的用例，整个布局 pipeline 占比不得超过 10%；无完整路径只报告阶段耗时，不宣称该门槛通过。超限必须输出 component 和候选统计，不能静默放宽阈值。
 - 对尚无目标 lowering 的 WGMMA/TMA 路径，只能报告契约、bank/coalescing、conversion 和资源静态指标，不能宣称运行时性能通过。
 
 ## 12. 分阶段实施方案
@@ -981,7 +1001,7 @@ Tensor/vector 桥接仍需 M6 可执行 lowering 接管，不代表 GPU runtime 
 - 统计 conversion、bank conflict、coalescing、资源、candidate 数和编译时间。
 - 对当前 codegen 或最小 adapter 支持的路径执行运行时性能回归。
 
-验收：正确性零容忍项全部通过；固定环境下受支持 kernel 中位运行时间回退不超过 3%；常规候选上限、beam width 和布局编译时间满足第 11.5 节；扩展新 target 不需要修改通用 solver 核心。
+验收：正确性零容忍项在声明的支持用例中全部通过；固定环境下受支持 kernel 中位运行时间回退不超过 3%；exact/beam 切换、搜索预算和适用域布局编译时间满足第 11.5 节；扩展新 target 不需要修改通用 solver 核心。必须有真实 adapter 的 GPU 执行证据，不能以 CPU 模拟或占位 IR 替代。
 
 ## 13. 建议的代码组织
 
@@ -1228,3 +1248,69 @@ CostVector 按字段字典序比较，先硬合法、后软成本；候选域内
 exact 穷尽、beam 截断和预算中断有不同结果语义：beam 找到的解只承诺合法；被截断后找不到解不等于证明无解。输出搜索统计与成本覆盖，保留 MMA/Reduce binding、consumer conversion、实际 IR 独立验证和 Task 22 事务。完整 9 变量链及含 Copy/Parallel 的整链已经实测成功并更新此前验收缺口；失败回滚改用显式搜索预算测试继续覆盖。
 
 本任务不包含 Task 24 的 hoist/rematerialization/critical-path placement，也不包含 Task 25 的完整 SM90 性能模型或 GPU 验收。方案及契约已经用户确认并实施，实际验收进度见实现计划 §23.9。
+
+## 23. M5 Task 24：同块边界选择与受限重计算（已完成）
+
+Task 24 在完整候选赋值评分时选择边界实现，不在物化后再用无成本依据的重写改变决定。`LayoutConversionChoices` 返回成本与逐 use 计划；相同编码不生成计划，不同编码比较同块一次共享转换与逐 use 的合法便宜重计算。共享转换在最早 consumer 前生成，成本只计一次。部分赋值的边界成本取 0 下界，避免提前重复计费导致错误剪枝。
+
+`LayoutConversionEdge` 保存 constraint/use 身份、source/target encoding、resolution、insertionPoint、sharedLeader、exchange、loopDepth、costProvenance 和拓扑序 slice。验证器在检查原硬关系和缺失转换后，重建确定性计划以核验上述信息；物化器用 `IRMapping` 在 detached module 生成新 SSA，MLIR 和 actual-only 布局验证都通过后才提交。
+
+克隆白名单为单 Tensor 结果的 dense constant 和便宜 arith add/sub/mul/bitwise/select，且必须有无副作用接口证明。最多 8 个不同操作，不跨块/region；标量及 Tensor 叶子必须支配插入点，叶子转换去重并计费。原 producer 保留，克隆不改写 hard encoding/资源约束，也不改变 MMA/Reduce/Storage 契约。Task 26 的跨 use 重计算共享与 cleanup 应复用此计划，不得无条件重复克隆。
+
+静态成本区分 register/shuffle/shared 和保守回退；owner 分类受 65536 逻辑元素、262144 合计 carrier 上限约束，lane/topology 或 map 不支持时使用非零 staging 上界。第四字段明确是边界修复工作：搬运/同步，或每个克隆输出 carrier 的元素字节工作与其叶子转换；循环权重为 `2^depth`，采用饱和运算。克隆增量寄存器槽、replication 和 codeSize 也计费。该模型不是 GPU cycle/occupancy 测量，也未补齐前三个 SM90 性能字段。
+
+实际命令、覆盖和验收记录见实现计划 Task 24；首版不承诺跨 region hoist、任意纯操作重计算、通用 placement 最优或运行时性能提升。
+
+## 24. M5 Task 25：目标规则、Copy 路径和物理地址成本
+
+SM90 adapter 将最近芯片声明与独立作用域的适用 DLTI 属性合并核验。普通默认 SM90 不隐式启用 WGMMA；现有 FP16/BF16 SS/RS 的 24 个 atom 表项与逐坐标证明联合使用。Copy 的第四角色是独立路径变量，避免同一 storage/execution 下的 TMA、cp.async 和普通向量被错误去重。
+
+物化的 `frisk.copy_contract` 包含 issuer、completion、guard 和 descriptor。TMA 支持静态 whole-tile Global→Shared、F16/BF16/F32、rank 1–5、每维不超过 256 和 non-interleave none/32/64/128B 地址关系。source base 对齐、Shared base 对齐与 swizzle phase 是不同条件；路径不成立时保留合法普通 Copy。guarded Copy 保留原 storage shape，execution 仅用二次幂 carrier，并从原 shape 重新验证有效域；不把 ragged encoding 扩大到一般 Tensor/MMA/Fill。
+
+前三项 CostVector 已从未建模零值改为显式静态代理：warp/atom 工作、32B Global sector、Shared 每 128B 访问阶段的 distinct-word bank 冲突。未知 base phase 取一致相位中的上界，连续 float4 的多个阶段不是 bank 冲突。Task 24 的边界成本继续参与同一字典序比较，所以转置 store 可能选择更合适的消费者布局并承担一次 shuffle；小 Copy 也可能胜过有固定 setup 的 TMA。具体代理参数、保守范围和精确值测试见实现计划 §25.4–25.5，不将这些分数解释为硬件 cycle、实测 occupancy 或性能保证。
+
+## 25. M6：正确性、固定语义参考与真实执行验收契约
+
+本节记录 2026-10-09 用户确认的方案 A 及实际交付边界；实施过程见实现计划 §M6.1–M6.5 和 Task27–29，最终证据见 `layout_inference_acceptance.md`。
+
+### 25.1 独立性质 oracle 与可重放失败
+
+GF(2) 组合、逆/右逆、canonicalize、Product 等性质采用有界逐点枚举验证；期望值不得完全复用被测实现计算。solver 小图采用独立全赋值 oracle；exact/未截断搜索核验最优性，截断 beam 只核验合法性、失败分类与确定性。固定 seed 和稳定语义身份支持跨插入顺序、跨进程复现，不人为改写有副作用 IR 的执行顺序。
+
+失败文件保存 schema、配置、稳定变量/候选/关系、必要宿主 IR 和结构化 failure signature；重新加载重建 SSA/use/alias/region 引用，不序列化指针。缩减每步先验证图有效、再确认失败特征相同，迭代至单步删除意义下的 1-minimal，不把 InvalidInput 替代原来的 solver 错误，也不承诺全局最小。
+
+Task27 已实施并通过独立复审（2026-10-09）：`evaluateLayoutMap(Attribute, ArrayRef<int64_t>)` 公开复用已有坐标求值器，供性质测试及后续语义枚举使用；调用者传入非空、已验证的 canonical map 和域内坐标，不改变布局代数。`layout-reduce` 首版文件域明确为 `finite-same-require-v1`：有限字符串候选、SameLayout/RequireEncoding、零测试成本及可解析宿主 MLIR。此支持库只链接 CLI/单测，不链接生产 analysis；指令表、Convertible、SSA/use、alias/region 和硬件成本等载荷明确拒绝。raw reducer 保留稳定候选序号，重建起点及最终结果必须继续满足失败谓词。当前不是任意真实 GPU 布局图的导出器，不把其缩减结果推广为所有布局失败均可重放。性质/随机图测试的覆盖与局部命令记录见实现计划 §27.2。
+
+### 25.2 固定 TileLang 语义参考
+
+参考版本继续固定为 `5e149e31674658f94779c7d0c6039549a1853123`；隔离构建、加载实际 native library 后导出，核验源码、子模块、Python/native 路径及内容摘要。schema v2 区分 carrier/logical 坐标、storage bit offset、同值 copy group、完成值/部分贡献及 writer 策略；JSON 不包含 TVM 对象 repr 或依赖本机地址的内容。Frisk CI 只读取审计后的静态 corpus，不链接 TileLang/TVM。
+
+共同支持域标为 `equivalent`，由 Frisk 独立构建并枚举布局比较；Frisk 已明确不支持的语义标为 `reject` 并真实执行拒绝测试。两个计数分开，不将 expected-rejection 当成功能支持。多个合法同值 owner 不能作为非法重复拒绝；非法重复 carrier、冲突映射及越界地址必须拒绝。上游未提供的 writer 策略须标清来源，不能伪造为 TileLang 的固定选择。
+
+本阶段不因 corpus 覆盖 dtype-changing view、一般非二次幂 Tensor 或 PartialFragment 而扩大 Frisk 生产支持范围；差异记录为采用/不采用的具体语义，而非把上游构造文本当真值。
+
+Task28 已实现并通过独立复审（2026-10-09）：真实固定版本导出已产生 schema2 corpus，20 个等价 case 和 3 个实际拒绝 case 均通过，两次最终导出字节一致。Copy/Reduce/guard/floating 来自实际上游 LayoutInference，GEMM 来自 WGMMA emitter，Shared 来自 native layout 工厂。Frisk 独立构造 canonical map 并运行 ownership/vector/reduction/instruction proof；不从 corpus 点表反建答案。未引入生产语义变更或上游运行依赖。exporter 校验输出身份、暂存两份文件、先发布 audit 再替换 corpus，失败不覆盖旧 corpus；不承诺跨两个文件的原子提交，最终 rename 失败留下的 audit/corpus 不匹配由摘要识别。实际范围与依赖/加载证据见 `tilelang_layout_reference.md` 和实现计划 §28.2；这不是两套完整推断策略或 kernel runtime 的等价性证明。
+
+### 25.3 统计、可执行桥接与编译时间
+
+统计分开记录域总量、单域峰值、组件组合数、frontier、扩展节点；保留 exact256/beam32/65536 原行为，不以候选乘积超过 256 直接失败。共享 conversion/rematerialization 分开统计 use 边与唯一实际动作，按照 leader 去重，静态 bank/transaction 估计不标成 profiler 计数。
+
+Task29 的接口实现采用显式、可选的 `LayoutStatisticsReport` 收集器，贯穿 collection、单次 solve、受控重试和 pipeline；不以全局可变状态在 pass 之间传递统计。每个 attempt 保留独立域快照、组件搜索记录、失败身份与计时，`expanded` 预算工作量不与 MRV probes、扩展节点混淆。infer/pipeline 的 `stats-file` 默认关闭；请求落盘时暂存完整 JSON，验证及统计写入均成功后才提交 IR。`solved`、`materialized`、`committed` 状态区分阶段，后续失败不得留下本次的最终成功记录。本段记录实施接口约束，是否验收通过以 Task29 最终测试为准。
+
+`LayoutStatisticsScope::Standalone` 在每次 infer 调用前重置外部收集器；`Pipeline` 保留本次外层事务已记录的阶段信息。最终 coordinator 失败身份与每次 attempt 的历史分别记录，落盘失败将外部状态设为 `failed/statistics-write`。统计 API 不因复用一个 report 对象累积上一次运行的候选或耗时。
+
+GPU 测试入口必须把现有 Tensor/vector 占位桥接替换为真实 tile load/store 与每线程传输，经过真实 `TestLayoutConversionLowering` 及后端生成可执行产物。首批必需验证 identity、warp shuffle、跨 warp Shared exchange，参考 kernel 独立实现，输入与语义校验相同；保留产物和编译链的内容摘要。不能用手写的第二个 CUDA kernel 冒充 inferred 路径，也不扩展完整 WGMMA/TMA lowering。
+
+本轮最小可执行入口限定为静态、rank-one、row-major Global MemRef ABI：普通 `func.func` Frisk 输入先经过正式布局 pipeline，再由测试驱动进行保留类型与 binding 的 `gpu.func` 入口提升，复验后调用 adapter 的显式 `executable` 模式。这是测试级 ABI 接入，不增加生产 alias 分析对任意 GPU region 根的支持。既有结构检查模式仍可含不可执行桥接，不能据此报告 GPU 成功；实际执行产物必须消除所有 tensor 桥接、未解析布局和占位调用。入口提升前后 IR 均保留为编译证据。
+
+完整编译计时从同一 Frisk 输入到可加载 GPU 产物，布局分子包含准备、传播/搜索/重试、物化、转换优化和布局验证。没有完整后端路径的用例只报告局部耗时。不能把 reference 编译、依赖构建、等待、GPU 执行或无关工作加入分母，以掩盖超过 10% 的布局开销。
+
+Task29 首轮实测编译占比超限后，将有限仿射坐标求值中的逐点 `IndexAttr` 构造改为直接整数表达式求值；所有枚举点、证明调用及原预算保持不变，不缓存可变 IR 的证明。支持原有不含 affine symbol 的常量、维度、加法、乘法、mod、floorDiv、ceilDiv，以有符号 64 位整数计算；加乘溢出、无效除数及 `INT64_MIN / -1` 返回求值失败，不能绕回到会溢出的求值路径并生成“已证明”结论。中间结果不可表示也必须保守失败，即使后续除法可能使最终结果回到范围内。该优化不扩大符号布局或证明支持域；实际性能改善必须由后续同样本完整编译重测确认。
+
+### 25.4 Gate 不得由缺失证据替代
+
+每个必需 GPU case 先通过数值/位模式及 memcheck/racecheck/synccheck，再比较同环境 reference/inferred median，回退上限仍为 3%。记录热身/采样、GPU/驱动/toolkit/时钟策略/flags 和负载，环境不匹配为不可比较；缺 baseline 不填零，也不自动自封 inferred 为基线。使用独立 Release 构建，默认 CPU 构建不依赖 CUDA。
+
+全量 CPU Gate、真实固定版本 corpus、GPU conversion 正确性/安全/runtime 和适用域完整编译占比均有证据后才能标记 M6 完成。失败则定位修复并重测；不能通过扩大 OUT_OF_SCOPE、删 case 或改变阈值取得通过。最终逐项结果记录在 `guoqiao/layout_inference_acceptance.md`，明确尚无 WGMMA/TMA 完整 lowering 的边界。
+
+2026-10-10 最终实测满足上述门槛：三个必测 conversion 的 runtime 比值为 1.007874/1.000000/1.008333，完整编译占比为 3.80%/3.97%/6.67%；另两次完整编译重复最大 7.165%。首轮 12.14%/12.05%/20.24% 的 FAIL 保留为优化前证据，没有放宽阈值。当前 accepted baseline 来自同环境独立 reference，保存真实样本及来源摘要；环境不匹配或参考源码改变时不能继续套用。

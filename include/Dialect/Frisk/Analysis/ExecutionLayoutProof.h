@@ -42,5 +42,12 @@ LayoutProof proveExecutionOwnership(DistributedEncodingAttr execution,
 LayoutProof proveExecutionVectorAccess(DistributedEncodingAttr execution,
     const StorageAliasInfo &storageInfo, const StorageAliasFootprint &storage,
     unsigned vectorBytes, AccessKind access, StringRef writerPolicy);
+/// Scalar-only guarded Copy proof. Execution shape must be the exact per-axis
+/// power-of-two ceiling of the unchanged storage shape. Tail points are inactive
+/// and never acquire storage addresses; both domains obey the 65536-point bound.
+LayoutProof proveGuardedExecutionVectorAccess(DistributedEncodingAttr execution,
+    RankedTensorType paddedExecutionType, const StorageAliasInfo &storageInfo,
+    const StorageAliasFootprint &storage, unsigned vectorBytes, AccessKind access,
+    StringRef writerPolicy);
 } // namespace mlir::frisk
 #endif

@@ -68,7 +68,7 @@ LogicalResult verifyImportAttributes(Operation *scope, bool allowLegacyThreads) 
       if (name == "frisk.target" || name == "frisk.legacy_semantics" ||
           name == "frisk.execution_threads" || name == "frisk.execution_layout" ||
           name == "frisk.writer_policy" || name == "frisk.vector_bytes" ||
-          name == "frisk.mma_contract" || name == "frisk.reduction_contract" ||
+          name == "frisk.mma_contract" || name == "frisk.copy_contract" || name == "frisk.reduction_contract" ||
           (allowLegacyThreads && name == "frisk.threads" && isa<GemmOp>(op)))
         continue;
       op->emitError("legacy-attribute-contract: unsupported semantic attribute ") << name;

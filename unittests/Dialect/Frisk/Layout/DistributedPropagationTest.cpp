@@ -80,7 +80,18 @@ TEST_F(DistributedPropagationTest, RealDualConsumerKeepsAlternatives) {
   ASSERT_TRUE(succeeded(propagateCommonToFixedPoint(*graph)));
   auto solution = solveLayoutGraph(*graph, *target);
   ASSERT_TRUE(succeeded(solution));
-  EXPECT_TRUE(solution->conversions.empty());
+  ASSERT_EQ(solution->conversions.size(), 1u);
+  EXPECT_EQ(solution->conversions.front().exchange, ConversionExchangeKind::Shuffle);
+  CandidateAssignment common{solution->assignments};
+  for (const auto &var : graph->getVariables())
+    if (var.use) {
+      auto source = graph->lookupVariable(var.use->get());
+      ASSERT_TRUE(source);
+      common.values[var.id] = solution->assignments.lookup(*source);
+    }
+  auto commonCost = target->evaluate(*graph, common);
+  ASSERT_TRUE(succeeded(commonCost));
+  EXPECT_LT(solution->cost.cost.memoryTransactions, commonCost->cost.memoryTransactions);
   EXPECT_TRUE(succeeded(verifySolvedLayoutGraph(
       *graph, *solution, *target, module->getLoc())));
 }

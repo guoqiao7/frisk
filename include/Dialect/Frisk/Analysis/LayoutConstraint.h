@@ -80,11 +80,16 @@ struct LayoutVar {
   bool instructionRole = false;
   /// A reduction result is seeded only by forward projection, never defaults.
   bool reductionResult = false;
+  // A LogicalResult-only target decoder rejected generated candidates. An
+  // ensuing empty domain is unsupported evidence, not proven infeasibility.
+  bool candidatePreparationUnsupported = false;
 };
 
 enum class AccessKind { Read, Write };
 
 enum class EdgeResolutionKind { KeepCommonLayout, Convert, Rematerialize };
+
+enum class ConversionExchangeKind { Identity, Register, Shuffle, Shared, Conservative };
 
 struct LayoutConversionEdge {
   OpOperand *use = nullptr;
@@ -94,6 +99,14 @@ struct LayoutConversionEdge {
   uint64_t bytes = 0;
   uint64_t synchronizationCost = 0;
   LayoutConstraintID constraint = std::numeric_limits<LayoutConstraintID>::max();
+  ConversionExchangeKind exchange = ConversionExchangeKind::Identity;
+  uint64_t loopDepth = 0;
+  std::string costProvenance;
+  Operation *insertionPoint = nullptr;
+  // The earliest use's constraint owns a shared conversion. Each use still has
+  // its own edge record so missing/duplicate consumers can be verified.
+  LayoutConstraintID sharedLeader = std::numeric_limits<LayoutConstraintID>::max();
+  SmallVector<Operation *> rematerialization;
 };
 
 struct LayoutProvenance {
@@ -204,6 +217,9 @@ struct LayoutPropagationStatistics {
 };
 
 struct LayoutCandidatePreparationStatistics {
+  // Generated target/root/constraint-projection proposals, before deduplication.
+  // Explicit input seeds are not generated proposals.
+  uint64_t generatedProposals = 0;
   uint64_t origins = 0;
   uint64_t projectedCandidates = 0;
   uint64_t footprintEvaluations = 0;

@@ -14,7 +14,8 @@ LogicalResult verifySolvedLayoutGraph(const LayoutConstraintGraph &graph,
 
 LogicalResult materializeLayouts(Operation *root,
                                  const LayoutConstraintGraph &graph,
-                                 const LayoutSolution &solution);
+                                 const LayoutSolution &solution,
+                                 bool authorizeInternalOptimization = false);
 
 LogicalResult verifyMaterializedLayouts(Operation *root,
                                         LayoutTarget &target);

@@ -136,7 +136,8 @@ LayoutProof mlir::frisk::proveExecutionOwnership(DistributedEncodingAttr executi
   return enumerate(execution, logicalType, writerPolicy, points);
 }
 
-LayoutProof mlir::frisk::proveExecutionVectorAccess(DistributedEncodingAttr execution,
+static LayoutProof proveAccess(DistributedEncodingAttr execution,
+    RankedTensorType executionType,
     const StorageAliasInfo &info, const StorageAliasFootprint &storage,
     unsigned vectorBytes, AccessKind access, StringRef writerPolicy) {
   if (vectorBytes != 1 && vectorBytes != 2 && vectorBytes != 4 && vectorBytes != 8 && vectorBytes != 16)
@@ -150,21 +151,28 @@ LayoutProof mlir::frisk::proveExecutionVectorAccess(DistributedEncodingAttr exec
   uint64_t bits = element.getIntOrFloatBitWidth();
   if (!bits) return reject("zero-width storage element");
   Enumeration points;
-  auto proof = enumerate(execution, RankedTensorType::get(info.viewType.getShape(), element), writerPolicy, points);
+  auto proof = enumerate(execution, executionType, writerPolicy, points);
   if (proof.status != ProofStatus::Proven) return proof;
-  if (storage.entries.size() != points.first.size())
+  auto shape = info.viewType.getShape();
+  uint64_t actualCount = 1;
+  for (int64_t extent : shape) {
+    if (extent <= 0 || uint64_t(extent) > budget / actualCount)
+      return reject("storage logical domain exceeds bounded positive tile");
+    actualCount *= extent;
+  }
+  if (storage.entries.size() != actualCount)
     return reject("storage footprint does not cover logical tile");
-  SmallVector<const StorageAliasPointAddress *> addresses(points.first.size(), nullptr);
+  SmallVector<const StorageAliasPointAddress *> addresses(actualCount, nullptr);
   for (const auto &entry : storage.entries) {
     auto root = evaluateStorageViewCoordinates(info, entry.view);
     if (failed(root) || *root != entry.root)
       return reject("storage footprint root coordinate does not match the view descriptor", entry.view);
-    if (entry.view.size() != points.shape.size()) return reject("footprint coordinate rank mismatch", entry.view);
+    if (entry.view.size() != shape.size()) return reject("footprint coordinate rank mismatch", entry.view);
     uint64_t flat = 0;
     for (unsigned i = 0; i < entry.view.size(); ++i) {
-      if (entry.view[i] < 0 || entry.view[i] >= points.shape[i])
+      if (entry.view[i] < 0 || entry.view[i] >= shape[i])
         return reject("footprint coordinate outside logical tile", entry.view);
-      flat = flat * points.shape[i] + entry.view[i];
+      flat = flat * shape[i] + entry.view[i];
     }
     if (addresses[flat] || entry.begin < info.lowerBit || entry.end > info.upperBit ||
         entry.end < entry.begin || entry.end - entry.begin != bits)
@@ -181,6 +189,9 @@ LayoutProof mlir::frisk::proveExecutionVectorAccess(DistributedEncodingAttr exec
   for (unsigned i = 1; i < intervals.size(); ++i)
     if (intervals[i]->begin < intervals[i-1]->end)
       return reject("storage footprint physical bit intervals overlap", intervals[i]->view);
+  // Scalar guarded execution consumes only the actual-domain table above.
+  // Enumeration proves every padded point has an elected owner, hence every
+  // active point does too. No address is looked up or synthesized for a tail.
   if (vectorBytes == 1) return proven(); // Packed scalar baseline.
   if (bits % 8) return reject("packed elements cannot use wide vectors");
   uint64_t bytes = bits / 8;
@@ -216,4 +227,38 @@ LayoutProof mlir::frisk::proveExecutionVectorAccess(DistributedEncodingAttr exec
     }
   }
   return proven();
+}
+
+LayoutProof mlir::frisk::proveExecutionVectorAccess(DistributedEncodingAttr execution,
+    const StorageAliasInfo &info, const StorageAliasFootprint &storage,
+    unsigned vectorBytes, AccessKind access, StringRef writerPolicy) {
+  if (!info.viewType) return reject("missing storage view type");
+  return proveAccess(execution,
+      RankedTensorType::get(info.viewType.getShape(), info.viewType.getElementType()),
+      info, storage, vectorBytes, access, writerPolicy);
+}
+
+LayoutProof mlir::frisk::proveGuardedExecutionVectorAccess(
+    DistributedEncodingAttr execution, RankedTensorType padded,
+    const StorageAliasInfo &info, const StorageAliasFootprint &storage,
+    unsigned vectorBytes, AccessKind access, StringRef writerPolicy) {
+  if (vectorBytes != 1) return reject("guarded Copy requires scalar vector_bytes=1");
+  if (!info.viewType || !info.viewType.hasStaticShape() || !padded ||
+      !padded.hasStaticShape() || padded.getRank() == 0 ||
+      padded.getRank() != info.viewType.getRank() ||
+      padded.getElementType() != info.viewType.getElementType())
+    return reject("guarded execution requires matching static storage and execution types");
+  uint64_t actualCount = 1, paddedCount = 1;
+  for (auto [actual, carrier] : llvm::zip_equal(info.viewType.getShape(), padded.getShape())) {
+    if (actual <= 0 || uint64_t(actual) > budget / actualCount)
+      return reject("guarded logical enumeration budget exceeded (65536)");
+    actualCount *= actual;
+    uint64_t expected = llvm::PowerOf2Ceil(uint64_t(actual));
+    if (carrier <= 0 || uint64_t(carrier) != expected)
+      return reject("guarded execution shape is not the exact padded storage shape");
+    if (expected > budget / paddedCount)
+      return reject("guarded padded enumeration budget exceeded (65536)");
+    paddedCount *= expected;
+  }
+  return proveAccess(execution, padded, info, storage, vectorBytes, access, writerPolicy);
 }

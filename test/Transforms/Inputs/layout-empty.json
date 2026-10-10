@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "domain": "finite-same-require-v1",
+  "seed": 42,
+  "host": "module {}",
+  "options": {"exact": 256, "beam": 32, "expanded": 65536},
+  "variables": [{"id": "empty", "candidates": []}, {"id": "unused", "candidates": ["b", "a"]}],
+  "relations": [],
+  "failure": {"kind": "EmptyDomain", "variable": "empty", "relation": "", "rule": "", "reason": "empty input domain"}
+}

@@ -322,6 +322,23 @@ LogicalResult LayoutConstraintGraph::verifyInvariants(Location loc) const {
       // The concrete MMA roles refer to actual operands/results, not synthetic
       // independent values. Avoid an Analysis -> FriskIR library dependency.
       Operation *op = instruction.source;
+      if (op->getName().getStringRef() == "frisk.copy") {
+        if (op->getNumOperands() < 2 || instruction.binding != op->getAttr("frisk.copy_contract"))
+          return emitError(loc) << "Copy instruction binding differs from actual operation";
+        for (unsigned role = 0; role < 2; ++role) {
+          const auto &var = variables[constraint.vars[role]];
+          if (var.kind != LayoutKind::Storage || var.value != op->getOperand(role) ||
+              var.shapedType != op->getOperand(role).getType())
+            return emitError(loc) << "Copy storage role does not match actual SSA operand";
+        }
+        const auto &execution = variables[constraint.vars[2]];
+        const auto &path = variables[constraint.vars[3]];
+        if (!execution.operationExecution || execution.anchor != op ||
+            path.kind != LayoutKind::Instruction || path.anchor != op ||
+            path.value || path.use || path.functionResult || !path.instructionRole ||
+            path.requiredThreads != execution.requiredThreads || path.shapedType != execution.shapedType)
+          return emitError(loc) << "Copy execution/path role does not match actual operation";
+      }
       if (op->getName().getStringRef() == "frisk.mma") {
         if (op->getNumOperands() != 3 || op->getNumResults() != 1)
           return emitError(loc) << "invalid MMA operation arity";

@@ -1,4 +1,6 @@
 #include "Dialect/Frisk/Target/SM90/SM90GemmConstraints.h"
+#include "Dialect/Frisk/Target/SM90/SM90InstructionTable.h"
+#include "Dialect/Frisk/Target/SM90/SM90TargetInfo.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/MathExtras.h"
 #include <map>
@@ -184,6 +186,7 @@ LogicalResult mlir::frisk::prepareSM90MmaCandidates(LayoutConstraintGraph &graph
       return op.emitOpError("sm90-mma-thread-group: unsupported tile/policy/threads");
     }
     auto add = [&](unsigned role, Attribute attr) {
+      ++graph.getCandidatePreparationStatistics().generatedProposals;
       auto &var = graph.getVariable(constraint.vars[role]);
       if (llvm::none_of(var.candidates,[&](const LayoutCandidate &c) { return c.value==attr; })) {
         auto provenance = graph.addProvenance(std::nullopt,op,"mma-target-candidate",
@@ -229,18 +232,24 @@ FailureOr<Attribute> mlir::frisk::buildSM90MmaContract(const LayoutConstraintGra
   }
   auto g = getSM90MmaGeometry(op,graph.getVariable(constraint.vars[3]).requiredThreads);
   if (failed(g)) return failure();
+  auto target = getSM90TargetInfo(op);
+  if (failed(target) || !target->supportsWGMMA) return failure();
   bool rs = isa<RankedTensorType>(op.getA().getType());
+  auto rule = lookupSM90WGMMA(cast<ShapedType>(op.getA().getType()).getElementType(),
+      cast<ShapedType>(op.getResult().getType()).getElementType(),rs ? "rs" : "ss",
+      64,g->atomN,16,g->threads,"k","k");
+  if (!rule) return failure();
   Builder b(op.getContext());
   SmallVector<NamedAttribute> fields{
     b.getNamedAttr("version",b.getI64IntegerAttr(1)),
-    b.getNamedAttr("target",b.getStringAttr("sm_90a")),
+    b.getNamedAttr("target",b.getStringAttr(target->targetKey)),
     b.getNamedAttr("form",b.getStringAttr(rs ? "rs" : "ss")),
     b.getNamedAttr("input_type",TypeAttr::get(cast<ShapedType>(op.getA().getType()).getElementType())),
     b.getNamedAttr("accumulator_type",TypeAttr::get(cast<ShapedType>(op.getResult().getType()).getElementType())),
     b.getNamedAttr("atom",b.getDenseI64ArrayAttr({64,g->atomN,16})),
     b.getNamedAttr("grid",b.getDenseI64ArrayAttr({g->gM,g->gN})),
     b.getNamedAttr("repeats",b.getDenseI64ArrayAttr({g->mRepeat,g->nRepeat,g->kRepeat})),
-    b.getNamedAttr("packing",b.getStringAttr(rs ? "f16x2-low-high" : "none"))};
+    b.getNamedAttr("packing",b.getStringAttr(rule->packing))};
   for (unsigned role = rs?1:0; role<2; ++role) {
     auto &var = graph.getVariable(constraint.vars[role]);
     auto storage = dyn_cast_or_null<StorageLayoutAttr>(encodings[role]);

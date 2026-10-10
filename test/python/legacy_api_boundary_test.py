@@ -18,7 +18,7 @@ def main():
         re.compile(r"LegacyLayoutOracle"),
     ]
     violations = []
-    for directory in ("include", "lib", "ffi", "tools"):
+    for directory in ("include", "lib", "ffi", "tools", "exp/layout"):
         for path in sorted((args.source_root / directory).rglob("*")):
             if path.suffix not in (".h", ".cpp", ".td"):
                 continue
@@ -31,6 +31,9 @@ def main():
         products = [args.build_dir / "bin/frisk-opt"]
         products.extend(args.build_dir.glob("frisk_ffi*.so"))
         assert len(products) > 1, "built frisk_ffi product missing"
+        layout_tool = args.build_dir / "exp/layout/frisk_layout_tool"
+        if layout_tool.exists():
+            products.append(layout_tool)
         for product in products:
             symbols = subprocess.run(
                 ["nm", "-C", str(product)], check=True, text=True,

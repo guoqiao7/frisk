@@ -16,6 +16,11 @@ enum class LayoutKind { Distributed, Storage, Instruction };
 
 enum class ProofStatus { Proven, Disproven, Unknown };
 
+enum class RelaxationKind {
+  Replication, StoragePaddingOrNarrowerVector, GuardedRagged,
+  TMAFallback, WGMMAFallback
+};
+
 struct LayoutProof {
   ProofStatus status = ProofStatus::Unknown;
   llvm::SmallVector<int64_t> counterexample;

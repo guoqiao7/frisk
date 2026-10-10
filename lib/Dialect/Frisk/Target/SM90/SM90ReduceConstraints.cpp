@@ -1,20 +1,15 @@
 #include "Dialect/Frisk/Target/SM90/SM90ReduceConstraints.h"
+#include "Dialect/Frisk/Target/SM90/SM90TargetInfo.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
 #include "Dialect/Frisk/Analysis/ReductionLayoutProof.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
 
 namespace mlir::frisk {
 namespace {
-FailureOr<StringRef> reductionTarget(Operation *op) {
-  for (auto *scope = op; scope; scope = scope->getParentOp()) {
-    if (auto attr = scope->getAttr("frisk.target")) {
-      auto name = dyn_cast<StringAttr>(attr);
-      if (!name || (name.getValue() != "sm_90" && name.getValue() != "sm_90a"))
-        return failure();
-      return name.getValue();
-    }
-  }
-  return StringRef("sm_90");
+FailureOr<std::string> reductionTarget(Operation *op) {
+  auto target = getSM90TargetInfo(op);
+  if (failed(target)) return failure();
+  return target->targetKey;
 }
 
 /// Decode the one versioned algorithm, never enumerate candidates or plans.

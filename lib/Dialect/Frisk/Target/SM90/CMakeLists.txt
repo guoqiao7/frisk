@@ -1,5 +1,9 @@
 add_frisk_library(FriskSM90LayoutTarget
   SM90LayoutTarget.cpp
+  SM90CopyConstraints.cpp
+  SM90CostModel.cpp
+  SM90TargetInfo.cpp
+  SM90InstructionTable.cpp
   SM90DistributedCandidates.cpp
   SM90MmaLayoutProof.cpp
   SM90GemmConstraints.cpp
@@ -10,4 +14,7 @@ add_frisk_library(FriskSM90LayoutTarget
   FriskLayoutAnalysis
   FriskIR
   MLIRIR
+  MLIRNVVMDialect
+  MLIRGPUDialect
+  MLIRDLTIDialect
 )
