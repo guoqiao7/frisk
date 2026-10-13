@@ -1,5 +1,7 @@
 # Frisk SM90 MLIR-native 布局推断系统设计
 
+> P0 方案 A（2026-10-14，方案已确认、详细契约待审阅）：基线已提交为 `219c0cf`。下一增量依次补强固定外部行主序 Attention、可选有界决策 trace、原预算内的 beam 解单变量邻域改进。接口、预算、失败语义与验收见 [P0 设计](optimize_plan/p0_implementation_design.md)。尚未实现，不改变历史完成状态；不扩展 GPU lowering、自动分块或成本模型。
+
 > 后续方案 A（2026-10-10，已实现并通过回归）：修复 Global 根身份/SSA 作用域混用及 packed 零输出位宽拒绝，新增受限 Tensor broadcast，完成单 tile Attention 布局推断。417 unit、61 lit、7 Debug CTest、1 Release generator CTest、5 Python normalization 及 API/tool 检查全部通过；逐任务及整体源码复审通过。契约如下；这不代表任意算子或完整 Attention lowering 已支持。
 
 ## 后续增量契约：单 tile Attention 与审计修复
