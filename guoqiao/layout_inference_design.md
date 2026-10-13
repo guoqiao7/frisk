@@ -1,5 +1,23 @@
 # Frisk SM90 MLIR-native 布局推断系统设计
 
+> 后续方案 A（2026-10-10，已实现并通过回归）：修复 Global 根身份/SSA 作用域混用及 packed 零输出位宽拒绝，新增受限 Tensor broadcast，完成单 tile Attention 布局推断。417 unit、61 lit、7 Debug CTest、1 Release generator CTest、5 Python normalization 及 API/tool 检查全部通过；逐任务及整体源码复审通过。契约如下；这不代表任意算子或完整 Attention lowering 已支持。
+
+## 后续增量契约：单 tile Attention 与审计修复
+
+验收 `O = cast_f16(softmax(Q Kᵀ × 0.25)) V`：Global Q/K/V 均为 `64×16xf16`，分数为 `64×64xf32`，Global O 为 `64×16xf32`；SM90a、128 线程，第一次 SS MMA、第二次 RS MMA。Softmax 为 ReduceMax → broadcast → Sub → Exp → ReduceSum → broadcast → Div；归约和归一化为 f32，归一化后才转 f16。
+
+单头、单静态 tile、无 causal mask/dropout/尾块；不实施 online Attention、通用 reshape、任意动态广播及完整 WGMMA/TMA/mbarrier lowering。成功标准是生产布局 pipeline 输出合法可复验 IR，不声称 Attention GPU 数值/性能已验收。正文早期 Broadcast/Reshape 总体目标不等于此前已交付能力。
+
+Global 规范根只能作为 alias identity；`storage_contract` 必须使用当前作用域内支配声明的实际根句柄，不能跨函数/分支引用另一个 `get_global` 的 SSA 值，同时保留共同 Global 一致性证明。BitLinear 输出零位宽表示常量零坐标，Storage alias 精确转换必须支持 `memref<4xi1>` 的 `(byte_offset=0, bit_offset=d)`；输入位宽、矩阵、容量、不重叠和证明预算不放宽。
+
+为静态 RankedTensor `linalg.broadcast` 建立有向坐标关系：输出坐标删除 broadcast dimensions 后必须匹配输入坐标，保持非广播轴顺序、dtype、线程域及复制/owner 语义。广播不是双射 transpose 或不同 shape 的 SameLayout。冻结候选前执行有限坐标投影/补全，冻结后仅删减；必要时在源 use 插入合法 `convert_layout`。具体候选策略：输出端由已有硬约束、邻接关系或 target 默认候选提供，再删除广播轴并消去冗余 register 基，反向投影至输入 use；输入端仅过滤输出支持，不伪造唯一逆映射或反复扩张寄存器域。实际 IR verifier 重建并验证关系，不能依赖旧候选表或测试硬编码布局。动态/未知证明/冲突保守失败，保持 exact256/beam32/65536。
+
+广播实际支持边界：输入/输出均为非零 rank、每轴大于 1 的静态 2 次幂 Tensor，dtype 相同；广播轴有序且不重复，删除这些轴后恰好等于输入 shape。证明枚举同一 CTA 内每个输出持有者，要求其线程的某个源寄存器持有所需输入坐标；不要求源/目标寄存器编号相同，也不依赖轴名称相等。单元轴、动态 shape、非 2 次幂及未知证明仍保守拒绝。实际 IR 复验不生成候选。
+
+验收包含两处缺陷先红后绿、广播坐标与冲突反例、完整 Attention 两次 MMA/两次 Reduce/两次 broadcast 及真实 Global 输出、重跑和 print/parse 一致、失败回滚；全量 unit/lit/CTest/Python 回归及独立复审。直接在源目录修改，本轮不自动 commit/push。
+
+完整可运行输入见 [`attention-layout.mlir`](../test/Transforms/attention-layout.mlir)，逐边数据流、全部 Tensor encoding、实际布局验证、字节一致重放与预算失败回滚检查见 [`AttentionLayoutIntegrationTest.cpp`](../unittests/Dialect/Frisk/Layout/AttentionLayoutIntegrationTest.cpp)。A1/A2 修复后完整 Attention 首次运行已通过，A3 仅增加集成验收，没有新增形状特判、放宽预算或绕过 verifier。完整命令及验收口径见实现计划“后续方案 A”。
+
 > **M6 完成（2026-10-10）：方案 A 的 Task27→28→29 已实施并通过分项复审。最终 405 unit、58 lit、7 CTest 及 Python/API 隔离通过；11 个真实 GPU 正确性用例和 33 次 sanitizer 通过，三个必测 conversion 的 runtime/完整编译占比门槛通过，参考基线已独立评审接受。整体源码及最终文档复审通过。exact256/beam32/65536、共同语义域及真实计时口径保持不变；证据见实现计划 §29.3 和验收文档，不推广为任意 kernel 性能或对 TileLang/Triton 的优势。**
 
 > 最新实现（2026-09-28）：Task 26 方案 A 已完成可诊断的独立重试、安全转换提升与共享重计算；357 unit / 53 lit / 4 CTest / 5 Python normalization、SM90 工具及生产隔离检查通过，独立复审的重要问题已关闭。具体契约与实际支持边界见 §8.9 和实现计划 §26.1–26.5。仍无完整异步 GPU lowering 或性能领先结论；源目录 main 修改未 commit/push。

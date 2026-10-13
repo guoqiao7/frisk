@@ -79,6 +79,44 @@ protected:
   }
 };
 
+TEST_F(LegacyNormalizationTest, StorageContractsUseLocalGlobalHandles) {
+  auto module = parse(R"mlir(
+#s = #frisk.storage<map=#frisk.affine_layout<inputs=["d"],input_extents=[4],outputs=["byte_offset","bit_offset"],output_extents=[16,8],map=affine_map<(d)->(4*d,0)>>,memory_space=#frisk<memory_space Global>,alignment=1,vector_granularity=1>
+module {
+  memref.global "private" @g : memref<4xi32,1> = dense<0>
+  func.func @first() {
+    %g = memref.get_global @g : memref<4xi32,1>
+    %v = frisk.layout_view %g {layout=#s} : memref<4xi32,1> -> memref<4xi32,1>
+    return
+  }
+  func.func @second(%c:i1) {
+    scf.if %c {
+      %g = memref.get_global @g : memref<4xi32,1>
+      %s = memref.subview %g[0] [4] [1] : memref<4xi32,1> to memref<4xi32,strided<[1]>,1>
+      %cast = memref.cast %s : memref<4xi32,strided<[1]>,1> to memref<4xi32,1>
+      %alias = frisk.layout_view %cast : memref<4xi32,1> -> memref<4xi32,1>
+      %v = frisk.layout_view %alias {layout=#s} : memref<4xi32,1> -> memref<4xi32,1>
+    } else {
+      %g = memref.get_global @g : memref<4xi32,1>
+      %v = frisk.layout_view %g {layout=#s} : memref<4xi32,1> -> memref<4xi32,1>
+    }
+    return
+  }
+})mlir");
+  ASSERT_TRUE(module);
+  ASSERT_TRUE(succeeded(normalize(*module)));
+  ASSERT_TRUE(succeeded(verify(*module)));
+  auto contracts = ops<StorageContractOp>(*module);
+  ASSERT_EQ(contracts.size(), 3u);
+  for (auto contract : contracts) {
+    auto global = contract.getRoot().getDefiningOp<memref::GetGlobalOp>();
+    ASSERT_TRUE(global);
+    EXPECT_EQ(global->getBlock(), contract->getBlock());
+  }
+  ASSERT_TRUE(succeeded(normalize(*module)));
+  EXPECT_EQ(ops<StorageContractOp>(*module).size(), 3u);
+}
+
 TEST_F(LegacyNormalizationTest, FillPreservesNegativeZeroAndIsIdempotent) {
   auto module = parse(R"mlir(module { func.func @f() {
     %x = memref.alloc() : memref<4xf32>

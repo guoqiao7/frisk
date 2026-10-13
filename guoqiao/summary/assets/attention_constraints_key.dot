@@ -1,0 +1,38 @@
+digraph AttentionKeyConstraints {
+  graph [rankdir=TB, bgcolor="white", pad=0.25, nodesep=0.42, ranksep=0.45,
+         fontname="DejaVu Sans", fontsize=19,
+         label="Key constraints: SS MMA / ReduceMax / Broadcast / Sub", labelloc=t];
+  node [shape=box, style="rounded,filled", fillcolor="#eaf2ff", color="#4a6da7",
+        fontname="DejaVu Sans", fontsize=15, margin="0.15,0.10"];
+  edge [fontname="DejaVu Sans", fontsize=13, color="#567096", arrowsize=0.7];
+  v37 [variable_id="37", label="V37  %zero\nProducer result layout"];
+  v3 [variable_id="3", label="V3  accumulator use\nMMA consumer layout", fillcolor="#eee4fb"];
+  v28 [variable_id="28", label="V28  %qv\nQ Shared storage layout", fillcolor="#dcf4ec"];
+  v29 [variable_id="29", label="V29  %kv\nK Shared storage layout", fillcolor="#dcf4ec"];
+  h29 [shape=diamond, style=filled, fillcolor="#fff1e8", color="#b76b35",
+       label="InstructionContract\nSS MMA: A / B / acc / result", constraint_ids="29"];
+  v2 [variable_id="2", label="V2  %scores\nMMA result layout"];
+  v4 [variable_id="4", label="V4  %scale\nConstant 0.25 layout"];
+  v5 [variable_id="5", label="V5  %scaled\nMul result layout"];
+  v7 [variable_id="7", label="V7  ReduceMax input use\nReduction consumer layout", fillcolor="#eee4fb"];
+  v6 [variable_id="6", label="V6  %max\nReduction result layout"];
+  v10 [variable_id="10", label="V10  Broadcast input use\nBroadcast consumer layout", fillcolor="#eee4fb"];
+  v8 [variable_id="8", label="V8  %e0\nBroadcast output init layout"];
+  v9 [variable_id="9", label="V9  %bm\nBroadcast result layout"];
+  v11 [variable_id="11", label="V11  %centered\nSub result layout"];
+  v37 -> v3 [label="Convertible", constraint_ids="20"];
+  v28 -> h29 [label="A", dir=none];
+  v29 -> h29 [label="B", dir=none];
+  v3 -> h29 [label="acc", dir=none];
+  h29 -> v2 [label="result", dir=none];
+  v3 -> v2 [label="SameLayout", dir=none, color="#9b59b6", penwidth=2.5, constraint_ids="0"];
+  v2 -> v5 [label="Convertible", constraint_ids="3"];
+  v4 -> v5 [label="Convertible", constraint_ids="4"];
+  v5 -> v7 [label="Convertible", constraint_ids="5"];
+  v7 -> v6 [label="ReductionLayout\n2D input -> row result", color="#16856a", penwidth=2.5, constraint_ids="23"];
+  v6 -> v10 [label="Convertible", constraint_ids="7"];
+  v10 -> v9 [label="BroadcastLayout\nSame-thread source access", color="#d97706", penwidth=2.5, constraint_ids="21"];
+  v8 -> v9 [label="Convertible", constraint_ids="8"];
+  v9 -> v11 [label="Convertible", constraint_ids="9"];
+  v5 -> v11 [label="Convertible\nscaled used again by Sub", constraint_ids="6"];
+}

@@ -124,7 +124,9 @@ FailureOr<AffineMap> asAffine(Attribute map) {
     if (columns > 128) return failure();
   }
   for (int64_t width : bits.getOutputBitWidths().asArrayRef()) {
-    if (width <= 0 || width > 62) return failure();
+    // A zero-width output is the constant zero (extent one); inputs must
+    // still have positive widths to establish their live domain.
+    if (width < 0 || width > 62) return failure();
     rows += width;
     if (rows > 128) return failure();
   }

@@ -47,6 +47,8 @@ StringRef stringifyConstraintKind(ConstraintKind kind) {
     return "convertible";
   case ConstraintKind::TransformLayout:
     return "transform-layout";
+  case ConstraintKind::BroadcastLayout:
+    return "broadcast-layout";
   case ConstraintKind::ReductionLayout:
     return "reduction-layout";
   case ConstraintKind::RequireEncoding:
@@ -238,6 +240,7 @@ LogicalResult LayoutConstraintGraph::verifyInvariants(Location loc) const {
       return emitError(loc) << "layout constraint ID differs from its array position";
     if ((constraint.kind == ConstraintKind::Convertible ||
          constraint.kind == ConstraintKind::TransformLayout ||
+         constraint.kind == ConstraintKind::BroadcastLayout ||
          constraint.kind == ConstraintKind::ReductionLayout ||
          constraint.kind == ConstraintKind::StorageAccess ||
          constraint.kind == ConstraintKind::CopyAccess ||
@@ -261,6 +264,43 @@ LogicalResult LayoutConstraintGraph::verifyInvariants(Location loc) const {
                               << id;
     if (constraint.provenance >= provenances.size())
       return emitError(loc) << "layout constraint has invalid provenance";
+    if (constraint.kind == ConstraintKind::BroadcastLayout || constraint.broadcast) {
+      if (constraint.kind != ConstraintKind::BroadcastLayout || !constraint.broadcast ||
+          constraint.vars.size() != 2 || constraint.instruction || constraint.reduction)
+        return emitError(loc) << "invalid broadcast relation payload or arity";
+      const auto &broadcast = *constraint.broadcast;
+      auto *op = broadcast.source;
+      if (!op || op->getName().getStringRef() != "linalg.broadcast" ||
+          op->getNumOperands() != 2 || op->getNumResults() != 1 ||
+          provenances[constraint.provenance].source != op || !broadcast.axes ||
+          broadcast.axes != op->getAttr("dimensions"))
+        return emitError(loc) << "broadcast metadata differs from actual operation";
+      const auto &src = variables[constraint.vars[0]];
+      const auto &dst = variables[constraint.vars[1]];
+      if (src.kind != LayoutKind::Distributed || dst.kind != LayoutKind::Distributed ||
+          src.use != &op->getOpOperand(0) || src.value ||
+          src.shapedType != op->getOperand(0).getType() ||
+          dst.value != op->getResult(0) || dst.use ||
+          dst.shapedType != op->getResult(0).getType())
+        return emitError(loc) << "broadcast role does not match actual SSA binding";
+      auto input = dyn_cast<RankedTensorType>(src.shapedType);
+      auto output = dyn_cast<RankedTensorType>(dst.shapedType);
+      if (!input || !output || input.getRank() == 0 ||
+          input.getElementType() != output.getElementType() ||
+          input.getRank() + broadcast.axes.size() != output.getRank())
+        return emitError(loc) << "invalid broadcast shapes";
+      int64_t previous = -1;
+      for (int64_t axis : broadcast.axes.asArrayRef()) {
+        if (axis <= previous || axis >= output.getRank())
+          return emitError(loc) << "invalid broadcast axes";
+        previous = axis;
+      }
+      unsigned sourceAxis = 0;
+      for (int64_t axis = 0; axis < output.getRank(); ++axis)
+        if (!llvm::is_contained(broadcast.axes.asArrayRef(), axis) &&
+            output.getDimSize(axis) != input.getDimSize(sourceAxis++))
+          return emitError(loc) << "invalid broadcast coordinate shape";
+    }
     if (constraint.kind == ConstraintKind::ReductionLayout || constraint.reduction) {
       if (constraint.kind != ConstraintKind::ReductionLayout || !constraint.reduction ||
           constraint.vars.size() != 2 || constraint.instruction)

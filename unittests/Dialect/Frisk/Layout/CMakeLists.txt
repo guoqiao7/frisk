@@ -22,6 +22,7 @@ add_unittest(FriskUnitTests FriskLayoutUnitTests
   SM90MmaLayoutProofTest.cpp
   InstructionConstraintTest.cpp
   GemmLayoutIntegrationTest.cpp
+  AttentionLayoutIntegrationTest.cpp
   ReduceLayoutIntegrationTest.cpp
   CopyFillConstraintTest.cpp
   AliasRegionTest.cpp
@@ -38,6 +39,7 @@ add_unittest(FriskUnitTests FriskLayoutUnitTests
   LayoutConstraintTest.cpp
   LayoutPropagationTest.cpp
   DistributedPropagationTest.cpp
+  BroadcastLayoutTest.cpp
   LayoutVerifierTest.cpp
   LayoutMaterializationTest.cpp
   LegacyLayoutAdapterTest.cpp
@@ -52,6 +54,7 @@ set_target_properties(FriskLayoutUnitTests PROPERTIES
 )
 
 target_compile_definitions(FriskLayoutUnitTests PRIVATE
+  FRISK_ATTENTION_FIXTURE="${PROJECT_SOURCE_DIR}/test/Transforms/attention-layout.mlir"
   FRISK_TILELANG_CORPUS="${PROJECT_SOURCE_DIR}/test/Dialect/Frisk/layout/Inputs/tilelang_layout_corpus.json")
 
 target_link_libraries(FriskLayoutUnitTests
@@ -69,6 +72,7 @@ target_link_libraries(FriskLayoutUnitTests
   MLIRFuncDialect
   MLIRArithDialect
   MLIRLinalgDialect
+  MLIRMathDialect
   MLIRTensorDialect
   MLIRSCFDialect
   MLIRMemRefDialect

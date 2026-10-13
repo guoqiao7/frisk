@@ -26,6 +26,7 @@ add_frisk_library(FriskLayoutAnalysis
   LayoutRelaxation.cpp
   ReductionLayoutProof.cpp
   ReductionLayoutConstraints.cpp
+  BroadcastLayoutConstraints.cpp
   InstructionLayoutConstraints.cpp
   MmaLayoutConstraints.cpp
   ExecutionLayoutProof.cpp

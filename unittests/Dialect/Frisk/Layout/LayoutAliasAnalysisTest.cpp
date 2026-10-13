@@ -184,6 +184,50 @@ TEST_F(LayoutAliasAnalysisTest, PackedBitRangesAndLowerBound) {
             ProofStatus::Disproven);
 }
 
+TEST_F(LayoutAliasAnalysisTest, ZeroWidthByteOutputMatchesPackedAffineMap) {
+  auto module = parse("func.func @f(%r: memref<4xi1, 3>) { return }");
+  ASSERT_TRUE(module);
+  auto info = analyzeStorageAlias(module->lookupSymbol<func::FuncOp>("f").getArgument(0));
+  ASSERT_TRUE(succeeded(info));
+  auto map = parseAttribute(R"mlir(#frisk.bit_linear<inputs=["d0"],input_bits=[2],
+    outputs=["byte_offset","bit_offset"],output_bits=[0,3],
+    matrix=dense<[[1,0],[0,1],[0,0]]>:tensor<3x2xi1>>)mlir", &context);
+  ASSERT_TRUE(map);
+  Builder b(&context);
+  auto packed = StorageLayoutAttr::get(&context, map,
+      MemorySpaceAttr::get(&context, attr::MemorySpace::Shared),
+      b.getI64IntegerAttr(1), b.getI64IntegerAttr(1));
+  auto d = getAffineDimExpr(0, &context);
+  auto affine = layout({4}, 0*d, d);
+  EXPECT_EQ(verifyStorageAliasCandidate(*info, packed).status, ProofStatus::Proven);
+  EXPECT_EQ(proveStorageAliasCompatible(*info, packed, *info, affine).status,
+            ProofStatus::Proven);
+  auto footprint = buildStorageAliasFootprint(*info, packed);
+  ASSERT_EQ(footprint.proof.status, ProofStatus::Proven);
+  ASSERT_EQ(footprint.entries.size(), 4u);
+  for (unsigned i = 0; i < 4; ++i) {
+    EXPECT_EQ(footprint.entries[i].begin, i);
+    EXPECT_EQ(footprint.entries[i].end, i + 1);
+  }
+  StorageAliasInfo tooSmall = *info;
+  tooSmall.upperBit = 3;
+  EXPECT_EQ(verifyStorageAliasCandidate(tooSmall, packed).status, ProofStatus::Disproven);
+  EXPECT_EQ(verifyStorageAliasCandidate(*info, layout({4}, 0*d, 0*d)).status,
+            ProofStatus::Disproven);
+  for (StringRef matrix : {"[[0,0],[0,0],[0,0]]", "[[0,0],[0,1],[1,0]]"}) {
+    auto badMap = parseAttribute((Twine("#frisk.bit_linear<inputs=[\"d0\"],input_bits=[2],") +
+        "outputs=[\"byte_offset\",\"bit_offset\"],output_bits=[0,3],matrix=dense<" +
+        matrix + ">:tensor<3x2xi1>>").str(), &context);
+    ASSERT_TRUE(badMap);
+    auto bad = StorageLayoutAttr::get(&context, badMap, packed.getMemorySpace(),
+        b.getI64IntegerAttr(1), b.getI64IntegerAttr(1));
+    EXPECT_EQ(verifyStorageAliasCandidate(*info, bad).status, ProofStatus::Disproven);
+  }
+  EXPECT_FALSE(parseAttribute(R"mlir(#frisk.bit_linear<inputs=["d0"],input_bits=[0],
+    outputs=["byte_offset","bit_offset"],output_bits=[0,3],
+    matrix=dense<0>:tensor<3x0xi1>>)mlir", &context));
+}
+
 TEST_F(LayoutAliasAnalysisTest, XorProjectionUsesIntegerCarryAndPositiveStride) {
   auto module = parse("func.func @f(%r: memref<8xi8, 3>) { return }");
   ASSERT_TRUE(module);

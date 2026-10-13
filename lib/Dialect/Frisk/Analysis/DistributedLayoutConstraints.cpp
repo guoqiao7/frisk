@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Analysis/LayoutSolver.h"
+#include "Dialect/Frisk/Analysis/BroadcastLayoutConstraints.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -228,6 +229,24 @@ LogicalResult collectDistributedLayoutConstraints(
       auto dst = builder.getOrCreateDistributedVar(op->getResult(0));
       (void)builder.transform(builder.getOrCreateDistributedUse(op->getOpOperand(0)),
           dst, transpose.getPermutationAttr(), op, "transpose");
+      (void)connectUse(op->getOpOperand(1), dst);
+      return WalkResult::advance();
+    }
+    if (auto broadcast = dyn_cast<linalg::BroadcastOp>(op)) {
+      auto srcType = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+      auto dstType = op->getNumResults() == 1
+          ? dyn_cast<RankedTensorType>(op->getResult(0).getType()) : RankedTensorType();
+      if (!validBroadcastTypes(srcType, dstType, broadcast.getDimensions())) {
+        op->emitError("broadcast layout requires static matching shapes and ordered injective dimensions");
+        return WalkResult::interrupt();
+      }
+      auto src = builder.getOrCreateDistributedUse(op->getOpOperand(0));
+      auto dst = builder.getOrCreateDistributedVar(op->getResult(0));
+      auto id = graph.addConstraint(ConstraintKind::BroadcastLayout,
+          ConstraintStrength::Hard, {src, dst}, op, "broadcast-coordinate-ownership",
+          "delete broadcast axes and read source registers in the same thread");
+      graph.getConstraints()[id].broadcast = BroadcastLayoutContract{
+          op, broadcast.getDimensionsAttr()};
       (void)connectUse(op->getOpOperand(1), dst);
       return WalkResult::advance();
     }

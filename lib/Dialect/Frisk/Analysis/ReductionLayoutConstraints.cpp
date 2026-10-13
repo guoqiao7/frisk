@@ -38,6 +38,7 @@ FailureOr<int64_t> inferSourceThreads(const LayoutConstraintGraph &graph,
       } else if (!var.requiredThreads && !enc &&
                  (c.kind == ConstraintKind::Convertible ||
                   c.kind == ConstraintKind::TransformLayout ||
+                  c.kind == ConstraintKind::BroadcastLayout ||
                   c.kind == ConstraintKind::ReductionLayout) &&
                  c.vars.size() == 2 && c.vars[1] == id) {
         pending.push_back(c.vars[0]);

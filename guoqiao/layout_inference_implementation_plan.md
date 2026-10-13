@@ -4956,6 +4956,65 @@ exactCombinationLimit = 256；超限使用 beam width = 32，不截断候选到 
 
 ## 4. 计划执行方式
 
+### 后续方案 A：审计修复与单 tile Attention（2026-10-10 已完成）
+
+目标与完整语义以设计文档开头的“后续增量契约”为准。技术栈继续使用 C++/MLIR、GF(2) 布局代数、GoogleTest/lit；不引入 TileLang/TVM 生产依赖。
+
+全局约束：SM90a、128 线程；Q/K/V=`64×16xf16`、scores=`64×64xf32`、O=`64×16xf32`；SS QKᵀ、稳定 f32 Softmax、cast_f16、RS PV；exact256/beam32/65536 不变。无 causal/dropout/动态尾块/通用 reshape/完整 Attention GPU lowering；不绕过实际布局 verifier。源目录 main，保留构建产物，不自动 commit/push。
+
+- [x] A0：先写设计契约、实施步骤及比较口径。
+- [x] A1：两处 Storage 修复及独立复审。
+  - 在 `unittests/Dialect/Frisk/Layout/LegacyNormalizationTest.cpp`、`LayoutAliasAnalysisTest.cpp` 及 `test/Transforms/storage-audit-local-global-packed.mlir` 增加跨函数/分支 Global 与 packed BitLinear/affine 等价反例；旧代码两项单测及 lit 失败，修复后 30 项局部 unit、8 项 lit、根代理完整 pipeline 连续重跑通过，独立 spec/quality 复审通过。
+  - 修改 `lib/Dialect/Frisk/Transforms/PreserveStorageContracts.cpp` 与 `lib/Dialect/Frisk/Analysis/LayoutAliasAnalysis.cpp`：分离 canonical identity 与就地 SSA 根，允许零输出位宽常量，不放宽其他边界。
+  - 构建 `FriskLayoutUnitTests frisk-opt`，运行对应 gtest filter 和新增 lit；复审 spec/quality 后进入 A2。
+- [x] A2：广播关系及独立复审。
+  - 新建 `BroadcastLayoutConstraints.h/.cpp` 封装广播坐标证明/投影，接入 constraint kind、collector、冻结候选准备、传播、solver 和实际 IR 验证；具体接口以代码声明为准，禁止伪造 SameLayout/transpose。
+  - 新建 `BroadcastLayoutTest.cpp` 与 `test/Transforms/infer-broadcast-layout.mlir`：先证明未实现失败，再验证正反坐标关系、不同广播轴、硬绑定冲突、源端转换、重跑、rollback。
+  - 实际新增 8 项广播单测；81 项局部 unit、4 项 lit、根代理重跑 8 项广播单测通过，独立 spec/quality 复审通过。涵盖 4×8/32 线程和 8×16/128 线程真实 load→稳定 Softmax→store、坐标 oracle、实际 verifier 零候选生成、冲突和回滚。广播规则无 Attention 特定形状例外。
+- [x] A3：完整 Attention 集成及最终复审。
+  - 新建 `test/Transforms/attention-layout.mlir`，真实 Global Q/K/V→三次 Copy→SS MMA→scale/max/broadcast/sub/exp/sum/broadcast/div→truncf→RS MMA→Global Store；输入不预填 Tensor encoding。
+  - 新增 C++ 集成测试检查完整数据流、契约、实际 IR 验证、连续重跑与 parse 重放、失败原子回滚；修复只限此链暴露的通用规则集成问题。
+  - 执行 `cmake --build build --target FriskLayoutUnitTests frisk-opt --parallel 12`、全量 unit、`llvm-lit -sv build/test`、`ctest --test-dir build --output-on-failure`、三个已有 Python normalization/API/tool 检查；逐项记录结果，更新维护文档。
+
+复现完整输入（本例只验收布局推断，不执行 GPU）：
+
+```bash
+build/bin/frisk-opt test/Transforms/attention-layout.mlir \
+  --frisk-layout-pipeline -verify-each -o /tmp/frisk-attention.mlir
+```
+
+`AttentionLayoutIntegrationTest.cpp` 与 lit 共用该输入，逐边检查 Q/K/V Copy、SS/RS MMA、稳定 Softmax、truncf、真实 O Store；测试不会用常量替换中间计算。A3 首次集成在 A1/A2 后已通过，因此只补充验收测试，没有宣称额外“先红后绿”的生产修复。
+
+最终验收记录：
+
+- Debug 显式构建 `FriskLayoutUnitTests frisk-opt` 后完成全量构建，均 exit 0。全量 unit 分 4 片执行，105+104+104+104 = **417/417**，XML 汇总 failures/errors/disabled 均为 0；包含新增 2 项 Storage、8 项 Broadcast、2 项 Attention 测试。
+- 全量 lit **61/61**；Debug CTest **7/7**；Release 的 `FriskLayoutConversionGeneratorTest` **1/1**。不将 Release 的未构建其他 CTest targets 算作已验收。
+- Python normalization **5/5**，生产 legacy API 隔离、SM90 SS/RS 工具输出与目标拒绝检查通过。
+- A1/A2/A3 各自独立 spec/quality 复审及整体源码复审通过，无 Critical/Important 问题。保留两项非阻塞说明：Attention 测试个别 typed attribute 缺失时诊断可更友好；Release 重编既有测试时出现 APInt 编译警告，Debug Ninja 日志有既有恢复提示，不宣称构建零警告。
+- 输入/输出布局真实物化、原有完整算子链回归、实际 verifier、重跑/文本重放、失败原子回滚通过。不包括 Attention GPU 数值/性能、完整 WGMMA/TMA lowering 或 M6 微基准性能重新认证。本轮没有 commit/push。
+
+可重复的全量验证命令（分片可分别并行执行）：
+
+```bash
+cmake --build build --target FriskLayoutUnitTests frisk-opt --parallel 12
+cmake --build build --parallel 12
+for shard in 0 1 2 3; do
+  GTEST_TOTAL_SHARDS=4 GTEST_SHARD_INDEX=$shard \
+    build/unittests/Dialect/Frisk/FriskLayoutUnitTests \
+    --gtest_output=xml:/tmp/frisk-attention-final-unit-$shard.xml
+done
+/usr/bin/python3 /data0/xiebaokang/rocm-llvm-project/llvm/utils/lit/lit.py -sv -j 4 build/test
+ctest --test-dir build --output-on-failure
+ctest --test-dir build-m6-release -R FriskLayoutConversionGeneratorTest --output-on-failure
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 test/python/legacy_normalization_test.py --build-dir build
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 test/python/legacy_api_boundary_test.py --source-root . --build-dir build
+/home/baopeihua/anaconda3/envs/torch/bin/python3.10 test/python/sm90_layout_tool_test.py --build-dir build
+```
+
+本轮临时证据为 `/tmp/frisk-attention-final-{build,lit,ctest,release-ctest,python}.log` 和 `/tmp/frisk-attention-final-unit-{0,1,2,3}.{log,xml}`；长期依据为上述仓库测试、命令和结果记录。三份维护文档先写契约，再同步实际实现边界与结果。
+
+以上增量采用测试驱动与子代理逐任务独立复审。下面 Task1–29 顺序描述保留为历史里程碑执行约定。
+
 严格按 Task 1 → Task 29 顺序执行。每完成一个 Task：
 
 1. 运行该任务局部测试；

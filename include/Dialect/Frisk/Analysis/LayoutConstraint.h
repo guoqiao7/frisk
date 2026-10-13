@@ -36,6 +36,7 @@ enum class ConstraintKind {
   SameLayout,
   Convertible,
   TransformLayout,
+  BroadcastLayout,
   ReductionLayout,
   RequireEncoding,
   InstructionContract,
@@ -142,6 +143,12 @@ struct ReductionLayoutContract {
   SmallVector<ReductionLayoutPair, 0> pairs;
 };
 
+/// Output coordinates delete these ordered axes to address the source use.
+struct BroadcastLayoutContract {
+  Operation *source = nullptr;
+  DenseI64ArrayAttr axes;
+};
+
 /// A fixed declaration, not a candidate variable. Its IR identity is borrowed
 /// just like graph operands; rebuilding the graph revalidates the declaration.
 struct RootStorageContract {
@@ -165,6 +172,7 @@ struct LayoutConstraint {
   int64_t requiredThreads = 0;
   std::optional<InstructionLayoutContract> instruction;
   std::optional<ReductionLayoutContract> reduction;
+  std::optional<BroadcastLayoutContract> broadcast;
   std::optional<RootStorageContract> rootStorage;
 };
 

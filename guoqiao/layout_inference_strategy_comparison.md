@@ -1139,3 +1139,15 @@ Frisk 的价值不是单独“比 TVM 更好”或“比 Triton 更新”，而�
 - [SCF 回归](../test/Transforms/materialize-scf.mlir)、[传播单测](../unittests/Dialect/Frisk/Layout/LayoutPropagationTest.cpp)。
 
 本地链接用于后续维护；上述“当前实现”结论固定到 Frisk `b120d06`，不能用之后的文件内容反推此次已实现范围。
+
+## 后续增量：简化 Attention 验收（2026-10-10，方案 A 已完成）
+
+增量前审计证明既有子集可以推断 Copy→MMA→Reduce→Store，但当时 `linalg.broadcast` 无规则，不能据 M6 完成宣称 Softmax/Attention 已支持。本轮已修复跨函数/分支 Global 契约 SSA 根及 packed 零输出位宽两处合法输入拒绝，并新增独立 `BroadcastLayout` 关系。
+
+本增量以 SM90a/128 线程、Q/K/V=`64×16xf16` 验收真实 `cast_f16(softmax(QKᵀ×0.25))V` 的布局推断：第一次 SS MMA、第二次 RS MMA，f32 稳定 Softmax，Global 输入/输出。广播使用坐标投影约束、有限候选传播、显式转换与实际 IR 复验，而非按 Op 顺序修改外部布局 map，也不复制上游 encoding 分类。保留 exact256/beam32/65536。
+
+实际候选策略是有限输出布局种子→删除广播轴、压缩冗余 register 基→输入 use；输入只过滤输出支持，不伪造广播的唯一逆映射。实际证明逐输出持有者检查所需源坐标在同线程可用，支持源复制及寄存器重编号。合法时显式插入源 use 转换，实际 IR verifier 不依赖求解阶段候选表。静态非零 rank、各轴大于 1 的 2 次幂边界保持明确；广播不是不同 shape 的 SameLayout。
+
+真实示例见 [`attention-layout.mlir`](../test/Transforms/attention-layout.mlir)，从无 Tensor encoding 输入完成整链物化、实际布局复验、重复推断及文本重放；失败保持原 IR。最终 **417 unit / 61 lit / 7 Debug CTest / 1 Release generator CTest / 5 Python normalization** 及 API/tool 检查通过，独立复审无阻塞问题。
+
+这是 Frisk 自身完整算子链验收，不是与 TileLang/Triton 的完整策略等价、性能优势或 Attention GPU 执行证据。未新增上游版本审计或比较性能测量；无 causal/dropout/尾块/online Attention/通用 reshape/完整 WGMMA/TMA lowering。

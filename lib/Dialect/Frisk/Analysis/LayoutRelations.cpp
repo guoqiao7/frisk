@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
+#include "Dialect/Frisk/Analysis/BroadcastLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/InstructionLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/ReductionLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/StorageRootContracts.h"
@@ -134,6 +135,7 @@ bool isSupportedLayoutRelation(ConstraintKind kind) {
          kind == ConstraintKind::StorageAccess ||
          kind == ConstraintKind::CopyAccess ||
          kind == ConstraintKind::TransformLayout ||
+         kind == ConstraintKind::BroadcastLayout ||
          kind == ConstraintKind::Convertible;
 }
 
@@ -290,6 +292,18 @@ FailureOr<Attribute> projectLayoutCandidate(
     return permuteEncoding(candidate, relation.coordinateTransform,
                            cast<ShapedType>(dst.shapedType),
                            source != relation.vars.front());
+  if (relation.kind == ConstraintKind::BroadcastLayout) {
+    if (!relation.broadcast || source != relation.vars[1] || target != relation.vars[0])
+      return failure(); // Nonbijective: output seeds determine input-use proposals only.
+    auto encoding = dyn_cast<DistributedEncodingAttr>(candidate);
+    if (!encoding) return failure();
+    auto result = projectBroadcastInputEncoding(encoding,
+        cast<RankedTensorType>(dst.shapedType),
+        cast<RankedTensorType>(graph.getVariable(source).shapedType),
+        relation.broadcast->axes.asArrayRef());
+    if (failed(result)) return failure();
+    return Attribute(*result);
+  }
   if (relation.kind == ConstraintKind::ReductionLayout) {
     if (!relation.reduction || source != relation.vars[0] || target != relation.vars[1])
       return failure(); // Projection has no inverse: reverse inference filters only.
@@ -328,6 +342,16 @@ LayoutProof proveLayoutRelation(const LayoutConstraintGraph &graph,
     return {ProofStatus::Unknown, {}, "unsupported layout relation decoder"};
   };
   const LayoutVar &a = graph.getVariable(lhsID), &b = graph.getVariable(rhsID);
+  if (relation.kind == ConstraintKind::BroadcastLayout) {
+    if (!relation.broadcast || relation.vars.size() != 2) return unknown();
+    bool forward = lhsID == relation.vars[0];
+    return proveBroadcastLayout(
+        dyn_cast<DistributedEncodingAttr>(forward ? lhs : rhs),
+        dyn_cast<DistributedEncodingAttr>(forward ? rhs : lhs),
+        dyn_cast<RankedTensorType>(forward ? a.shapedType : b.shapedType),
+        dyn_cast<RankedTensorType>(forward ? b.shapedType : a.shapedType),
+        relation.broadcast->axes.asArrayRef());
+  }
   if (relation.kind == ConstraintKind::CopyAccess) {
     if (!sameLogicalType(a.shapedType, b.shapedType) || !a.storageAlias || !b.storageAlias)
       return unknown();
