@@ -208,7 +208,7 @@ TEST_F(DistributedPropagationTest, RejectsUnsupportedTensorShapesAndOperations) 
       "func.func @unranked(%arg: tensor<*xf32>) { return }",
       "func.func @dynamic(%arg: tensor<?xf32>) { return }",
       "func.func @odd(%arg: tensor<3xf32>) { return }",
-      "func.func @unit(%arg: tensor<1xf32>) { return }",
+      "func.func @zero(%arg: tensor<0xf32>) { return }",
       "func.func private @external(tensor<8xf32>)"}) {
     auto module = parseSourceString<ModuleOp>(source, &context);
     ASSERT_TRUE(module);

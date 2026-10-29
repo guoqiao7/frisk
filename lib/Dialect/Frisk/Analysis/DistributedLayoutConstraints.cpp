@@ -25,9 +25,9 @@ LogicalResult collectDistributedLayoutConstraints(
     if (type.getRank() == 0)
       return anchor->emitError("distributed inference requires nonzero-rank tensor tiles");
     if (!type.hasStaticShape() || llvm::any_of(type.getShape(), [](int64_t extent) {
-          return extent <= 1 || !llvm::isPowerOf2_64(extent);
+          return extent <= 0 || !llvm::isPowerOf2_64(extent);
         }))
-      return anchor->emitError("distributed inference requires static power-of-two tile extents greater than one (M1 bit-width boundary)");
+      return anchor->emitError("distributed inference requires static positive power-of-two tile extents");
     LayoutVarID id = builder.getOrCreateDistributedVar(value);
     if (Attribute encoding = type.getEncoding()) {
       auto distributed = dyn_cast<DistributedEncodingAttr>(encoding);
@@ -219,6 +219,47 @@ LogicalResult collectDistributedLayoutConstraints(
     if (auto convert = dyn_cast<ConvertLayoutOp>(op)) {
       (void)builder.convertible(builder.getOrCreateDistributedVar(convert.getSource()),
           builder.getOrCreateDistributedVar(convert.getResult()), op->getOpOperand(0), true);
+      return WalkResult::advance();
+    }
+    if (isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp>(op)) {
+      // Static reassociation preserves the row-major element number. Describe
+      // it by a permutation of logical bits, including zero-width unit axes.
+      auto src = cast<RankedTensorType>(op->getOperand(0).getType());
+      auto dst = cast<RankedTensorType>(op->getResult(0).getType());
+      SmallVector<int64_t> srcWidths, dstWidths, order;
+      for (int64_t e : src.getShape()) srcWidths.push_back(llvm::Log2_64(e));
+      for (int64_t e : dst.getShape()) dstWidths.push_back(llvm::Log2_64(e));
+      unsigned total = 0;
+      for (int64_t width : srcWidths) total += width;
+      unsigned dstTotal = 0;
+      for (int64_t width : dstWidths) dstTotal += width;
+      if (total != dstTotal) {
+        op->emitError("static tensor reassociation must preserve element count");
+        return WalkResult::interrupt();
+      }
+      // Both maps store axis zero first, whereas row-major flattening stores
+      // the last axis in the low bits. Match by flattened bit significance.
+      SmallVector<int64_t> sourceBits(total);
+      unsigned row = 0, suffix = total;
+      for (int64_t width : srcWidths) {
+        suffix -= width;
+        for (unsigned bit = 0; bit < unsigned(width); ++bit)
+          sourceBits[suffix + bit] = row++;
+      }
+      suffix = total;
+      for (int64_t width : dstWidths) {
+        suffix -= width;
+        for (unsigned bit = 0; bit < unsigned(width); ++bit)
+          order.push_back(sourceBits[suffix + bit]);
+      }
+      Builder b(op->getContext());
+      auto transform = b.getDictionaryAttr({
+          b.getNamedAttr("source_widths", b.getDenseI64ArrayAttr(srcWidths)),
+          b.getNamedAttr("result_widths", b.getDenseI64ArrayAttr(dstWidths)),
+          b.getNamedAttr("bit_order", b.getDenseI64ArrayAttr(order))});
+      (void)builder.transform(builder.getOrCreateDistributedUse(op->getOpOperand(0)),
+          builder.getOrCreateDistributedVar(op->getResult(0)), transform, op,
+          "static-tensor-reassociation");
       return WalkResult::advance();
     }
     if (auto transpose = dyn_cast<linalg::TransposeOp>(op)) {

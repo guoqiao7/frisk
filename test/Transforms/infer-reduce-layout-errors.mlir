@@ -17,7 +17,7 @@ func.func @wrong_axis(%a: tensor<4x4xf32>) {
 // -----
 
 func.func @ragged(%a: tensor<4x3xf32>) {
-  // expected-error@+1 {{static power-of-two extents greater than one}}
+  // expected-error@+1 {{static positive power-of-two extents}}
   %r = frisk.reduce_tensor %a {kind = "sum", dim = 1 : i64} : tensor<4x3xf32> -> tensor<4xf32>
   return
 }

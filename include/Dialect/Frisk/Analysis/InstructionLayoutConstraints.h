@@ -3,11 +3,13 @@
 #include "Dialect/Frisk/Analysis/LayoutTarget.h"
 
 namespace mlir::frisk {
+class LayoutTrace;
 /// Select only from frozen domains; a tuple supports all roles simultaneously.
 const InstructionLayoutTuple *findInstructionSupport(
     const LayoutConstraintGraph &graph, const LayoutConstraint &constraint,
     const DenseMap<LayoutVarID, Attribute> &partialAssignment);
 LogicalResult prepareInstructionTuples(LayoutConstraintGraph &graph,
-                                       LayoutTarget &target, Location loc);
+                                       LayoutTarget &target, Location loc,
+                                       LayoutTrace *trace = nullptr);
 } // namespace mlir::frisk
 #endif

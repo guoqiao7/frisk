@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Analysis/LayoutStatistics.h"
+#include "Dialect/Frisk/Analysis/LayoutTrace.h"
 #include "Dialect/Frisk/Analysis/LayoutSolver.h"
 #include "Dialect/Frisk/Analysis/LayoutRelaxation.h"
 #include "Dialect/Frisk/Transforms/PassPipelines.h"
@@ -9,6 +10,8 @@
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "mlir/IR/Builders.h"
 #include "gtest/gtest.h"
 
@@ -23,6 +26,104 @@ public:
   }
   FailureOr<CostVector> evaluate(const CandidateAssignment &) const override { return CostVector{}; }
 };
+TEST(LayoutStatisticsTest, JSONOwnsModelIdentityBeforeReportMutation) {
+  LayoutStatisticsReport report;
+  const std::string expected(64, 'A');
+  report.costModelID = expected;
+  auto json = report.toJSON();
+  // Mutate the same live allocation: a borrowed StringRef fails deterministically
+  // without relying on allocator reuse after the report has been destroyed.
+  for (char &c : report.costModelID) c = 'B';
+  EXPECT_EQ(json.getString("cost_model_id"), expected);
+}
+TEST(LayoutStatisticsTest, DetachedJSONSurvivesReportDestruction) {
+  auto json = [] {
+    LayoutStatisticsReport report;
+    report.costModelID = std::string(64, 'Z');
+    return report.toJSON();
+  }();
+  auto text = llvm::formatv("{0}", llvm::json::Value(std::move(json))).str();
+  auto parsed = llvm::json::parse(text);
+  ASSERT_TRUE(bool(parsed));
+  EXPECT_EQ(parsed->getAsObject()->getString("cost_model_id"), std::string(64, 'Z'));
+}
+TEST(LayoutStatisticsTest, UnsolvedReportsNormalizeCompleteIdentity) {
+  LayoutStatisticsReport report;
+  EXPECT_EQ(report.toJSON().getString("cost_model_id"), "unversioned-target");
+  for (const std::string id : {std::string(), std::string(65, 'a'),
+         std::string("model with space"), std::string("模型"), std::string("id\0bad", 6)}) {
+    report.costModelID = id;
+    EXPECT_EQ(report.toJSON().getString("cost_model_id"), "unversioned-target");
+  }
+  report.costModelID = std::string(64, 'Z');
+  EXPECT_EQ(report.toJSON().getString("cost_model_id"), report.costModelID);
+}
+TEST(LayoutStatisticsTest, CustomTargetIdentitySurvivesPublicSolverBoundaries) {
+  class NamedTarget : public StatisticsTarget {
+  public:
+    explicit NamedTarget(std::string id) : id(std::move(id)) {}
+    StringRef costModelID() const override { return id; }
+    LayoutBoundaryFrequencyMode boundaryFrequencyMode() const override { return LayoutBoundaryFrequencyMode::StaticTripCount; }
+    FailureOr<CostVector> evaluate(const CandidateAssignment &) const override {
+      return CostVector{1, 2, 3, 4, 5, 6, 7, 8, 9};
+    }
+    std::string id;
+  };
+  MLIRContext context;
+  Builder builder(&context);
+  ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
+  for (std::string id : {std::string("custom.A_2-v1"), std::string(65, 'a'), std::string("bad id")}) {
+    NamedTarget target(id);
+    std::string expected = id == "custom.A_2-v1" ? id : "unversioned-target";
+    for (bool coordinator : {false, true}) {
+      for (bool invalid : {false, true}) {
+        for (auto limits : {LayoutTraceOptions{"unused.json"}, LayoutTraceOptions{"unused.json", 1, 4096}}) {
+          LayoutConstraintGraph graph;
+          auto var = graph.addVariable(LayoutKind::Distributed,
+              RankedTensorType::get({4}, builder.getF32Type()), "v");
+          graph.getVariable(var).candidates.push_back({builder.getStringAttr("a")});
+          if (invalid) graph.getVariable(var).id = 42;
+          LayoutTrace trace(limits);
+          LayoutStatisticsReport report;
+          report.costModelID = "stale-model";
+          SmallVector<RelaxationRecord> records;
+          auto result = coordinator
+              ? attemptControlledRelaxation(graph, target, {}, records, nullptr, &report, &trace)
+              : solveLayoutGraph(graph, target, {}, nullptr, nullptr, &trace);
+          EXPECT_EQ(succeeded(result), !invalid);
+          auto parsed = llvm::json::parse(trace.serialize());
+          ASSERT_TRUE(bool(parsed));
+          auto *object = parsed->getAsObject();
+          EXPECT_EQ(object->getString("cost_model_id"), expected);
+          EXPECT_EQ(object->getString("boundaryFrequency"), "static-trip-count");
+          EXPECT_EQ(trace.getSummary().costModelID, expected);
+          if (coordinator) {
+            EXPECT_EQ(report.costModelID, expected);
+            EXPECT_EQ(report.toJSON().getString("boundaryFrequency"), "static-trip-count");
+            EXPECT_EQ(report.toJSON().getString("cost_model_id"), expected);
+          }
+          if (!invalid && coordinator) {
+            auto *final = object->getObject("finalCost");
+            ASSERT_TRUE(final);
+            auto *omitted = object->getObject("omittedCost")->getArray("cost");
+            for (unsigned field = 0; field < 9; ++field) {
+              uint64_t sum = *(*omitted)[field].getAsUINT64();
+              for (auto &entry : *object->getArray("events")) {
+                auto *event = entry.getAsObject();
+                if (event->getString("event") == "cost-contribution")
+                  sum += *(*event->getObject("estimate")->getArray("cost"))[field].getAsUINT64();
+              }
+              EXPECT_EQ(sum, *(*final->getArray("cost"))[field].getAsUINT64());
+            }
+          }
+        }
+      }
+    }
+  }
+  StatisticsTarget legacy;
+  EXPECT_EQ(legacy.costModelID(), "unversioned-target");
+  EXPECT_EQ(legacy.boundaryFrequencyMode(), LayoutBoundaryFrequencyMode::Legacy);
+}
 TEST(LayoutStatisticsTest, DeduplicatedDomainsAndActualFrontier) {
   MLIRContext context;
   Builder builder(&context);
@@ -68,6 +169,8 @@ TEST(LayoutStatisticsTest, StandaloneCollectorIsPerInvocationAndSuccessClearsFai
     pm.addPass(createFriskInferLayoutsPass({}, false, &report));
     ASSERT_TRUE(succeeded(pm.run(*module)));
     EXPECT_EQ(report.attempts.size(), 1u);
+    EXPECT_EQ(report.toJSON().getString("cost_model_id"), "sm90-layout-lex9-legacy-v1");
+    EXPECT_EQ(report.toJSON().getInteger("schema_version"), 1);
     EXPECT_TRUE(report.failureKind.empty());
   }
 }
@@ -85,6 +188,74 @@ TEST(LayoutStatisticsTest, StandaloneWriteFailureUpdatesExternalCollector) {
   EXPECT_TRUE(failed(pm.run(*module)));
   EXPECT_EQ(report.status, "failed");
   EXPECT_EQ(report.failureKind, "statistics-write");
+}
+TEST(LayoutStatisticsTest, CallerOwnedTraceMetadataPrecedesOptionValidation) {
+  MLIRContext context;
+  context.loadDialect<FriskDialect, arith::ArithDialect, func::FuncDialect>();
+  ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
+  llvm::SmallString<128> directory;
+  ASSERT_FALSE(bool(llvm::sys::fs::createUniqueDirectory("frisk-trace-options-external", directory)));
+  std::string output = (directory + "/must-not-be-written.json").str();
+  SolverOptions settings{17, 5, 23, false, 29};
+  const std::pair<std::string, std::string> scenarios[] = {
+      {"trace-max-events=0", "trace-options"},
+      {"trace-max-bytes=4095 trace-file=" + output, "trace-options"},
+      {"profile-file=" + output + " stats-file=" + output, "profile-options"},
+      {"profile-file=" + output + " trace-file=" + output, "profile-options"}};
+  for (const auto &[arguments, failureKind] : scenarios) {
+    for (bool stale : {false, true}) {
+      SCOPED_TRACE(arguments + (stale ? " stale" : " fresh"));
+      LayoutTrace trace({output, 1, 4096});
+      if (stale) {
+        LayoutTraceSummary summary;
+        summary.target = "other-target";
+        summary.costCoverage = "other-coverage";
+        summary.costModelID = "other-model-v1";
+        trace.setSummary(summary);
+      }
+      auto module = parseSourceString<ModuleOp>(R"(
+        func.func @f(%x: tensor<4xf32>) -> tensor<4xf32> {
+          %y = arith.addf %x, %x : tensor<4xf32>
+          return %y : tensor<4xf32>
+        })", &context);
+      ASSERT_TRUE(module);
+      auto print = [&] { std::string text; llvm::raw_string_ostream(text) << *module; return text; };
+      auto before = print();
+      LayoutStatisticsReport report;
+      PassManager pm(&context);
+      auto pass = createFriskInferLayoutsPass(settings, false, &report,
+          LayoutStatisticsScope::Standalone, &trace);
+      ASSERT_TRUE(succeeded(pass->initializeOptions(arguments,
+          [](const Twine &) { return failure(); })));
+      pm.addPass(std::move(pass));
+      EXPECT_TRUE(failed(pm.run(*module)));
+      EXPECT_EQ(print(), before);
+      EXPECT_EQ(report.status, "failed");
+      EXPECT_EQ(report.failureKind, failureKind);
+      EXPECT_FALSE(report.failureReason.empty());
+      EXPECT_TRUE(report.attempts.empty());
+      EXPECT_EQ(report.toJSON().getString("cost_model_id"), "sm90-layout-lex9-legacy-v1");
+      auto json = llvm::json::parse(trace.serialize());
+      ASSERT_TRUE(bool(json));
+      auto *object = json->getAsObject();
+      EXPECT_EQ(object->getString("cost_model_id"), report.costModelID);
+      EXPECT_EQ(object->getString("target"), "SM90");
+      EXPECT_NE(object->getString("cost_coverage"), "other-coverage");
+      auto *options = object->getObject("solver_options");
+      ASSERT_TRUE(options);
+      EXPECT_EQ(options->getInteger("exactCombinationLimit"), 17);
+      EXPECT_EQ(options->getInteger("beamWidth"), 5);
+      EXPECT_EQ(options->getInteger("maxExpandedStates"), 23);
+      EXPECT_EQ(options->getBoolean("refineBeamSolution"), false);
+      EXPECT_EQ(options->getInteger("maxRefinementProbes"), 29);
+      EXPECT_FALSE(llvm::sys::fs::exists(output));
+      std::error_code directoryError;
+      llvm::sys::fs::directory_iterator files(directory, directoryError);
+      EXPECT_FALSE(bool(directoryError));
+      EXPECT_TRUE(files == llvm::sys::fs::directory_iterator());
+    }
+  }
+  EXPECT_FALSE(bool(llvm::sys::fs::remove(directory)));
 }
 TEST(LayoutStatisticsTest, SharedUseEdgesChargeOnePhysicalConversion) {
   LayoutConstraintGraph graph;
@@ -241,6 +412,11 @@ TEST(LayoutStatisticsTest, IndependentNonemptyRunsHaveIdenticalNonTimingJSON) {
 }
 TEST(LayoutStatisticsTest, RetryProposalsAndAttemptsRemainSeparate) {
   class RetryingTarget : public StatisticsTarget {
+    FailureOr<CostVector> evaluate(const CandidateAssignment &a) const override {
+      CostVector cost;
+      cost.codeSize = a.values.size() * 7;
+      return cost;
+    }
     void enumerateRelaxedCandidates(const LayoutConstraintGraph &, const LayoutVar &var,
         RelaxationKind kind, SmallVectorImpl<LayoutCandidate> &out) const override {
       if (kind == RelaxationKind::Replication) {
@@ -252,17 +428,332 @@ TEST(LayoutStatisticsTest, RetryProposalsAndAttemptsRemainSeparate) {
   MLIRContext context;
   Builder builder(&context);
   LayoutConstraintGraph graph;
-  graph.addVariable(LayoutKind::Distributed, RankedTensorType::get({4}, builder.getF32Type()), "retry");
+  auto seed = graph.addVariable(LayoutKind::Distributed,
+      RankedTensorType::get({4}, builder.getF32Type()), "a-successful-component");
+  graph.getVariable(seed).candidates.push_back({builder.getStringAttr("a")});
+  graph.addVariable(LayoutKind::Distributed, RankedTensorType::get({4}, builder.getF32Type()), "z-retry");
   LayoutStatisticsReport report;
+  LayoutTrace trace({"unused.json"});
   SmallVector<RelaxationRecord> records;
-  ASSERT_TRUE(succeeded(attemptControlledRelaxation(graph, target, {}, records, nullptr, &report)));
+  auto retryGraph = graph;
+  auto solution = attemptControlledRelaxation(graph, target, {}, records, nullptr, &report, &trace);
+  ASSERT_TRUE(succeeded(solution));
+  auto parsed = llvm::json::parse(trace.serialize());
+  ASSERT_TRUE(bool(parsed));
+  EXPECT_EQ(parsed->getAsObject()->getInteger("costScope"), 2);
+  EXPECT_EQ(parsed->getAsObject()->getInteger("attempts"), 2);
+  EXPECT_EQ(parsed->getAsObject()->getString("analysis_status"), "solved");
+  EXPECT_EQ(parsed->getAsObject()->getString("verification_status"), "solved-graph-verified");
+  EXPECT_TRUE(parsed->getAsObject()->getObject("finalCost"));
+  EXPECT_EQ(solution->cost.cost.codeSize, 14u);
+  uint64_t historical = 0, selected = 0;
+  unsigned attemptGraphs = 0;
+  for (auto &e : *parsed->getAsObject()->getArray("events")) {
+    auto *event = e.getAsObject();
+    if (event->getString("event") == "graph") ++attemptGraphs;
+    if (event->getString("event") == "attempt-end" && event->getInteger("attempt") == 1)
+      EXPECT_EQ(event->getString("failureKind"), "empty-domain");
+    if (event->getString("event") != "cost-contribution") continue;
+    auto cost = (*event->getObject("estimate")->getArray("cost"))[7].getAsUINT64();
+    ASSERT_TRUE(cost);
+    if (event->getInteger("costScope") == 1) historical += *cost;
+    if (event->getInteger("costScope") == 2) selected += *cost;
+  }
+  EXPECT_EQ(historical, 7u);
+  EXPECT_EQ(selected, 14u);
+  EXPECT_EQ(attemptGraphs, 2u);
+  LayoutTrace capped({"unused.json", 1, 4096});
+  ASSERT_TRUE(succeeded(attemptControlledRelaxation(retryGraph, target, {}, records, nullptr, nullptr, &capped)));
+  auto cappedJSON = llvm::json::parse(capped.serialize());
+  ASSERT_TRUE(bool(cappedJSON));
+  EXPECT_EQ(cappedJSON->getAsObject()->getInteger("costScope"), 2);
+  EXPECT_EQ((*cappedJSON->getAsObject()->getObject("omittedCost")->getArray("cost"))[7].getAsUINT64(), 14u);
   ASSERT_EQ(report.attempts.size(), 2u);
   EXPECT_EQ(report.attempts[0].kind, "initial");
   EXPECT_EQ(report.attempts[1].kind, "replication");
-  EXPECT_EQ(report.attempts[0].statistics.preparedCandidates, 0u);
-  EXPECT_EQ(report.attempts[1].statistics.preparedCandidates, 1u);
+  EXPECT_EQ(report.attempts[0].statistics.preparedCandidates, 1u);
+  EXPECT_EQ(report.attempts[1].statistics.preparedCandidates, 2u);
   ASSERT_EQ(report.relaxations.size(), 1u);
-  EXPECT_EQ(*report.relaxations[0].getAsObject()->getInteger("generatedProposals"), 2);
+  EXPECT_EQ(*report.relaxations[0].getAsObject()->getInteger("generatedProposals"), 4);
   EXPECT_EQ(*report.relaxations[0].getAsObject()->getInteger("addedCandidates"), 1);
+}
+TEST(LayoutTraceIntegrationTest, BudgetFailureRecordsInterruptedSearchDepth) {
+  MLIRContext context;
+  Builder builder(&context);
+  LayoutConstraintGraph graph;
+  auto id = graph.addVariable(LayoutKind::Distributed,
+      RankedTensorType::get({4}, builder.getF32Type()), "v");
+  graph.getVariable(id).candidates = {{builder.getStringAttr("a")}, {builder.getStringAttr("b")}};
+  LayoutTrace trace({"unused.json"});
+  StatisticsTarget target;
+  SmallVector<RelaxationRecord> records;
+  LayoutSolveFailure why;
+  ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
+  EXPECT_TRUE(failed(attemptControlledRelaxation(graph, target, {256, 32, 1}, records, &why, nullptr, &trace)));
+  EXPECT_EQ(why.kind, LayoutSolveFailureKind::SearchBudget);
+  auto json = llvm::json::parse(trace.serialize());
+  ASSERT_TRUE(bool(json));
+  unsigned depths = 0;
+  for (auto &e : *json->getAsObject()->getArray("events")) {
+    auto *event = e.getAsObject();
+    if (event->getString("event") != "search-depth") continue;
+    ++depths;
+    EXPECT_EQ(event->getInteger("probes"), 1);
+    EXPECT_EQ(event->getBoolean("completed"), false);
+    EXPECT_EQ(event->getInteger("retained"), 0);
+  }
+  EXPECT_EQ(depths, 1u);
+}
+TEST(LayoutTraceIntegrationTest, ExistingRequiredEncodingCheckIsDisprovenNotMissingSupport) {
+  MLIRContext context;
+  Builder builder(&context);
+  LayoutConstraintGraph graph;
+  auto id = graph.addVariable(LayoutKind::Distributed,
+      RankedTensorType::get({4}, builder.getF32Type()), "v");
+  graph.getVariable(id).candidates = {{builder.getStringAttr("a")}, {builder.getStringAttr("b")}};
+  graph.addConstraint(ConstraintKind::RequireEncoding, ConstraintStrength::Hard,
+      {id}, nullptr, "required", "test seed", builder.getStringAttr("a"));
+  LayoutTrace trace({"unused.json"});
+  StatisticsTarget target;
+  ASSERT_TRUE(succeeded(solveLayoutGraph(graph, target, {}, nullptr, nullptr, &trace)));
+  auto json = llvm::json::parse(trace.serialize());
+  ASSERT_TRUE(bool(json));
+  unsigned rejected = 0;
+  for (auto &e : *json->getAsObject()->getArray("events")) {
+    auto *event = e.getAsObject();
+    if (event->getString("event") != "candidate-rejected") continue;
+    ++rejected;
+    EXPECT_EQ(event->getString("status"), "Disproven");
+  }
+  EXPECT_EQ(rejected, 1u);
+}
+TEST(LayoutTraceIntegrationTest, PropagationPreservesThreeValuedRejectionEvidence) {
+  MLIRContext context;
+  Builder builder(&context);
+  for (auto kind : {ConstraintKind::RequireEncoding, ConstraintKind::Ownership,
+                    ConstraintKind::InstructionContract}) {
+    LayoutConstraintGraph graph;
+    auto id = graph.addVariable(LayoutKind::Distributed,
+        RankedTensorType::get({4}, builder.getF32Type()), "v");
+    graph.getVariable(id).candidates = {{builder.getStringAttr("b")}};
+    graph.addConstraint(kind, ConstraintStrength::Hard, {id}, nullptr,
+        "evidence", "test", kind == ConstraintKind::RequireEncoding ? builder.getStringAttr("a") : Attribute{});
+    if (kind == ConstraintKind::InstructionContract) graph.getConstraints().front().instruction.emplace();
+    LayoutTrace trace({"unused.json"});
+    EXPECT_TRUE(failed(propagateStrict(graph, &trace)));
+    auto json = llvm::json::parse(trace.serialize());
+    ASSERT_TRUE(bool(json));
+    unsigned rejections = 0;
+    for (auto &e : *json->getAsObject()->getArray("events")) {
+      auto *event = e.getAsObject();
+      if (event->getString("event") != "candidate-rejected") continue;
+      ++rejections;
+      EXPECT_EQ(event->getString("status"), kind == ConstraintKind::RequireEncoding ? "Disproven"
+          : kind == ConstraintKind::Ownership ? "Unknown" : "NoSupport");
+      EXPECT_EQ(event->getString("stage"), "strict");
+    }
+    EXPECT_EQ(rejections, 1u);
+  }
+}
+TEST(LayoutTraceIntegrationTest, MandatorySolverOptionsSurviveTruncationAndEarlyFailure) {
+  MLIRContext context;
+  context.loadDialect<FriskDialect, arith::ArithDialect, func::FuncDialect>();
+  llvm::SmallString<128> directory;
+  ASSERT_FALSE(bool(llvm::sys::fs::createUniqueDirectory("frisk-trace-options", directory)));
+  std::string path = (directory + "/trace.json").str();
+  SolverOptions options{17, 5, 23, false, 29};
+  auto check = [&](StringRef text, StringRef expectedModelID) {
+    auto json = llvm::json::parse(text);
+    ASSERT_TRUE(bool(json));
+    EXPECT_LE(text.size(), 4096u);
+    EXPECT_TRUE(json->getAsObject()->getArray("events")->empty());
+    EXPECT_EQ(json->getAsObject()->getString("cost_model_id"), expectedModelID);
+    auto *solver = json->getAsObject()->getObject("solver_options");
+    ASSERT_TRUE(solver);
+    EXPECT_EQ(solver->getInteger("exactCombinationLimit"), 17);
+    EXPECT_EQ(solver->getInteger("beamWidth"), 5);
+    EXPECT_EQ(solver->getInteger("maxExpandedStates"), 23);
+    EXPECT_EQ(solver->getBoolean("refineBeamSolution"), false);
+    EXPECT_EQ(solver->getInteger("maxRefinementProbes"), 29);
+  };
+  ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
+  // Unknown operation with tensor operands fails collection/normalization
+  // before solveLayoutGraph, so transaction-boundary initialization is needed.
+  context.allowUnregisteredDialects();
+  for (bool pipeline : {false, true}) {
+    auto module = parseSourceString<ModuleOp>(R"(func.func @f(%x:tensor<4xf32>) {
+      "unknown.layout_op"(%x) : (tensor<4xf32>) -> ()
+      return
+    })", &context);
+    ASSERT_TRUE(module);
+    LayoutStatisticsReport report;
+    PassManager pm(&context);
+    if (pipeline) buildFriskLayoutPipeline(pm, options, {}, &report, {path, 1, 4096});
+    else {
+      auto pass = createFriskInferLayoutsPass(options, false, &report);
+      ASSERT_TRUE(succeeded(pass->initializeOptions("trace-file=" + path + " trace-max-bytes=4096",
+          [](const Twine &) { return failure(); })));
+      pm.addPass(std::move(pass));
+    }
+    EXPECT_TRUE(failed(pm.run(*module)));
+    EXPECT_TRUE(report.attempts.empty());
+    auto file = llvm::MemoryBuffer::getFile(path);
+    ASSERT_TRUE(bool(file));
+    EXPECT_EQ(report.costModelID, "sm90-layout-lex9-legacy-v1");
+    EXPECT_EQ(report.toJSON().getString("cost_model_id"), report.costModelID);
+    check((*file)->getBuffer(), "sm90-layout-lex9-legacy-v1");
+  }
+  StatisticsTarget target;
+  for (bool coordinator : {false, true}) {
+    LayoutConstraintGraph graph;
+    // The coordinator rejects these invariants without entering the solver,
+    // independently exercising both public API initialization boundaries.
+    Builder builder(&context);
+    auto id = graph.addVariable(LayoutKind::Distributed,
+        RankedTensorType::get({4}, builder.getF32Type()), "invalid-id");
+    graph.getVariable(id).id = 42;
+    LayoutTrace trace({path, 1, 4096});
+    SmallVector<RelaxationRecord> records;
+    auto result = coordinator ? attemptControlledRelaxation(graph, target, options, records, nullptr, nullptr, &trace)
+                              : solveLayoutGraph(graph, target, options, nullptr, nullptr, &trace);
+    EXPECT_TRUE(failed(result));
+    check(trace.serialize(), "unversioned-target");
+  }
+  EXPECT_FALSE(bool(llvm::sys::fs::remove(path)));
+  EXPECT_FALSE(bool(llvm::sys::fs::remove(directory)));
+}
+TEST(LayoutTraceIntegrationTest, TransactionRollbackForInvalidOptionsAndWriteFailures) {
+  MLIRContext context;
+  context.loadDialect<FriskDialect, arith::ArithDialect, func::FuncDialect>();
+  ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
+  const char *input = R"(func.func @f(%x:tensor<4xf32>) -> tensor<4xf32> {
+    %y = arith.addf %x, %x : tensor<4xf32>
+    return %y : tensor<4xf32>
+  })";
+  for (bool pipeline : {false, true}) {
+    for (unsigned scenario = 0; scenario < 4; ++scenario) {
+      auto module = parseSourceString<ModuleOp>(input, &context);
+      auto print = [&] { std::string s; llvm::raw_string_ostream(s) << *module; return s; };
+      auto before = print();
+      LayoutTraceOptions options{"/nonexistent-frisk-trace-directory/trace.json"};
+      std::string stats;
+      if (scenario == 1) options.maxEvents = 0;
+      if (scenario == 2) options.maxBytes = 4095;
+      if (scenario == 3) stats = options.file;
+      LayoutStatisticsReport report;
+      PassManager pm(&context);
+      if (pipeline) buildFriskLayoutPipeline(pm, {}, stats, &report, options);
+      else {
+        auto pass = createFriskInferLayoutsPass({}, false, &report);
+        std::string text = "trace-file=" + options.file + " trace-max-events=" + std::to_string(options.maxEvents)
+            + " trace-max-bytes=" + std::to_string(options.maxBytes);
+        if (!stats.empty()) text += " stats-file=" + stats;
+        ASSERT_TRUE(succeeded(pass->initializeOptions(text, [](const Twine &) { return failure(); })));
+        pm.addPass(std::move(pass));
+      }
+      EXPECT_TRUE(failed(pm.run(*module)));
+      EXPECT_EQ(print(), before);
+      EXPECT_EQ(report.costModelID, "sm90-layout-lex9-legacy-v1");
+      EXPECT_EQ(report.failureKind, scenario ? "trace-options" : "trace-write");
+      if (scenario) EXPECT_TRUE(report.attempts.empty());
+      else {
+        ASSERT_FALSE(report.attempts.empty());
+        EXPECT_TRUE(report.attempts.back().succeeded);
+      }
+    }
+  }
+}
+TEST(LayoutTraceIntegrationTest, TraceOnOffAndRepeatedSemanticJSONAreIdentical) {
+  MLIRContext context;
+  context.loadDialect<FriskDialect, arith::ArithDialect, func::FuncDialect>();
+  llvm::SmallString<128> directory;
+  ASSERT_FALSE(bool(llvm::sys::fs::createUniqueDirectory("frisk-trace-integration", directory)));
+  std::string path = (directory + "/trace.json").str();
+  std::string referenceIR, referenceStats, referenceTrace;
+  for (unsigned iteration = 0; iteration < 3; ++iteration) {
+    auto module = parseSourceString<ModuleOp>(R"(func.func @f(%x:tensor<4xf32>) -> tensor<4xf32> {
+      %y = arith.addf %x, %x : tensor<4xf32>
+      return %y : tensor<4xf32>
+    })", &context);
+    LayoutStatisticsReport report;
+    PassManager pm(&context);
+    buildFriskLayoutPipeline(pm, {}, {}, &report, {iteration ? path : ""});
+    ASSERT_TRUE(succeeded(pm.run(*module)));
+    EXPECT_EQ(report.costModelID, "sm90-layout-lex9-legacy-v1");
+    std::string ir;
+    llvm::raw_string_ostream(ir) << *module;
+    report.timings.clear();
+    for (auto &attempt : report.attempts) {
+      attempt.statistics.solveTime = attempt.propagationTime = attempt.verificationTime = std::chrono::nanoseconds(0);
+    }
+    auto stats = llvm::formatv("{0}", llvm::json::Value(report.toJSON())).str();
+    if (!iteration) { referenceIR = ir; referenceStats = stats; }
+    else {
+      EXPECT_EQ(ir, referenceIR);
+      EXPECT_EQ(stats, referenceStats);
+      auto file = llvm::MemoryBuffer::getFile(path);
+      ASSERT_TRUE(bool(file));
+      auto json = llvm::json::parse((*file)->getBuffer());
+      ASSERT_TRUE(bool(json));
+      EXPECT_EQ(json->getAsObject()->getString("cost_model_id"), report.costModelID);
+      EXPECT_EQ(json->getAsObject()->getBoolean("costExplanationComplete"), true);
+      if (iteration == 1) referenceTrace = (*file)->getBuffer().str();
+      else EXPECT_EQ((*file)->getBuffer(), referenceTrace);
+    }
+  }
+  EXPECT_FALSE(bool(llvm::sys::fs::remove(path)));
+  EXPECT_FALSE(bool(llvm::sys::fs::remove(directory)));
+}
+TEST(LayoutStatisticsTest, WeightedTrafficDeduplicatesConvertsAndSaturatesWithoutClones) {
+  LayoutConstraintGraph graph;
+  LayoutSolution solution;
+  LayoutConversionEdge edge;
+  edge.resolution = EdgeResolutionKind::Convert;
+  edge.constraint = 0; edge.sharedLeader = 0;
+  edge.bytes = UINT64_MAX; edge.frequencyFactor = 2; edge.frequencyUsesProxy = true;
+  solution.conversions.push_back(edge);
+  edge.constraint = 1; solution.conversions.push_back(edge);
+  edge.constraint = edge.sharedLeader = 2; edge.resolution = EdgeResolutionKind::Rematerialize;
+  solution.conversions.push_back(edge);
+  LayoutAttemptStatistics attempt;
+  finishLayoutStatistics(graph, {}, &solution, attempt);
+  EXPECT_EQ(attempt.statistics.conversionBytes, UINT64_MAX);
+  EXPECT_EQ(attempt.statistics.weightedConversionBytes, UINT64_MAX);
+  EXPECT_TRUE(attempt.statistics.weightedConversionBytesSaturated);
+  EXPECT_TRUE(attempt.statistics.weightedConversionBytesUsesProxy);
+  EXPECT_EQ(attempt.statistics.uniqueConversions, 1u);
+  EXPECT_EQ(attempt.statistics.uniqueRematerializations, 1u);
+}
+TEST(LayoutTraceIntegrationTest, StaticEarlyFailurePreservesModelAndOriginalIR) {
+  MLIRContext context;
+  context.loadDialect<FriskDialect, arith::ArithDialect, func::FuncDialect>();
+  context.allowUnregisteredDialects();
+  ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
+  for (bool pipeline : {false,true}) {
+    auto module = parseSourceString<ModuleOp>(R"mlir(
+      func.func @bad(%x: tensor<4xf32>) {
+        "unknown.layout_op"(%x) : (tensor<4xf32>) -> ()
+        return
+      }
+    )mlir", &context);
+    ASSERT_TRUE(module);
+    auto print = [&] { std::string text; llvm::raw_string_ostream(text) << *module; return text; };
+    auto before = print();
+    LayoutStatisticsReport report;
+    LayoutTrace trace({"unused.json"});
+    PassManager pm(&context);
+    if (pipeline) buildFriskLayoutPipeline(pm, {}, {}, &report, {}, {}, false, LayoutBoundaryFrequencyMode::StaticTripCount);
+    else pm.addPass(createFriskInferLayoutsPass({}, false, &report, LayoutStatisticsScope::Standalone,
+                                               &trace, nullptr, LayoutBoundaryFrequencyMode::StaticTripCount));
+    EXPECT_TRUE(failed(pm.run(*module)));
+    EXPECT_EQ(print(), before);
+    EXPECT_EQ(report.costModelID, "sm90-layout-lex9-static-trip-count-v1");
+    EXPECT_TRUE(report.staticTripCountFrequency);
+    if (!pipeline) {
+      EXPECT_EQ(trace.getSummary().costModelID, report.costModelID);
+      EXPECT_TRUE(trace.getSummary().staticTripCountFrequency);
+      EXPECT_FALSE(trace.getSummary().hasFinalCost);
+    }
+  }
 }
 }

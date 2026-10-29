@@ -215,6 +215,11 @@ LogicalResult Normalizer::checkLifetime(Value allocation) {
 LogicalResult Normalizer::preflight() {
   // Validate math before rewriting even dead computations or allocations.
   auto math = module.walk([&](Operation *op) -> WalkResult {
+    if (auto gemm = dyn_cast<GemmOp>(op))
+      if (gemm.getPolicy() == attr::GemmWarpPolicy::Auto) {
+        gemm.emitOpError("Auto policy requires frisk.mma");
+        return WalkResult::interrupt();
+      }
     if (isa<GemmOp, ReduceOp>(op) && failed(verifyLegacyTensorV1Semantics(op)))
       return WalkResult::interrupt();
     return WalkResult::advance();

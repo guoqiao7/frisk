@@ -44,8 +44,8 @@ LogicalResult ReduceTensorOp::verify() {
     return emitOpError("reduce-shape: requires matching f16/bf16/f32 element types");
   for (auto type : {src,dst}) {
     if (!type.hasStaticShape() || llvm::any_of(type.getShape(), [](int64_t e) {
-          return e <= 1 || !llvm::isPowerOf2_64(e); }))
-      return emitOpError("reduce-shape: requires static power-of-two extents greater than one");
+          return e <= 0 || !llvm::isPowerOf2_64(e); }))
+      return emitOpError("reduce-shape: requires static positive power-of-two extents");
     if (auto attr = type.getEncoding()) {
       auto encoding = dyn_cast<DistributedEncodingAttr>(attr);
       if (!encoding) return emitOpError("reduce-shape: requires distributed tensor encoding");

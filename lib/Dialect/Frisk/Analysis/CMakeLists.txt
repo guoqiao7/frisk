@@ -1,5 +1,6 @@
 add_frisk_library(FriskAnalysis
   LayoutAlgebra.cpp
+  LayoutBoundaryFrequency.cpp
   LayoutConstraint.cpp
 
   LINK_LIBS PUBLIC
@@ -19,7 +20,11 @@ add_frisk_library(FriskLegacyLayoutAdapter
 )
 
 add_frisk_library(FriskLayoutAnalysis
+  LayoutIRDiagnostics.cpp
+  LayoutIRResources.cpp
+  LayoutProfile.cpp
   LayoutStatistics.cpp
+  LayoutTrace.cpp
   LayoutCostModel.cpp
   LayoutConversionChoice.cpp
   LayoutCandidateSolver.cpp
@@ -30,6 +35,7 @@ add_frisk_library(FriskLayoutAnalysis
   InstructionLayoutConstraints.cpp
   MmaLayoutConstraints.cpp
   ExecutionLayoutProof.cpp
+  LinearExecutionLayout.cpp
   LayoutAliasAnalysis.cpp
   StorageAliasCandidates.cpp
   StorageRootContracts.cpp
@@ -44,6 +50,7 @@ add_frisk_library(FriskLayoutAnalysis
   FriskIR
   MLIRIR
   MLIRFuncDialect
+  MLIRGPUDialect
   MLIRLinalgDialect
   MLIRSCFDialect
   MLIRTensorDialect

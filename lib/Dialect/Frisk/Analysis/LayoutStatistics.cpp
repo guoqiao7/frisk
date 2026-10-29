@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Analysis/LayoutStatistics.h"
+#include "Dialect/Frisk/Analysis/LayoutCostModel.h"
 #include "Dialect/Frisk/Analysis/LayoutSolver.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/FileSystem.h"
@@ -18,7 +19,7 @@ void prepareLayoutStatistics(const LayoutConstraintGraph &graph,
     attempt.statistics.preparedCandidates += unique.size();
   }
 }
-static StringRef failureName(LayoutSolveFailureKind kind) {
+StringRef stringifyLayoutSolveFailureKind(LayoutSolveFailureKind kind) {
   switch (kind) {
   case LayoutSolveFailureKind::None: return "none";
   case LayoutSolveFailureKind::InvalidInput: return "invalid-input";
@@ -36,7 +37,7 @@ void finishLayoutStatistics(const LayoutConstraintGraph &graph,
                             const LayoutSolution *solution,
                             LayoutAttemptStatistics &attempt) {
   attempt.succeeded = solution != nullptr;
-  attempt.failureKind = failureName(failure.kind).str();
+  attempt.failureKind = stringifyLayoutSolveFailureKind(failure.kind).str();
   attempt.failureReason = failure.reason;
   if (failure.variable < graph.getVariables().size())
     attempt.failureVariable = graph.getVariable(failure.variable).stableName;
@@ -52,7 +53,19 @@ void finishLayoutStatistics(const LayoutConstraintGraph &graph,
     auto leader = edge.sharedLeader == UINT32_MAX ? edge.constraint : edge.sharedLeader;
     if (edge.resolution == EdgeResolutionKind::Convert) {
       ++stats.conversionUseEdges;
-      if (conversions.insert(leader).second) stats.conversionBytes += edge.bytes;
+      if (conversions.insert(leader).second) {
+        stats.conversionBytes += edge.bytes;
+        auto &saturated = stats.weightedConversionBytesSaturated;
+        uint64_t weighted = edge.bytes;
+        if (edge.frequencyFactor && weighted > UINT64_MAX / edge.frequencyFactor) {
+          weighted = UINT64_MAX; saturated = true;
+        } else weighted *= edge.frequencyFactor;
+        saturated |= edge.frequencySaturated && edge.bytes != 0;
+        stats.weightedConversionBytesUsesProxy |= edge.frequencyUsesProxy;
+        if (stats.weightedConversionBytes > UINT64_MAX - weighted) {
+          stats.weightedConversionBytes = UINT64_MAX; saturated = true;
+        } else stats.weightedConversionBytes += weighted;
+      }
     } else if (edge.resolution == EdgeResolutionKind::Rematerialize) {
       ++stats.rematerializationUseEdges;
       rematerializations.insert(leader);
@@ -77,6 +90,9 @@ static llvm::json::Object statsJSON(const LayoutStatistics &s, bool success) {
     result["rematerializationUseEdges"] = s.rematerializationUseEdges;
     result["uniqueRematerializations"] = s.uniqueRematerializations;
     result["conversionBytes"] = s.conversionBytes;
+    result["weightedConversionBytes"] = s.weightedConversionBytes;
+    result["weightedConversionBytesUsesProxy"] = s.weightedConversionBytesUsesProxy;
+    result["weightedConversionBytesSaturated"] = s.weightedConversionBytesSaturated;
     result["estimatedBankConflicts"] = s.estimatedBankConflicts;
     result["estimatedMemoryTransactions"] = s.estimatedMemoryTransactions;
   }
@@ -99,6 +115,9 @@ llvm::json::Object LayoutStatisticsReport::toJSON() const {
       {"status", attempt.succeeded ? "solved" : "failed"},
       {"components", llvm::json::Array(attempt.components)}, {"mrvProbes", attempt.mrvProbes},
       {"expandedNodes", attempt.expandedNodes},
+      {"refinementProbes", attempt.refinementProbes},
+      {"refinementSweeps", attempt.refinementSweeps},
+      {"refinementAccepted", attempt.refinementAccepted},
       {"timings", llvm::json::Object{{"solve_ns", attempt.statistics.solveTime.count()},
                                     {"propagation_ns", attempt.propagationTime.count()},
                                     {"verification_ns", attempt.verificationTime.count()}}}};
@@ -111,7 +130,12 @@ llvm::json::Object LayoutStatisticsReport::toJSON() const {
   llvm::json::Object time;
   for (const auto &entry : timings) time[entry.first] = entry.second;
   llvm::json::Object result{{"schema_version", 1}, {"status", status},
-    {"preparation", llvm::json::Object{{"rawGeneratedProposals", rawGeneratedProposals}}},
+    {"actual_ir_diagnostics", actualIRDiagnostics},
+    {"cost_model_id", normalizeLayoutCostModelID(costModelID).str()},
+    {"boundaryFrequency", staticTripCountFrequency ? "static-trip-count" : "legacy"},
+    {"preparation", llvm::json::Object{{"rawGeneratedProposals", rawGeneratedProposals},
+        {"instructionCombinations", instructionCombinations},
+        {"instructionFragmentPrechecks", instructionFragmentPrechecks}}},
     {"attempts", std::move(records)}, {"relaxations", llvm::json::Array(relaxations)},
     {"timings", std::move(time)}};
   if (status == "failed") result["failure"] = llvm::json::Object{

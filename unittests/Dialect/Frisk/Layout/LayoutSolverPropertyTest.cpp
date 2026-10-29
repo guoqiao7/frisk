@@ -170,6 +170,43 @@ TEST(LayoutSolverPropertyTest, DefaultBudgetsAndNonRetryableFailures) {
     }
   }
 }
+TEST(LayoutSolverPropertyTest, RefinementNeverWorsensBeamAndRespectsIndependentOracle) {
+  MLIRContext ctx; Builder b(&ctx);
+  auto host = OwningOpRef<ModuleOp>(ModuleOp::create(b.getUnknownLoc()));
+  ScopedDiagnosticHandler quiet(&ctx, [](Diagnostic &) { return success(); });
+  for (uint64_t seed : {1u, 7u, 42u, 20260816u}) {
+    std::mt19937_64 rng(seed);
+    for (unsigned ci = 0; ci < 12; ++ci) {
+      SCOPED_TRACE("seed=" + std::to_string(seed) + " case=" + std::to_string(ci));
+      Fixture f; f.n = 3 + ci % 4; f.domain = 2 + ci % 2; f.costs.resize(f.n);
+      for (auto &v : f.costs) for (auto &c : v) for (auto &d : c) d = rng() % 7;
+      for (unsigned i = 1; i < f.n; ++i)
+        f.relations.push_back({i-1, i, uint16_t(rng() | 1u), false});
+      auto optimum = oracle(f); ASSERT_TRUE(optimum);
+      std::string first;
+      for (unsigned shuffle = 0; shuffle < 20; ++shuffle) {
+        auto offGraph = graphFor(f, b, *host, rng), onGraph = offGraph;
+        FiniteCostTarget target(f);
+        SolverOptions options{1, 1, 65536, false, 256};
+        auto off = solveLayoutGraph(offGraph, target, options);
+        options.refineBeamSolution = true;
+        auto on = solveLayoutGraph(onGraph, target, options);
+        ASSERT_EQ(succeeded(on), succeeded(off));
+        if (failed(on)) continue; // Refinement cannot rescue an absent incumbent.
+        EXPECT_FALSE(off->cost.cost < on->cost.cost);
+        EXPECT_FALSE(on->cost.cost < costVector(*optimum));
+        EXPECT_TRUE(succeeded(verifySolvedLayoutGraph(onGraph, *on, target, b.getUnknownLoc())));
+        auto dump = canonical(onGraph, *on);
+        if (!shuffle) first = dump; else EXPECT_EQ(first, dump);
+        for (auto &c : on->components) {
+          EXPECT_EQ(c.expanded, c.mrvProbes + c.refinementProbes);
+          EXPECT_LE(c.refinementProbes, 256u);
+          EXPECT_LE(c.expanded, 65536u);
+        }
+      }
+    }
+  }
+}
 TEST(LayoutSolverPropertyTest, EachOfNineCostDimensionsCanDecideTheOptimum) {
   MLIRContext ctx;Builder b(&ctx);auto host=OwningOpRef<ModuleOp>(ModuleOp::create(b.getUnknownLoc()));
   std::mt19937_64 rng(42);

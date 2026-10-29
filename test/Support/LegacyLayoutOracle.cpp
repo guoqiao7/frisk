@@ -814,6 +814,8 @@ computeWarpPartition(attr::GemmWarpPolicy policy, int64_t M, int64_t N,
   int64_t mWarp = 1;
   int64_t nWarp = numWarps;
   switch (policy) {
+  case attr::GemmWarpPolicy::Auto:
+    return {0, 0}; // Auto is intentionally unavailable to the legacy oracle.
   case attr::GemmWarpPolicy::FullRow: {
     mWarp = numWarps;
     if (M % (mWarp * kMPerWarp) != 0) {
@@ -1126,6 +1128,8 @@ LogicalResult inferLegacyParallelLayout(ParallelOp parallel, OpBuilder &builder,
 
 LogicalResult inferLegacyGemmLayout(GemmOp gemm, OpBuilder &builder,
                                     DenseMap<Value, Attribute> &layoutMap) {
+  if (gemm.getPolicy() == attr::GemmWarpPolicy::Auto)
+    return gemm.emitOpError("Auto policy requires frisk.mma");
   Operation *op = gemm.getOperation();
   auto targetInfo = detectTargetInfo(op);
   if (!targetInfo)

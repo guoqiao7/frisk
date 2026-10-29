@@ -15,6 +15,7 @@ config.excludes = ["CMakeLists.txt", "lit.cfg.py", "lit.site.cfg.py"]
 llvm_config.use_default_substitutions()
 llvm_config.add_tool_substitutions(
     [ToolSubst("frisk-opt", unresolved="fatal"),
+     ToolSubst("not", unresolved="fatal"),
      ToolSubst("layout-reduce", unresolved="fatal")],
     [config.frisk_tools_dir, config.llvm_tools_dir],
 )

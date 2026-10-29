@@ -167,7 +167,10 @@ StorageLayoutAttr buildXor(MemRefType type, unsigned swizzleBytes) {
 }
 
 class SM90LayoutTarget final : public LayoutTarget {
+  LayoutBoundaryFrequencyMode mode;
 public:
+  explicit SM90LayoutTarget(LayoutBoundaryFrequencyMode mode) : mode(mode) {}
+  LayoutBoundaryFrequencyMode boundaryFrequencyMode() const override { return mode; }
   void enumerateRelaxedCandidates(const LayoutConstraintGraph &,
       const LayoutVar &var, RelaxationKind kind,
       SmallVectorImpl<LayoutCandidate> &out) const override;
@@ -212,6 +215,26 @@ public:
       return verifySM90CopyContract(graph, constraint, encodings, binding);
     return verifySM90MmaContract(graph, constraint, encodings, binding);
   }
+  InstructionContractBuildResult buildInstructionContractDetailed(
+      const LayoutConstraintGraph &graph, const LayoutConstraint &constraint,
+      ArrayRef<Attribute> encodings) const override {
+    if (constraint.instruction && isa_and_nonnull<CopyOp>(constraint.instruction->source))
+      return buildSM90CopyContractDetailed(graph, constraint, encodings);
+    return buildSM90MmaContractDetailed(graph, constraint, encodings);
+  }
+  LayoutProof precheckInstructionRole(const LayoutConstraintGraph &graph,
+      const LayoutConstraint &constraint, unsigned role, Attribute candidate,
+      Attribute geometry) const override {
+    auto op = constraint.instruction ? dyn_cast_or_null<MmaOp>(constraint.instruction->source) : MmaOp{};
+    if (!op || constraint.vars.size() != 5 || role >= 4)
+      return {ProofStatus::Unknown, {}, "unsupported geometry-conditioned role"};
+    auto g = decodeSM90MmaGeometry(op,graph.getVariable(constraint.vars[4]).requiredThreads,geometry);
+    if (failed(g)) return {ProofStatus::Disproven, {}, "sm90-mma-thread-group: invalid geometry"};
+    auto type = dyn_cast<RankedTensorType>(graph.getVariable(constraint.vars[role]).shapedType);
+    if (!type) return {ProofStatus::Unknown, {}, "not a fragment role"};
+    return verifySM90MmaFragment(*g,role == 0,role == 0 && op.getTransA(),type,
+        dyn_cast_or_null<DistributedEncodingAttr>(candidate));
+  }
   void enumerateCandidates(
       const LayoutVar &var,
       SmallVectorImpl<LayoutCandidate> &out) const override {
@@ -241,8 +264,11 @@ public:
 
   LogicalResult verifyCandidate(const LayoutVar &var, Attribute candidate,
                                 Location loc) const override {
-    if (var.kind == LayoutKind::Instruction)
+    if (var.kind == LayoutKind::Instruction) {
+      if (auto mma = dyn_cast_or_null<MmaOp>(var.anchor))
+        return success(succeeded(decodeSM90MmaGeometry(mma,var.requiredThreads,candidate)));
       return success(isa_and_nonnull<CopyOp>(var.anchor) && isSM90CopyPath(candidate));
+    }
     if (var.kind == LayoutKind::Distributed) {
       auto tensor = dyn_cast<RankedTensorType>(var.shapedType);
       auto encoding = dyn_cast<DistributedEncodingAttr>(candidate);
@@ -263,13 +289,24 @@ public:
   evaluate(const CandidateAssignment &) const override { return CostVector{}; }
   FailureOr<CostEstimate> evaluate(const LayoutConstraintGraph &graph,
       const CandidateAssignment &assignment) const override {
-    return evaluateSM90LayoutCost(graph, assignment);
+    return evaluateSM90LayoutCost(graph, assignment, nullptr, mode);
+  }
+  FailureOr<CostEstimate> evaluate(const LayoutConstraintGraph &graph,
+      const CandidateAssignment &assignment, LayoutCostObserver *observer) const override {
+    return evaluateSM90LayoutCost(graph, assignment, observer, mode);
   }
   FailureOr<CostEstimate> lowerBound(const LayoutConstraintGraph &graph,
       const CandidateAssignment &assignment) const override {
     return evaluateStaticLayoutCost(graph, assignment);
   }
+  StringRef costModelID() const override { return mode == LayoutBoundaryFrequencyMode::Legacy ? getSM90LegacyCostModelID() : "sm90-layout-lex9-static-trip-count-v1"; }
   StringRef costCoverage() const override {
+    if (mode == LayoutBoundaryFrequencyMode::StaticTripCount)
+      return "bounded-owner-proof-v1 with cta-staging-upper-bound-v1 fallback; "
+             "pure-slice-byte-work-v1; static signed trip counts with unknown-loop factor-2 proxy; "
+             "register/replication slots; shared root spans; "
+             "sm90-shape-work-v1; warp-issue-32B-sectors-v1 (unknown base phase upper bound); "
+             "shared-128B-phase-32x4B-distinct-word-conflicts-v2; unmodeled=latency,cache,overlap";
     return "bounded-owner-proof-v1 with cta-staging-upper-bound-v1 fallback; "
            "pure-slice-byte-work-v1; loop-depth proxy; register/replication slots; shared root spans; "
            "sm90-shape-work-v1; warp-issue-32B-sectors-v1 (unknown base phase upper bound); "
@@ -288,8 +325,8 @@ void SM90LayoutTarget::enumerateRelaxedCandidates(const LayoutConstraintGraph &,
     enumerateSM90ReplicatedCandidates(var, out);
 }
 
-std::unique_ptr<LayoutTarget> createSM90LayoutTarget() {
-  return std::make_unique<SM90LayoutTarget>();
+std::unique_ptr<LayoutTarget> createSM90LayoutTarget(LayoutBoundaryFrequencyMode mode) {
+  return std::make_unique<SM90LayoutTarget>(mode);
 }
 
 } // namespace mlir::frisk

@@ -4,6 +4,10 @@
 #include "Dialect/Frisk/Analysis/LayoutTarget.h"
 
 namespace mlir::frisk {
+/// Metadata only: accept a complete 1..64-byte ASCII model identifier, or
+/// explicitly mark it unversioned. Never truncate an invalid identity.
+StringRef normalizeLayoutCostModelID(StringRef id);
+
 CostEstimate addLayoutCosts(const CostEstimate &lhs, const CostEstimate &rhs);
 
 /// Counts enclosing scf.for/scf.while operations. This is a bounded dynamic
@@ -19,7 +23,8 @@ CostEstimate weightLayoutBoundaryCost(CostEstimate cost, uint64_t loopDepth);
 /// assignments and never enumerates candidates or changes IR.
 FailureOr<CostEstimate>
 evaluateStaticLayoutCost(const LayoutConstraintGraph &graph,
-                         const CandidateAssignment &assignment);
+                         const CandidateAssignment &assignment,
+                         LayoutCostObserver *observer = nullptr);
 
 /// Uses bounded physical-owner proofs to classify register, shuffle, or shared
 /// exchange. cta-staging-upper-bound-v1 is the nonzero fallback when the proof
@@ -27,11 +32,11 @@ evaluateStaticLayoutCost(const LayoutConstraintGraph &graph,
 /// nor the scratch allocation of a lowering plan.
 FailureOr<CostEstimate> evaluateLayoutConversionCost(
     const LayoutVar &sourceVar, Attribute source, Attribute target,
-    LayoutConversionEdge &edge);
+    LayoutConversionEdge &edge, LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy);
 
 /// One cheap cloned operation's output-carrier byte work and static resources.
 /// Eligibility, hard contracts and slice/leaf selection are the caller's job.
 FailureOr<CostEstimate> evaluateLayoutCloneCost(
-    const LayoutVar &result, Attribute encoding, Operation *insertionPoint);
+    const LayoutVar &result, Attribute encoding, Operation *insertionPoint, LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy);
 } // namespace mlir::frisk
 #endif

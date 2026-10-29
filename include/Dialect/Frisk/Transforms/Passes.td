@@ -15,6 +15,11 @@ def FriskInferLayouts : Pass<"frisk-infer-layouts", "::mlir::ModuleOp"> {
   let constructor = "mlir::frisk::createFriskInferLayoutsPass()";
   let dependentDialects = ["::mlir::frisk::FriskDialect"];
   let options = [
+    Option<"boundaryFrequency", "boundary-frequency", "std::string", "\"legacy\"", "Boundary frequency: legacy or static-trip-count">,
+    Option<"profileFile", "profile-file", "std::string", "\"\"", "Atomically write invocation-local inclusive layout profile JSON">,
+    Option<"traceFile", "trace-file", "std::string", "\"\"", "Atomically write layout decision trace JSON">,
+    Option<"traceMaxEvents", "trace-max-events", "uint64_t", "4096", "Maximum trace events">,
+    Option<"traceMaxBytes", "trace-max-bytes", "uint64_t", "8388608", "Maximum trace bytes (at least 4096)">,
     Option<"statsFile", "stats-file", "std::string", "\"\"",
            "Atomically write attempt-local layout statistics JSON">,
     Option<"analysisOnly", "analysis-only", "bool", "false",
@@ -25,12 +30,17 @@ def FriskInferLayouts : Pass<"frisk-infer-layouts", "::mlir::ModuleOp"> {
            "Maximum domain product for exact layout search">,
     Option<"beamWidth", "beam-width", "unsigned", "32", "Layout search beam width">,
     Option<"maxExpandedStates", "max-expanded-states", "uint64_t", "65536",
-           "Per-component attempted candidate expansion budget">
+           "Per-component attempted candidate expansion budget">,
+    Option<"refineBeamSolution", "refine-beam-solution", "bool", "true",
+           "Improve complete beam solutions by single-variable replacements">,
+    Option<"maxRefinementProbes", "max-refinement-probes", "uint64_t", "256",
+           "Per-component refinement budget within the total expansion budget">
   ];
 }
 
 def OptimizeLayoutConversions : Pass<"frisk-optimize-layout-conversions", "::mlir::ModuleOp"> {
   let summary = "Fold and compose type-safe distributed layout conversions";
+  let options = [Option<"boundaryFrequency", "boundary-frequency", "std::string", "\"legacy\"", "Boundary frequency: legacy or static-trip-count">];
   let constructor = "mlir::frisk::createOptimizeLayoutConversionsPass()";
 }
 

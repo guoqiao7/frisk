@@ -1,4 +1,9 @@
-add_unittest(FriskUnitTests FriskLayoutUnitTests
+add_unittest(FriskUnitTests FriskLayoutUnitTests PARTIAL_SOURCES_INTENDED
+  LayoutIRDiagnosticsTest.cpp
+  LayoutBoundaryFrequencyTest.cpp
+  LayoutIRResourcesTest.cpp
+  LayoutProfileTest.cpp
+  LayoutTraceTest.cpp
   LayoutStatisticsTest.cpp
   LayoutExecutableAdapterTest.cpp
   LayoutAffineEvaluationTest.cpp
@@ -10,6 +15,7 @@ add_unittest(FriskUnitTests FriskLayoutUnitTests
   LayoutRelaxationTest.cpp
   LayoutConversionHoistTest.cpp
   SM90CopyContractTest.cpp
+  CopyMmaIntegrationTest.cpp
   GuardedCopyTest.cpp
   SM90ContractTest.cpp
   SM90CostModelTest.cpp
@@ -20,6 +26,8 @@ add_unittest(FriskUnitTests FriskLayoutUnitTests
   ReductionLayoutProofTest.cpp
   GemmConstraintTest.cpp
   SM90MmaLayoutProofTest.cpp
+  SM90MmaGeometryTest.cpp
+  MmaAutoIntegrationTest.cpp
   InstructionConstraintTest.cpp
   GemmLayoutIntegrationTest.cpp
   AttentionLayoutIntegrationTest.cpp
@@ -28,6 +36,7 @@ add_unittest(FriskUnitTests FriskLayoutUnitTests
   AliasRegionTest.cpp
   LayoutAliasAnalysisTest.cpp
   ExecutionLayoutProofTest.cpp
+  SymbolicExecutionLayoutTest.cpp
   StorageAliasIntegrationTest.cpp
   StorageRootContractTest.cpp
   LayoutPipelineTest.cpp
@@ -40,6 +49,7 @@ add_unittest(FriskUnitTests FriskLayoutUnitTests
   LayoutPropagationTest.cpp
   DistributedPropagationTest.cpp
   BroadcastLayoutTest.cpp
+  SymbolicBroadcastLayoutTest.cpp
   LayoutVerifierTest.cpp
   LayoutMaterializationTest.cpp
   LegacyLayoutAdapterTest.cpp
@@ -49,12 +59,17 @@ add_unittest(FriskUnitTests FriskLayoutUnitTests
   ProductLayoutTest.cpp
 )
 
+add_unittest(FriskUnitTests FriskLayoutSelectionTests PARTIAL_SOURCES_INTENDED LayoutSelectionQualityTest.cpp)
+target_link_libraries(FriskLayoutSelectionTests PRIVATE FriskLayoutSelectionSupport)
+
 set_target_properties(FriskLayoutUnitTests PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/..
 )
 
 target_compile_definitions(FriskLayoutUnitTests PRIVATE
+  FRISK_COPY_MMA_FIXTURE="${PROJECT_SOURCE_DIR}/test/Transforms/copy-mma-contract.mlir"
   FRISK_ATTENTION_FIXTURE="${PROJECT_SOURCE_DIR}/test/Transforms/attention-layout.mlir"
+  FRISK_ATTENTION_FIXED_ABI_FIXTURE="${PROJECT_SOURCE_DIR}/test/Transforms/attention-layout-fixed-abi.mlir"
   FRISK_TILELANG_CORPUS="${PROJECT_SOURCE_DIR}/test/Dialect/Frisk/layout/Inputs/tilelang_layout_corpus.json")
 
 target_link_libraries(FriskLayoutUnitTests

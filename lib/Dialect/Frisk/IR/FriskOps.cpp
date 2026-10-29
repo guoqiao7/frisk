@@ -404,6 +404,8 @@ void ForOp::print(OpAsmPrinter &p) {
 // -- GemmOp --
 //===----------------------------------------------------------------------===//
 LogicalResult GemmOp::verify() {
+  if (getPolicy() == attr::GemmWarpPolicy::Auto)
+    return emitOpError("Auto policy requires frisk.mma; legacy gemm has deterministic partitioning");
   if (auto error = getLegacyGemmValidationError(
           getA().getType(), getB().getType(), getC().getType(), getTransA(),
           getTransB(), getM(), getN(), getK()))

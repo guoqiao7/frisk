@@ -1,5 +1,6 @@
 #ifndef FRISK_TRANSFORMS_PASSES_H
 #define FRISK_TRANSFORMS_PASSES_H
+#include "Dialect/Frisk/Analysis/LayoutBoundaryFrequency.h"
 
 #include "mlir/Pass/Pass.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -7,6 +8,8 @@
 namespace mlir::frisk {
 struct SolverOptions;
 struct LayoutStatisticsReport;
+class LayoutTrace;
+class LayoutProfile;
 enum class LayoutStatisticsScope { Standalone, Pipeline };
 
 #define GEN_PASS_DECL
@@ -16,9 +19,13 @@ std::unique_ptr<Pass> createFriskInferLayoutsPass();
 std::unique_ptr<Pass> createFriskInferLayoutsPass(const SolverOptions &options,
                                               bool authorizeInternalOptimization = false,
                                               LayoutStatisticsReport *statistics = nullptr,
-                                              LayoutStatisticsScope scope = LayoutStatisticsScope::Standalone);
+                                              LayoutStatisticsScope scope = LayoutStatisticsScope::Standalone,
+                                              LayoutTrace *trace = nullptr,
+                                              LayoutProfile *profile = nullptr,
+                                              LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy);
 std::unique_ptr<Pass> createNormalizeLayoutIRPass();
 std::unique_ptr<Pass> createOptimizeLayoutConversionsPass();
+std::unique_ptr<Pass> createOptimizeLayoutConversionsPass(LayoutBoundaryFrequencyMode mode);
 std::unique_ptr<Pass> createTestLowerLayoutConversionsPass();
 
 #define GEN_PASS_REGISTRATION

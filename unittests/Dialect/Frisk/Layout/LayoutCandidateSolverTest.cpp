@@ -1,5 +1,9 @@
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
 #include "Dialect/Frisk/Analysis/LayoutRelaxation.h"
+#include "Dialect/Frisk/Analysis/LayoutStatistics.h"
+#include "Dialect/Frisk/Analysis/LayoutTrace.h"
+#include "Dialect/Frisk/Analysis/LayoutRelations.h"
+#include "Dialect/Frisk/Analysis/LayoutCostModel.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "Dialect/Frisk/IR/FriskAttributes.h"
 #include "gtest/gtest.h"
@@ -51,9 +55,9 @@ protected:
   }
   // A finite, independently specified binary relation represented by a
   // four-role instruction table (the last three roles share one endpoint).
-  void pair(LayoutVarID a, LayoutVarID b, unsigned mask) {
+  void pair(LayoutVarID a, LayoutVarID b, unsigned mask, bool balanced = false) {
     auto id = graph.addConstraint(ConstraintKind::InstructionContract,
-        ConstraintStrength::Hard, {a,b,b,b}, *source, "finite", "finite relation");
+        ConstraintStrength::Hard, {a,b,balanced ? a : b,b}, *source, "finite", "finite relation");
     auto &c = graph.getConstraints()[id];
     c.instruction = InstructionLayoutContract{*source, {}, {}};
     for (unsigned x = 0; x < 2; ++x)
@@ -61,10 +65,280 @@ protected:
         if (mask & (1u << (2*x+y))) {
           auto lhs = builder.getStringAttr(x ? "b" : "a");
           auto rhs = builder.getStringAttr(y ? "b" : "a");
-          c.instruction->tuples.push_back({{lhs,rhs,rhs,rhs}, builder.getStringAttr("plan")});
+          c.instruction->tuples.push_back({{lhs,rhs,balanced ? lhs : rhs,rhs}, builder.getStringAttr("plan")});
         }
   }
 };
+
+// A zero partial bound deliberately hides the first variable's complete cost.
+// Beam width one fixes it to a; the last variable is still priced completely.
+class NeighborhoodTarget : public RankedTarget {
+public:
+  CostVector costs[4] = {{10}, {12}, {5}, {0}};
+  int failingAssignment = -1;
+  FailureOr<CostVector> evaluate(const CandidateAssignment &a) const override {
+    unsigned index = 2 * (cast<StringAttr>(a.values.lookup(0)).getValue() == "b") +
+                     (cast<StringAttr>(a.values.lookup(1)).getValue() == "b");
+    if (int(index) == failingAssignment) return failure();
+    return costs[index];
+  }
+};
+
+TEST_F(LayoutCandidateSolverTest, RefinementDefaultRecoversMissedNeighborInMultipleSweeps) {
+  variable("x"); variable("y"); pair(0, 1, 15, true);
+  NeighborhoodTarget costs;
+  SolverOptions options{1, 1, 65536};
+  EXPECT_TRUE(options.refineBeamSolution);
+  EXPECT_EQ(options.maxRefinementProbes, 256u);
+  LayoutAttemptStatistics statistics;
+  LayoutTrace trace({"unused.json"});
+  auto result = solveLayoutGraph(graph, costs, options, nullptr, &statistics, &trace);
+  ASSERT_TRUE(succeeded(result));
+  EXPECT_EQ(result->cost.cost.instructionPathAndWork, 0u);
+  auto &s = result->components.front();
+  EXPECT_EQ(s.refinementAccepted, 2u);
+  EXPECT_EQ(s.refinementSweeps, 3u);
+  EXPECT_EQ(s.refinementProbes, 6u);
+  EXPECT_EQ(s.refinementStopReason, "no-improvement");
+  EXPECT_EQ(s.refinementStartCost.cost.instructionPathAndWork, 10u);
+  EXPECT_FALSE(s.refinementEndCost.cost < result->cost.cost);
+  EXPECT_FALSE(result->cost.cost < s.refinementEndCost.cost);
+  EXPECT_EQ(s.expanded, s.mrvProbes + s.refinementProbes);
+  EXPECT_EQ(statistics.refinementProbes, 6u);
+  EXPECT_FALSE(s.exhaustive);
+  auto json = llvm::json::parse(trace.serialize()); ASSERT_TRUE(bool(json));
+  unsigned probes = 0, accepted = 0, stopped = 0, contributions = 0;
+  for (auto &value : *json->getAsObject()->getArray("events")) {
+    auto *event = value.getAsObject(); auto kind = event->getString("event");
+    probes += kind == "refinement-probe";
+    accepted += kind == "refinement-accepted";
+    stopped += kind == "refinement-stop";
+    if (kind == "cost-contribution") {
+      ++contributions;
+      EXPECT_EQ((*event->getObject("estimate")->getArray("cost"))[0].getAsInteger(), 0);
+    }
+  }
+  EXPECT_EQ(probes, 6u); EXPECT_EQ(accepted, 2u); EXPECT_EQ(stopped, 1u);
+  EXPECT_EQ(contributions, 1u); // Only the refined winner, never proposals.
+  auto copy = graph;
+  LayoutTrace capped({"unused.json", 1, 4096});
+  auto cappedResult = solveLayoutGraph(copy, costs, options, nullptr, nullptr, &capped);
+  ASSERT_TRUE(succeeded(cappedResult));
+  EXPECT_EQ(cappedResult->assignments, result->assignments);
+  EXPECT_EQ(cappedResult->components.front().refinementProbes, 6u);
+  EXPECT_EQ(capped.omittedCost().cost.instructionPathAndWork, 0u);
+}
+
+TEST_F(LayoutCandidateSolverTest, RefinementUsesEveryLexicographicDimensionAndCanonicalImprovementTie) {
+  variable("x"); variable("y"); pair(0, 1, 15, true);
+  for (unsigned dimension = 0; dimension < 9; ++dimension) {
+    NeighborhoodTarget costs;
+    uint64_t v[9] = {};
+    v[dimension] = 10;
+    costs.costs[0] = costs.costs[1] = {v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]};
+    v[dimension] = 5;
+    if (dimension + 1 < 9) v[dimension + 1] = 1000;
+    costs.costs[2] = costs.costs[3] = {v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]};
+    auto copy = graph;
+    auto result = solveLayoutGraph(copy, costs, {1,1,65536});
+    ASSERT_TRUE(succeeded(result));
+    EXPECT_EQ(result->assignments.lookup(0), builder.getStringAttr("b"));
+    EXPECT_EQ(result->components.front().refinementAccepted, 1u);
+  }
+  // With three candidates, two unseen improving neighbors tie. Canonical b
+  // wins even if the input candidate insertion order is reversed.
+  class TieTarget : public RankedTarget {
+  public:
+    bool tied = true;
+    FailureOr<CostVector> evaluate(const CandidateAssignment &a) const override {
+      auto name = cast<StringAttr>(a.values.lookup(0)).getValue();
+      return CostVector{name == "a" ? 10u : name == "b" && !tied ? 5u : 0u};
+    }
+  } tie;
+  graph = LayoutConstraintGraph(); variable("x", 3); variable("y", 3);
+  auto cid = graph.addConstraint(ConstraintKind::InstructionContract,
+      ConstraintStrength::Hard, {0,1,0,1}, *source, "tie", "full support");
+  auto &c = graph.getConstraints()[cid]; c.instruction = InstructionLayoutContract{*source,{}, {}};
+  for (auto &x : graph.getVariable(0).candidates) for (auto &y : graph.getVariable(1).candidates)
+    c.instruction->tuples.push_back({{x.value,y.value,x.value,y.value},builder.getStringAttr("plan")});
+  for (bool tied : {false,true}) for (bool reverse : {false,true}) {
+    tie.tied = tied;
+    auto copy = graph;
+    if (reverse) for (auto &v : copy.getVariables()) std::reverse(v.candidates.begin(),v.candidates.end());
+    auto result = solveLayoutGraph(copy, tie, {1,1,65536});
+    ASSERT_TRUE(succeeded(result));
+    EXPECT_EQ(result->assignments.lookup(0), builder.getStringAttr(tied ? "b" : "c"));
+    EXPECT_EQ(result->components.front().refinementAccepted, 1u);
+  }
+}
+
+TEST_F(LayoutCandidateSolverTest, RefinementDisabledExactAndBudgetBoundaries) {
+  variable("x"); variable("y"); pair(0, 1, 15, true);
+  NeighborhoodTarget costs;
+  for (unsigned mode = 0; mode < 6; ++mode) {
+    auto copy = graph;
+    SolverOptions options{1, 1, 65536};
+    if (mode == 0) options.refineBeamSolution = false;
+    if (mode == 1) options.maxRefinementProbes = 0;
+    if (mode == 2) options.exactCombinationLimit = 256;
+    if (mode == 3) options.maxExpandedStates = 6;
+    if (mode == 4) options.maxExpandedStates = 7;
+    if (mode == 5) options.maxRefinementProbes = 1;
+    auto result = solveLayoutGraph(copy, costs, options);
+    ASSERT_TRUE(succeeded(result)) << mode;
+    auto &s = result->components.front();
+    EXPECT_EQ(result->cost.cost.instructionPathAndWork, mode == 2 ? 0u : mode >= 4 ? 5u : 10u);
+    EXPECT_EQ(s.refinementProbes, mode >= 4 ? 1u : 0u);
+    EXPECT_LE(s.expanded, options.maxExpandedStates);
+    EXPECT_EQ(s.refinementAccepted, mode >= 4 ? 1u : 0u);
+    EXPECT_EQ(s.refinementStopReason, mode == 2 ? "exact-mode" : mode < 2 ? "disabled" :
+              mode < 5 ? "total-budget" : "refinement-budget");
+  }
+}
+
+TEST_F(LayoutCandidateSolverTest, RefinementStrictDescentLegalityAndCostFailure) {
+  NeighborhoodTarget costs;
+  ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
+  for (unsigned mode = 0; mode < 4; ++mode) {
+    graph = LayoutConstraintGraph();
+    variable("x"); variable("y");
+    pair(0, 1, mode == 1 ? 9 : mode == 2 ? 11 : 15, true);
+    costs.costs[0] = CostVector{10}; costs.costs[1] = CostVector{12};
+    costs.costs[2] = CostVector{mode == 0 ? 10u : 5u};
+    costs.costs[3] = CostVector{0};
+    costs.failingAssignment = mode == 3 ? 2 : -1;
+    LayoutSolveFailure why;
+    LayoutAttemptStatistics statistics;
+    auto result = solveLayoutGraph(graph, costs, {1, 1, 65536}, &why, &statistics);
+    if (mode == 3) {
+      EXPECT_TRUE(failed(result));
+      EXPECT_EQ(why.kind, LayoutSolveFailureKind::CostFailure);
+      EXPECT_EQ(statistics.refinementProbes, 1u);
+    } else {
+      ASSERT_TRUE(succeeded(result));
+      EXPECT_EQ(result->cost.cost.instructionPathAndWork, 10u);
+      EXPECT_EQ(result->components.front().refinementAccepted, 0u);
+      EXPECT_EQ(result->assignments.lookup(0), builder.getStringAttr("a"));
+    }
+  }
+}
+
+TEST_F(LayoutCandidateSolverTest, RefinementCostFailureDoesNotRetryOrPublishPartialGraph) {
+  variable("x"); variable("y"); pair(0,1,15,true);
+  // Preserve even noncanonical caller candidate order on coordinator failure.
+  std::reverse(graph.getVariable(0).candidates.begin(),graph.getVariable(0).candidates.end());
+  auto before = graph.getVariable(0).candidates;
+  NeighborhoodTarget costs; costs.failingAssignment = 2;
+  LayoutStatisticsReport report; LayoutSolveFailure why;
+  SmallVector<RelaxationRecord> records;
+  LayoutTrace trace({"unused.json"});
+  std::string original; llvm::raw_string_ostream(original) << *source;
+  ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
+  auto result = attemptControlledRelaxation(graph,costs,{1,1,65536},records,&why,&report,&trace);
+  EXPECT_TRUE(failed(result)); EXPECT_EQ(why.kind,LayoutSolveFailureKind::CostFailure);
+  EXPECT_TRUE(records.empty()); ASSERT_EQ(report.attempts.size(),1u);
+  EXPECT_EQ(report.attempts.front().refinementProbes,1u);
+  EXPECT_EQ(report.attempts.front().components.front().getAsObject()->getString("refinementStopReason"),"cost-failure");
+  EXPECT_FALSE(graph.isFinalized());
+  for (unsigned i=0;i<before.size();++i)
+    EXPECT_EQ(graph.getVariable(0).candidates[i].value,before[i].value);
+  std::string after; llvm::raw_string_ostream(after) << *source;
+  EXPECT_EQ(after,original);
+  auto json = llvm::json::parse(trace.serialize()); ASSERT_TRUE(bool(json));
+  EXPECT_EQ(json->getAsObject()->getString("failure_kind"),"cost-failure");
+  EXPECT_EQ(json->getAsObject()->getInteger("contributionsSeen"),0);
+  EXPECT_TRUE(json->getAsObject()->get("finalCost")->getAsNull());
+}
+
+TEST_F(LayoutCandidateSolverTest, SaturatedGlobalRefinementNeverWorsensMixedComponents) {
+  class SaturatingTarget : public RankedTarget {
+  public:
+    bool failImproved = false;
+    FailureOr<CostEstimate> evaluate(const LayoutConstraintGraph &g,
+                                   const CandidateAssignment &a) const override {
+      CostEstimate result;
+      bool x = false, y = false, hasBeam = false;
+      for (auto [id, attr] : a.values) {
+        auto name = g.getVariable(id).stableName;
+        if (name == "fixed") result = addLayoutCosts(result, {{UINT64_MAX},false});
+        if (name == "x") { x = cast<StringAttr>(attr).getValue() == "b"; hasBeam = true; }
+        if (name == "y") y = cast<StringAttr>(attr).getValue() == "b";
+      }
+      if (hasBeam && x && failImproved) return failure();
+      if (hasBeam) result = addLayoutCosts(result, {{x ? (y ? 6u : 5u) : (y ? 12u : 10u), x ? 100u : 0u},false});
+      return result;
+    }
+    LayoutProof verifyInstructionContract(const LayoutConstraintGraph &,
+        const LayoutConstraint &c, ArrayRef<Attribute> values, Attribute binding) const override {
+      for (auto &t : c.instruction->tuples)
+        if (ArrayRef<Attribute>(t.encodings) == values && t.binding == binding)
+          return {ProofStatus::Proven,{},"finite member"};
+      return {ProofStatus::Disproven,{},"not a finite member"};
+    }
+  } costs;
+  variable("fixed",1); variable("x"); variable("y"); pair(1,2,15,true);
+  // Distinct selected instruction bindings expose stale refined-plan leakage.
+  for (auto &tuple : graph.getConstraints().front().instruction->tuples)
+    tuple.binding = tuple.encodings[0];
+  CostVector reference;
+  for (unsigned mode=0;mode<6;++mode) {
+    auto copy = graph;
+    LayoutTrace trace(mode == 1 ? LayoutTraceOptions{} :
+                      LayoutTraceOptions{"unused.json",mode == 3 ? 1u : 4096u,mode == 3 ? 4096u : 8388608u});
+    SolverOptions options{1,1,65536,mode != 0,256};
+    if (mode == 4) options.maxRefinementProbes = 1;
+    if (mode == 5) options.maxExpandedStates = 7;
+    LayoutAttemptStatistics statistics;
+    auto result = solveLayoutGraph(copy,costs,options,nullptr,&statistics,&trace);
+    ASSERT_TRUE(succeeded(result));
+    if (!mode) reference = result->cost.cost;
+    EXPECT_FALSE(reference < result->cost.cost);
+    EXPECT_EQ(result->cost.cost.memoryTransactions,0u);
+    EXPECT_TRUE(result->cost.saturated);
+    EXPECT_EQ(result->assignments.lookup(1),builder.getStringAttr("a"));
+    EXPECT_EQ(result->instructionBindings.begin()->second,builder.getStringAttr("a"));
+    EXPECT_TRUE(succeeded(verifySolvedLayoutGraph(copy,*result,costs,loc)));
+    EXPECT_EQ(result->components.size(),2u);
+    EXPECT_FALSE(result->components.front().usedBeam);
+    EXPECT_TRUE(result->components.back().usedBeam);
+    EXPECT_EQ(result->components.back().cost.cost.memoryTransactions,0u);
+    EXPECT_EQ(result->components.back().refinementGlobalFallback,mode != 0);
+    EXPECT_EQ(result->components.back().refinementEndCost.cost.memoryTransactions,mode ? 100u : 0u);
+    auto *componentJSON = statistics.components.back().getAsObject();
+    EXPECT_EQ(componentJSON->getBoolean("refinementGlobalFallback"),mode != 0);
+    EXPECT_EQ((*componentJSON->getObject("selectedCost")->getArray("cost"))[1].getAsInteger(),0);
+    if (mode >= 4) {
+      EXPECT_EQ(result->components.back().refinementProbes,1u);
+      EXPECT_EQ(result->components.back().refinementStopReason,
+                mode == 4 ? "refinement-budget" : "total-budget");
+    }
+    EXPECT_EQ(result->components.back().expanded,
+              result->components.back().mrvProbes + result->components.back().refinementProbes);
+    if (mode) EXPECT_EQ(result->components.back().refinementAccepted,1u);
+    if (!trace.enabled()) continue;
+    auto json = llvm::json::parse(trace.serialize()); ASSERT_TRUE(bool(json));
+    CostEstimate explained = trace.omittedCost();
+    for (auto &event : *json->getAsObject()->getArray("events")) {
+      auto *e = event.getAsObject();
+      if (e->getString("event") == "refinement-global-selection") {
+        EXPECT_EQ(e->getBoolean("fallback"),true);
+        EXPECT_EQ((*e->getObject("selectedCost")->getArray("cost"))[1].getAsInteger(),0);
+      }
+      if (e->getString("event") != "cost-contribution") continue;
+      auto *v = e->getObject("estimate")->getArray("cost");
+      CostVector contribution{*(*v)[0].getAsUINT64(),*(*v)[1].getAsUINT64()};
+      explained = addLayoutCosts(explained,{contribution,*e->getObject("estimate")->getBoolean("saturated")});
+    }
+    EXPECT_FALSE(result->cost.cost < explained.cost);
+    EXPECT_FALSE(explained.cost < result->cost.cost);
+    EXPECT_EQ(explained.saturated,result->cost.saturated);
+  }
+  costs.failImproved = true;
+  ScopedDiagnosticHandler quiet(&context,[](Diagnostic &){ return success(); });
+  LayoutSolveFailure why; auto copy = graph;
+  auto failedCost = solveLayoutGraph(copy,costs,{1,1,65536},&why);
+  EXPECT_TRUE(failed(failedCost)); EXPECT_EQ(why.kind,LayoutSolveFailureKind::CostFailure);
+}
 
 TEST_F(LayoutCandidateSolverTest, NineVariablesChooseCostNotOrdinal) {
   for (unsigned i = 0; i < 9; ++i) {
@@ -267,15 +541,39 @@ protected:
   class Target : public LayoutTarget {
   public:
     Attribute preferred;
+    bool latePreference = false, permissive = false, saturatingFixed = false;
     void enumerateCandidates(const LayoutVar &, SmallVectorImpl<LayoutCandidate> &) const override {}
     LogicalResult verifyCandidate(const LayoutVar &v, Attribute a, Location loc) const override {
+      if (permissive) return success();
       auto e = dyn_cast<DistributedEncodingAttr>(a);
       return e ? e.verifyForType(cast<ShapedType>(v.shapedType),loc) : failure();
     }
     FailureOr<CostVector> evaluate(const CandidateAssignment &a) const override {
       CostVector cost;
-      if (preferred && a.values.lookup(0) != preferred) cost.instructionPathAndWork=100;
+      if (preferred && a.values.lookup(0) != preferred) {
+        if (latePreference) cost.spillRiskAndRegisters = 100;
+        else cost.instructionPathAndWork = 100;
+      }
       return cost;
+    }
+    FailureOr<CostEstimate> evaluate(const LayoutConstraintGraph &g,
+                                   const CandidateAssignment &a) const override {
+      if (!saturatingFixed) return LayoutTarget::evaluate(g,a);
+      CostEstimate cost;
+      for (auto [id,value] : a.values) {
+        auto name = g.getVariable(id).stableName;
+        if (name == "fixed") cost = addLayoutCosts(cost,{{UINT64_MAX},false});
+        if (name == "producer" && value != preferred)
+          cost = addLayoutCosts(cost,{{100},false});
+      }
+      return cost;
+    }
+    LayoutProof verifyInstructionContract(const LayoutConstraintGraph &,
+        const LayoutConstraint &c, ArrayRef<Attribute> values, Attribute binding) const override {
+      for (auto &t : c.instruction->tuples)
+        if (ArrayRef<Attribute>(t.encodings) == values && t.binding == binding)
+          return {ProofStatus::Proven,{},"finite member"};
+      return {ProofStatus::Disproven,{},"not a finite member"};
     }
   } target;
   PhysicalSolverTest() {
@@ -313,6 +611,106 @@ protected:
     return graph;
   }
 };
+
+TEST_F(PhysicalSolverTest, RefinementPricesFullConversionAndRebuildsSelectedPlan) {
+  Attribute a = encoding(), z = encoding(true);
+  if (layoutCandidateKey(z) < layoutCandidateKey(a)) std::swap(a,z);
+  for (bool late : {false,true}) {
+    Block block;
+    auto graph = make(block,{a,z},a);
+    auto dummy = graph.addVariable(LayoutKind::Distributed,type,"z");
+    graph.getVariable(dummy).candidates = {{a},{z}};
+    auto host = OwningOpRef<ModuleOp>(ModuleOp::create(b.getUnknownLoc()));
+    auto cid = graph.addConstraint(ConstraintKind::InstructionContract,
+        ConstraintStrength::Hard,{0,dummy,0,dummy},*host,"connect","full support");
+    auto &c = graph.getConstraints()[cid]; c.instruction = InstructionLayoutContract{*host,{}, {}};
+    for (auto x : {a,z}) for (auto y : {a,z})
+      c.instruction->tuples.push_back({{x,y,x,y}, b.getStringAttr("plan")});
+    target.preferred = z; target.latePreference = late;
+    auto result = solveLayoutGraph(graph,target,{1,1,65536});
+    ASSERT_TRUE(succeeded(result));
+    EXPECT_EQ(result->assignments.lookup(0),late ? a : z);
+    EXPECT_EQ(result->components.front().refinementAccepted,late ? 0u : 1u);
+    EXPECT_EQ(result->cost.cost.conversionBytesAndSync,late ? 0u : 512u);
+    EXPECT_EQ(result->conversions.size(),late ? 0u : 1u);
+    if (!late) EXPECT_EQ(result->conversions.front().sourceEncoding,z);
+  }
+}
+
+TEST_F(PhysicalSolverTest, SaturatedFallbackRebuildsOriginalConversionAndBindingPlan) {
+  Attribute a = encoding(), z = encoding(true);
+  if (layoutCandidateKey(z) < layoutCandidateKey(a)) std::swap(a,z);
+  target.preferred = z; target.saturatingFixed = true;
+  for (unsigned mode=0;mode<4;++mode) {
+    Block block;
+    auto graph = make(block,{a,z},a);
+    auto dummy = graph.addVariable(LayoutKind::Distributed,type,"z");
+    graph.getVariable(dummy).candidates = {{a},{z}};
+    auto fixed = graph.addVariable(LayoutKind::Distributed,type,"fixed");
+    graph.getVariable(fixed).candidates = {{a}};
+    auto host = OwningOpRef<ModuleOp>(ModuleOp::create(b.getUnknownLoc()));
+    auto cid = graph.addConstraint(ConstraintKind::InstructionContract,
+        ConstraintStrength::Hard,{0,dummy,0,dummy},*host,"connect","full support");
+    auto &c = graph.getConstraints()[cid]; c.instruction = InstructionLayoutContract{*host,{}, {}};
+    for (auto x : {a,z}) for (auto y : {a,z})
+      c.instruction->tuples.push_back({{x,y,x,y},x});
+    LayoutTrace trace(mode == 1 ? LayoutTraceOptions{} :
+                      LayoutTraceOptions{"unused.json",mode == 3 ? 1u : 4096u,mode == 3 ? 4096u : 8388608u});
+    auto result = solveLayoutGraph(graph,target,{1,1,65536,mode != 0,256},nullptr,nullptr,&trace);
+    ASSERT_TRUE(succeeded(result));
+    EXPECT_TRUE(result->cost.saturated);
+    EXPECT_EQ(result->cost.cost.instructionPathAndWork,UINT64_MAX);
+    EXPECT_EQ(result->cost.cost.conversionBytesAndSync,0u);
+    EXPECT_TRUE(result->conversions.empty());
+    EXPECT_EQ(result->instructionBindings.begin()->second,a);
+    auto &component = result->components.back();
+    EXPECT_EQ(component.refinementAccepted,mode ? 1u : 0u);
+    EXPECT_EQ(component.refinementGlobalFallback,mode != 0);
+    EXPECT_EQ(component.refinementEndCost.cost.conversionBytesAndSync,mode ? 512u : 0u);
+    EXPECT_EQ(component.cost.cost.conversionBytesAndSync,0u);
+    for (auto &v : graph.getVariables())
+      if (v.stableName == "producer") EXPECT_EQ(result->assignments.lookup(v.id),a);
+    EXPECT_TRUE(succeeded(verifySolvedLayoutGraph(graph,*result,target,b.getUnknownLoc())));
+    if (!trace.enabled()) continue;
+    auto json = llvm::json::parse(trace.serialize()); ASSERT_TRUE(bool(json));
+    EXPECT_EQ(trace.omittedCost().cost.conversionBytesAndSync,0u);
+    for (auto &value : *json->getAsObject()->getArray("events")) {
+      auto *event = value.getAsObject();
+      if (event->getString("event") == "cost-contribution")
+        EXPECT_NE(event->getString("kind"),"conversion");
+      if (event->getString("event") == "solution")
+        EXPECT_TRUE(event->getArray("conversions")->empty());
+    }
+  }
+}
+
+TEST_F(PhysicalSolverTest, RefinementUnknownNeighborIsNotLegalAndCachedTraceRetainsStatus) {
+  LayoutConstraintGraph graph;
+  auto a = encoding(); auto opaque = b.getStringAttr("opaque");
+  auto x = graph.addVariable(LayoutKind::Distributed,type,"x");
+  auto y = graph.addVariable(LayoutKind::Distributed,type,"y");
+  graph.getVariable(x).candidates = {{a},{opaque}};
+  graph.getVariable(y).candidates = {{a}};
+  auto cid = graph.addConstraint(ConstraintKind::TransformLayout,
+      ConstraintStrength::Hard,{x,y},nullptr,"identity","unknown source decoder");
+  graph.getConstraints()[cid].coordinateTransform = b.getDenseI64ArrayAttr({0});
+  target.permissive = true; target.preferred = opaque;
+  LayoutTrace trace({"unused.json"});
+  auto result = solveLayoutGraph(graph,target,{1,1,65536},nullptr,nullptr,&trace);
+  ASSERT_TRUE(succeeded(result));
+  EXPECT_EQ(result->assignments.lookup(x),a);
+  EXPECT_EQ(result->components.front().refinementProbes,1u);
+  EXPECT_EQ(result->components.front().refinementAccepted,0u);
+  auto json = llvm::json::parse(trace.serialize()); ASSERT_TRUE(bool(json));
+  unsigned unknown = 0;
+  for (auto &value : *json->getAsObject()->getArray("events")) {
+    auto *event = value.getAsObject();
+    if (event->getString("event") != "refinement-probe") continue;
+    EXPECT_EQ(event->getString("status"),"Unknown");
+    EXPECT_EQ(event->getBoolean("legal"),false); ++unknown;
+  }
+  EXPECT_EQ(unknown,1u);
+}
 
 TEST_F(PhysicalSolverTest, BetterMainComputationBeatsZeroConversions) {
   Block block;

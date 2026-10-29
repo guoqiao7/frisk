@@ -3,15 +3,46 @@
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
 #include "Dialect/Frisk/Analysis/LayoutAliasAnalysis.h"
+#include "Dialect/Frisk/Analysis/LayoutTrace.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Parser/Parser.h"
 #include "gtest/gtest.h"
+#include "LayoutCostObserverTestSupport.h"
 using namespace mlir;
 using namespace mlir::frisk;
 namespace {
+TEST(SM90CostModelTest, CompleteModelIdentityIsIndependentOfCoverage) {
+  auto target = createSM90LayoutTarget();
+  EXPECT_EQ(getSM90LegacyCostModelID(), "sm90-layout-lex9-legacy-v1");
+  EXPECT_EQ(target->costModelID(), getSM90LegacyCostModelID());
+  EXPECT_NE(target->costCoverage(), target->costModelID());
+  constexpr StringLiteral legacyCoverage =
+      "bounded-owner-proof-v1 with cta-staging-upper-bound-v1 fallback; "
+      "pure-slice-byte-work-v1; loop-depth proxy; register/replication slots; shared root spans; "
+      "sm90-shape-work-v1; warp-issue-32B-sectors-v1 (unknown base phase upper bound); "
+      "shared-128B-phase-32x4B-distinct-word-conflicts-v2; unmodeled=latency,cache,overlap";
+  EXPECT_EQ(target->costCoverage(), legacyCoverage);
+  auto staticTarget = createSM90LayoutTarget(LayoutBoundaryFrequencyMode::StaticTripCount);
+  StringRef staticCoverage = staticTarget->costCoverage();
+  EXPECT_TRUE(staticCoverage.contains("static signed trip counts"));
+  EXPECT_TRUE(staticCoverage.contains("unknown-loop factor-2 proxy"));
+  EXPECT_FALSE(staticCoverage.contains("loop-depth proxy"));
+  staticTarget.reset();
+  // Returned StringRef refers to static storage, independent of target lifetime.
+  EXPECT_TRUE(staticCoverage.contains("static signed trip counts"));
+  for (uint64_t maxBytes : {uint64_t{4096}, uint64_t{8388608}}) {
+    LayoutConstraintGraph graph;
+    LayoutTrace trace({"unused.json", 1, maxBytes});
+    ASSERT_TRUE(succeeded(solveLayoutGraph(graph, *target, {}, nullptr, nullptr, &trace)));
+    auto parsed = llvm::json::parse(trace.serialize());
+    ASSERT_TRUE(bool(parsed));
+    EXPECT_EQ(parsed->getAsObject()->getString("cost_model_id"), getSM90LegacyCostModelID());
+    EXPECT_EQ(parsed->getAsObject()->getInteger("schema_version"), 1);
+  }
+}
 // Small address fixtures exercise the actual graph scorer and alias footprint,
 // without paying for Copy candidate enumeration. The binding states the already
 // selected vector width; hardware-contract legality has separate tests.
@@ -78,7 +109,16 @@ protected:
     assignment.values[s] = *storage;
     assignment.values[e] = execution;
     assignment.values[p] = path;
-    return evaluateSM90LayoutCost(graph, assignment);
+    auto plain = evaluateSM90LayoutCost(graph, assignment);
+    TestCostObserver observer;
+    auto observed = createSM90LayoutTarget()->evaluate(graph, assignment, &observer);
+    EXPECT_EQ(succeeded(plain), succeeded(observed));
+    if (succeeded(plain) && succeeded(observed)) {
+      EXPECT_EQ(plain->cost, observed->cost);
+      EXPECT_EQ(plain->saturated, observed->saturated);
+      observer.expectSum(*observed);
+    }
+    return plain;
   }
 };
 TEST_F(SM90AddressCostTest, ContiguousWideVectorsHaveIndependentBankPhases) {
@@ -172,6 +212,12 @@ TEST(SM90CostModelTest, CopyHasNonzeroPathAndTransactionWork) {
       for (auto [id, value] : llvm::zip(c.vars, tuple.encodings)) assignment.values[id] = value;
       auto cost = target->evaluate(*graph, assignment);
       ASSERT_TRUE(succeeded(cost));
+      TestCostObserver observer;
+      auto observed = target->evaluate(*graph, assignment, &observer);
+      ASSERT_TRUE(succeeded(observed));
+      EXPECT_EQ(cost->cost, observed->cost);
+      EXPECT_EQ(cost->saturated, observed->saturated);
+      observer.expectSum(*observed);
       bestSectors = std::min(bestSectors, cost->cost.memoryTransactions);
       worstSectors = std::max(worstSectors, cost->cost.memoryTransactions);
       bestBanks = std::min(bestBanks, cost->cost.bankConflictDegree);

@@ -14,7 +14,7 @@ func.func @unranked(%arg: tensor<*xf32>) { return }
 
 // -----
 
-// expected-error@+1 {{static power-of-two tile extents greater than one}}
+// expected-error@+1 {{static positive power-of-two tile extents}}
 func.func @non_power_of_two(%arg: tensor<6xf32>) { return }
 
 // -----

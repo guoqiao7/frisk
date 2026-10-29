@@ -10,7 +10,7 @@ bool validTypes(RankedTensorType src, RankedTensorType dst, int64_t axis) {
       axis < 0 || axis >= src.getRank() || src.getElementType() != dst.getElementType()) return false;
   for (auto t : {src,dst})
     if (!t.hasStaticShape() || llvm::any_of(t.getShape(), [](int64_t e) {
-          return e <= 1 || !llvm::isPowerOf2_64(e); })) return false;
+          return e <= 0 || !llvm::isPowerOf2_64(e); })) return false;
   SmallVector<int64_t> shape(src.getShape()); shape.erase(shape.begin()+axis);
   return dst.getShape() == ArrayRef<int64_t>(shape);
 }

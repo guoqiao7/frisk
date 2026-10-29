@@ -7,7 +7,7 @@
 
 namespace mlir::frisk {
 
-std::unique_ptr<LayoutTarget> createSM90LayoutTarget();
+std::unique_ptr<LayoutTarget> createSM90LayoutTarget(LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy);
 
 } // namespace mlir::frisk
 

@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Analysis/LayoutCostModel.h"
+#include "Dialect/Frisk/Analysis/LayoutProfile.h"
 #include "Dialect/Frisk/Analysis/LayoutAlgebra.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
 #include "Dialect/Frisk/IR/FriskAttributes.h"
@@ -86,7 +87,7 @@ FailureOr<uint64_t> logicalSlot(BitLinearLayoutMapAttr map,
   unsigned offset = 0;
   for (auto [extent, width] :
        llvm::zip_equal(shape, map.getOutputBitWidths().asArrayRef())) {
-    uint64_t coordinate = output.extractBitsAsZExtValue(width, offset);
+    uint64_t coordinate = width ? output.extractBitsAsZExtValue(width, offset) : 0;
     if (coordinate >= uint64_t(extent)) return failure();
     slot = slot * uint64_t(extent) + coordinate;
     offset += width;
@@ -119,6 +120,7 @@ LogicalResult enumerateOwners(ArrayRef<int64_t> topology,
 FailureOr<ConversionExchangeKind>
 classifyExchange(RankedTensorType type, DistributedEncodingAttr source,
                  DistributedEncodingAttr target) {
+  LayoutProfile::Scope profile(LayoutProfileKind::ConversionClassification);
   auto sourceTopology = source.getTopology().asArrayRef();
   auto targetTopology = target.getTopology().asArrayRef();
   if (sourceTopology.drop_front() != targetTopology.drop_front() ||
@@ -207,6 +209,15 @@ StringRef provenance(ConversionExchangeKind kind) {
 }
 } // namespace
 
+StringRef mlir::frisk::normalizeLayoutCostModelID(StringRef id) {
+  if (id.empty() || id.size() > 64 || !llvm::all_of(id, [](unsigned char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+      }))
+    return "unversioned-target";
+  return id;
+}
+
 bool mlir::frisk::operator<(const CostVector &lhs, const CostVector &rhs) {
   for (auto field : fields)
     if (lhs.*field != rhs.*field) return lhs.*field < rhs.*field;
@@ -252,7 +263,7 @@ CostEstimate mlir::frisk::weightLayoutBoundaryCost(CostEstimate cost,
 
 FailureOr<CostEstimate> mlir::frisk::evaluateLayoutConversionCost(
     const LayoutVar &sourceVar, Attribute source, Attribute target,
-    LayoutConversionEdge &edge) {
+    LayoutConversionEdge &edge, LayoutBoundaryFrequencyMode mode) {
   auto type = dyn_cast_or_null<RankedTensorType>(sourceVar.shapedType);
   if (!type) return failure();
   auto src = dyn_cast_or_null<DistributedEncodingAttr>(source);
@@ -295,7 +306,18 @@ FailureOr<CostEstimate> mlir::frisk::evaluateLayoutConversionCost(
   Operation *insertionPoint = edge.insertionPoint;
   if (!insertionPoint && edge.use) insertionPoint = edge.use->getOwner();
   edge.loopDepth = getLayoutLoopDepth(insertionPoint);
-  result = weightLayoutBoundaryCost(result, edge.loopDepth);
+  auto frequency = getLayoutBoundaryFrequency(insertionPoint, mode);
+  edge.frequencyFactor = frequency.factor;
+  edge.frequencyUsesProxy = frequency.usesProxy;
+  edge.frequencySaturated = frequency.saturated;
+  edge.staticTripCountFrequency = mode == LayoutBoundaryFrequencyMode::StaticTripCount;
+  if (mode == LayoutBoundaryFrequencyMode::Legacy)
+    result = weightLayoutBoundaryCost(result, edge.loopDepth);
+  else {
+    result.cost.conversionBytesAndSync = multiply(result.cost.conversionBytesAndSync,
+                                                frequency.factor, result.saturated);
+    result.saturated |= frequency.saturated && result.cost.conversionBytesAndSync != 0;
+  }
   edge.sourceEncoding = source;
   edge.targetEncoding = target;
   edge.bytes = bytes;
@@ -306,7 +328,7 @@ FailureOr<CostEstimate> mlir::frisk::evaluateLayoutConversionCost(
 }
 
 FailureOr<CostEstimate> mlir::frisk::evaluateLayoutCloneCost(
-    const LayoutVar &result, Attribute candidate, Operation *insertionPoint) {
+    const LayoutVar &result, Attribute candidate, Operation *insertionPoint, LayoutBoundaryFrequencyMode mode) {
   auto type = dyn_cast_or_null<RankedTensorType>(result.shapedType);
   auto encoding = dyn_cast_or_null<DistributedEncodingAttr>(candidate);
   if (failed(validateDistributed(encoding, type)) || failed(threads(encoding)))
@@ -320,35 +342,43 @@ FailureOr<CostEstimate> mlir::frisk::evaluateLayoutCloneCost(
   cost.cost.spillRiskAndRegisters = encoding.getTopology()[0];
   cost.cost.replication = encoding.getReplication().getValue().getLimitedValue() - 1;
   cost.cost.codeSize = 1;
-  return weightLayoutBoundaryCost(cost, getLayoutLoopDepth(insertionPoint));
+  if (mode == LayoutBoundaryFrequencyMode::Legacy)
+    return weightLayoutBoundaryCost(cost, getLayoutLoopDepth(insertionPoint));
+  auto frequency = getLayoutBoundaryFrequency(insertionPoint, mode);
+  cost.cost.conversionBytesAndSync = multiply(cost.cost.conversionBytesAndSync,
+                                            frequency.factor, cost.saturated);
+  cost.saturated |= frequency.saturated && cost.cost.conversionBytesAndSync != 0;
+  return cost;
 }
 
 FailureOr<CostEstimate> mlir::frisk::evaluateStaticLayoutCost(
-    const LayoutConstraintGraph &graph, const CandidateAssignment &assignment) {
+    const LayoutConstraintGraph &graph, const CandidateAssignment &assignment,
+    LayoutCostObserver *observer) {
   CostEstimate result;
-  DenseMap<Value, uint64_t> sharedRoots;
-  DenseMap<LayoutVarID, uint64_t> syntheticRoots;
-  for (const auto &[id, attr] : assignment.values) {
+  DenseMap<Value, unsigned> sharedRoots;
+  struct RootCharge { LayoutVarID owner; uint64_t bytes; };
+  SmallVector<RootCharge> roots;
+  auto chargeVariable = [&](LayoutVarID id, Attribute attr) -> LogicalResult {
     if (id >= graph.getVariables().size() || !attr) return failure();
     const auto &var = graph.getVariable(id);
-    if (var.use || var.kind == LayoutKind::Instruction) continue;
+    if (var.use || var.kind == LayoutKind::Instruction) return success();
     if (var.kind == LayoutKind::Distributed) {
       auto type = dyn_cast_or_null<ShapedType>(var.shapedType);
       auto encoding = dyn_cast<DistributedEncodingAttr>(attr);
       if (failed(validateDistributed(encoding, type))) return failure();
-      result.cost.spillRiskAndRegisters = add(result.cost.spillRiskAndRegisters,
-          encoding.getTopology()[0], result.saturated);
-      result.cost.replication = add(result.cost.replication,
-          encoding.getReplication().getValue().getLimitedValue() - 1,
-          result.saturated);
-      continue;
+      CostEstimate charge;
+      charge.cost.spillRiskAndRegisters = encoding.getTopology()[0];
+      charge.cost.replication = encoding.getReplication().getValue().getLimitedValue() - 1;
+      result = addLayoutCosts(result, charge);
+      if (observer) observer->recordCost("registers", id, charge);
+      return success();
     }
     auto type = dyn_cast_or_null<MemRefType>(var.shapedType);
     auto layout = dyn_cast<StorageLayoutAttr>(attr);
     if (!type || !layout || !type.hasStaticShape() ||
         failed(layout.verifyForType(type, UnknownLoc::get(type.getContext()))))
       return failure();
-    if (layout.getMemorySpace().getValue() != attr::MemorySpace::Shared) continue;
+    if (layout.getMemorySpace().getValue() != attr::MemorySpace::Shared) return success();
     std::optional<StorageAliasInfo> alias = var.storageAlias;
     if (!alias && var.value) {
       auto analyzed = analyzeStorageAlias(var.value);
@@ -364,18 +394,40 @@ FailureOr<CostEstimate> mlir::frisk::evaluateStaticLayoutCost(
       if (footprint.proof.status != ProofStatus::Proven) return failure();
       for (const auto &entry : footprint.entries)
         bytes = std::max(bytes, entry.end / 8 + (entry.end % 8 != 0));
-      sharedRoots[alias->root] = std::max(sharedRoots[alias->root], bytes);
+      auto inserted = sharedRoots.try_emplace(alias->root, roots.size());
+      if (inserted.second) roots.push_back({id, bytes});
+      else roots[inserted.first->second].bytes =
+          std::max(roots[inserted.first->second].bytes, bytes);
     } else {
       auto footprint = getStorageFootprintBytes(layout, type);
       if (failed(footprint)) return failure();
-      syntheticRoots[id] = *footprint;
+      roots.push_back({id, *footprint});
     }
+    return success();
+  };
+  if (!observer) {
+    // Partial lower bounds are a hot path: visit only assigned variables,
+    // with no sorting, trace snapshot, or work on unrelated graph components.
+    for (const auto &[id, attr] : assignment.values)
+      if (failed(chargeVariable(id, attr))) return failure();
+  } else {
+    // IDs follow graph order. Sort only assigned IDs for stable event order
+    // and Shared-root ownership, without scanning the rest of the graph.
+    SmallVector<LayoutVarID> assignedIDs;
+    assignedIDs.reserve(assignment.values.size());
+    for (const auto &[id, attr] : assignment.values) {
+      if (id >= graph.getVariables().size() || !attr) return failure();
+      assignedIDs.push_back(id);
+    }
+    llvm::sort(assignedIDs);
+    for (auto id : assignedIDs)
+      if (failed(chargeVariable(id, assignment.values.lookup(id)))) return failure();
   }
-  for (const auto &[root, bytes] : sharedRoots)
-    result.cost.sharedBytesAndOccupancy =
-        add(result.cost.sharedBytesAndOccupancy, bytes, result.saturated);
-  for (const auto &[id, bytes] : syntheticRoots)
-    result.cost.sharedBytesAndOccupancy =
-        add(result.cost.sharedBytesAndOccupancy, bytes, result.saturated);
+  for (const auto &root : roots) {
+    CostEstimate charge;
+    charge.cost.sharedBytesAndOccupancy = root.bytes;
+    result = addLayoutCosts(result, charge);
+    if (observer) observer->recordCost("shared-root", root.owner, charge);
+  }
   return result;
 }

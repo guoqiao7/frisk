@@ -18,9 +18,11 @@ private:
   const LayoutSolution &solution;
 };
 
+/// target is borrowed for this call; null preserves the legacy SM90 default.
 LogicalResult materializeDistributedLayouts(
     Operation *root, const LayoutConstraintGraph &graph,
     const LayoutSolution &solution, ArrayRef<LayoutConversionEdge> conversions,
-    bool authorizeInternalOptimization = false);
+    bool authorizeInternalOptimization = false,
+    LayoutTarget *target = nullptr);
 } // namespace mlir::frisk
 #endif

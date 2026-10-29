@@ -170,9 +170,10 @@ LogicalResult mlir::frisk::prepareSM90MmaCandidates(LayoutConstraintGraph &graph
   for (auto &constraint : graph.getConstraints()) {
     if (!constraint.instruction) continue;
     auto op = dyn_cast_or_null<MmaOp>(constraint.instruction->source);
-    if (!op || constraint.vars.size()!=4) continue;
-    auto g = getSM90MmaGeometry(op,graph.getVariable(constraint.vars[3]).requiredThreads);
-    if (failed(g)) {
+    if (!op || constraint.vars.size()!=5) continue;
+    int64_t threads = graph.getVariable(constraint.vars[3]).requiredThreads;
+    auto geometries = getSM90MmaGeometries(op,threads);
+    if (failed(geometries)) {
       auto exceeds = [](ShapedType type) {
         return type.getRank() == 2 && type.getDimSize(0) > 0 &&
                type.getDimSize(1) > 0 &&
@@ -183,25 +184,62 @@ LogicalResult mlir::frisk::prepareSM90MmaCandidates(LayoutConstraintGraph &graph
           exceeds(cast<ShapedType>(op.getB().getType())) ||
           exceeds(cast<ShapedType>(op.getResult().getType())))
         return op.emitOpError("sm90-mma-fragment: unknown proof: logical point budget exceeds 65536");
+    }
+    // Preserve logical-budget evidence before the bounded semantic decoder can
+    // reject a valid explicit plan whose logical domain is too large to prove.
+    FailureOr<SM90MmaGeometry> fixed = failure();
+    if (constraint.instruction->binding) {
+      fixed = getSM90MmaContractGeometry(op,threads,constraint.instruction->binding);
+      if (failed(fixed))
+        return op.emitOpError("sm90-mma-thread-group: explicit binding has invalid geometry");
+      // The semantic decoder admits this hard binding, but Auto may omit it
+      // from the generated domain solely for the RS hardware proof budget.
+      if (failed(geometries) || llvm::none_of(*geometries,[&](const SM90MmaGeometry &g) {
+            return g.gM == fixed->gM && g.gN == fixed->gN;
+          }))
+        return op.emitOpError("sm90-mma-fragment: unknown proof: hardware point budget exceeds 65536");
+    }
+    if (failed(geometries))
       return op.emitOpError("sm90-mma-thread-group: unsupported tile/policy/threads");
+    // SameLayout makes a hard-bound accumulator authoritative for both roles.
+    // Gather only exact equality requirements, never Convertible preferences.
+    SmallVector<SmallVector<Attribute>> hardRequirements(5);
+    for (unsigned role = 0; role < 5; ++role) {
+      SmallVector<LayoutVarID> peers{constraint.vars[role]};
+      for (size_t i = 0; i < peers.size(); ++i)
+        for (const auto &c : graph.getConstraints()) {
+          if (c.strength != ConstraintStrength::Hard || !llvm::is_contained(c.vars,peers[i])) continue;
+          if (c.kind == ConstraintKind::RequireEncoding) hardRequirements[role].push_back(c.requiredEncoding);
+          if (c.kind == ConstraintKind::SameLayout)
+            for (auto peer : c.vars) if (!llvm::is_contained(peers,peer)) peers.push_back(peer);
+        }
     }
     auto add = [&](unsigned role, Attribute attr) {
       ++graph.getCandidatePreparationStatistics().generatedProposals;
       auto &var = graph.getVariable(constraint.vars[role]);
+      // Hard seeds are retained, including semantically equivalent reordered
+      // carriers. An impossible generated alternative cannot consume the cap.
+      if (llvm::any_of(hardRequirements[role],[&](Attribute required) { return required != attr; })) return;
       if (llvm::none_of(var.candidates,[&](const LayoutCandidate &c) { return c.value==attr; })) {
         auto provenance = graph.addProvenance(std::nullopt,op,"mma-target-candidate",
             (Twine("finite canonical proposal for MMA role ")+Twine(role)).str());
         var.candidates.push_back({attr,provenance,var.candidates.size()});
       }
     };
-    auto accum = buildSM90MmaFragment(op.getContext(),*g,false,false);
-    if (failed(accum)) return op.emitOpError("sm90-mma-fragment: unknown proof: init/result hardware enumeration budget exceeded");
-    add(2,*accum); add(3,*accum);
     bool rs = isa<RankedTensorType>(op.getA().getType());
-    if (rs) {
-      auto a = buildSM90MmaFragment(op.getContext(),*g,true,op.getTransA());
-      if (failed(a)) return op.emitOpError("sm90-mma-fragment: unknown proof: A hardware enumeration budget exceeded");
-      add(0,*a);
+    for (const auto &g : *geometries) {
+      if (constraint.instruction->binding) {
+        if (fixed->gM != g.gM || fixed->gN != g.gN) continue;
+      }
+      add(4,encodeSM90MmaGeometry(op.getContext(),g));
+      auto accum = buildSM90MmaFragment(op.getContext(),g,false,false);
+      if (failed(accum)) return op.emitOpError("sm90-mma-fragment: unknown proof: init/result hardware enumeration budget exceeded");
+      add(2,*accum); add(3,*accum);
+      if (rs) {
+        auto a = buildSM90MmaFragment(op.getContext(),g,true,op.getTransA());
+        if (failed(a)) return op.emitOpError("sm90-mma-fragment: unknown proof: A hardware enumeration budget exceeded");
+        add(0,*a);
+      }
     }
     for (unsigned role = rs?1:0; role<2; ++role) {
       auto &var = graph.getVariable(constraint.vars[role]);
@@ -220,25 +258,30 @@ LogicalResult mlir::frisk::prepareSM90MmaCandidates(LayoutConstraintGraph &graph
   return success();
 }
 
-FailureOr<Attribute> mlir::frisk::buildSM90MmaContract(const LayoutConstraintGraph &graph,
+InstructionContractBuildResult mlir::frisk::buildSM90MmaContractDetailed(const LayoutConstraintGraph &graph,
     const LayoutConstraint &constraint, ArrayRef<Attribute> encodings) {
-  if (!constraint.instruction || constraint.vars.size()!=4 || encodings.size()!=4) return failure();
+  auto unsupported = [](StringRef reason) -> InstructionContractBuildResult {
+    return {{},{ProofStatus::Unknown,{},reason.str()},"mma-decoder",{}};
+  };
+  auto checked = [&](Attribute binding) -> InstructionContractBuildResult {
+    auto proof = verifySM90MmaContract(graph,constraint,encodings,binding);
+    bool proven = proof.status == ProofStatus::Proven;
+    return {proven ? binding : Attribute{},std::move(proof),proven ? "" : "mma-contract",{}};
+  };
+  if (!constraint.instruction || constraint.vars.size()!=5 || encodings.size()!=5)
+    return unsupported("mma-joint-contract: expected five roles");
   auto op = dyn_cast_or_null<MmaOp>(constraint.instruction->source);
-  if (!op) return failure();
-  if (Attribute explicitBinding = constraint.instruction->binding) {
-    if (verifySM90MmaContract(graph,constraint,encodings,explicitBinding).status==ProofStatus::Proven)
-      return explicitBinding;
-    return failure();
-  }
-  auto g = getSM90MmaGeometry(op,graph.getVariable(constraint.vars[3]).requiredThreads);
-  if (failed(g)) return failure();
+  if (!op) return unsupported("mma-joint-contract: missing MMA source");
+  if (Attribute explicitBinding = constraint.instruction->binding) return checked(explicitBinding);
+  auto g = decodeSM90MmaGeometry(op,graph.getVariable(constraint.vars[3]).requiredThreads,encodings[4]);
+  if (failed(g)) return unsupported("sm90-mma-thread-group: invalid geometry candidate");
   auto target = getSM90TargetInfo(op);
-  if (failed(target) || !target->supportsWGMMA) return failure();
+  if (failed(target) || !target->supportsWGMMA) return unsupported("sm90-mma-target: explicit sm_90a required");
   bool rs = isa<RankedTensorType>(op.getA().getType());
   auto rule = lookupSM90WGMMA(cast<ShapedType>(op.getA().getType()).getElementType(),
       cast<ShapedType>(op.getResult().getType()).getElementType(),rs ? "rs" : "ss",
       64,g->atomN,16,g->threads,"k","k");
-  if (!rule) return failure();
+  if (!rule) return unsupported("sm90-mma-fragment: unsupported instruction form");
   Builder b(op.getContext());
   SmallVector<NamedAttribute> fields{
     b.getNamedAttr("version",b.getI64IntegerAttr(1)),
@@ -253,13 +296,19 @@ FailureOr<Attribute> mlir::frisk::buildSM90MmaContract(const LayoutConstraintGra
   for (unsigned role = rs?1:0; role<2; ++role) {
     auto &var = graph.getVariable(constraint.vars[role]);
     auto storage = dyn_cast_or_null<StorageLayoutAttr>(encodings[role]);
-    if (!var.storageAlias || !storage) return failure();
+    if (!var.storageAlias || !storage) return unsupported("sm90-mma-descriptor: missing storage alias/layout");
     auto plan = decodeDescriptor(*var.storageAlias,storage,role ? op.getTransB() : !op.getTransA(),
                                 role ? g->n : g->m,g->k,role ? g->atomN : 64);
-    if (failed(plan)) return failure();
+    if (failed(plan)) return unsupported("sm90-mma-descriptor: bounded descriptor decoder could not construct a plan");
     fields.push_back(b.getNamedAttr(role ? "b_descriptor" : "a_descriptor",*plan));
   }
   Attribute binding = MmaInstructionContractAttr::get(op.getContext(),b.getDictionaryAttr(fields));
-  if (verifySM90MmaContract(graph,constraint,encodings,binding).status!=ProofStatus::Proven) return failure();
-  return binding;
+  return checked(binding);
+}
+
+FailureOr<Attribute> mlir::frisk::buildSM90MmaContract(const LayoutConstraintGraph &graph,
+    const LayoutConstraint &constraint, ArrayRef<Attribute> encodings) {
+  auto result = buildSM90MmaContractDetailed(graph,constraint,encodings);
+  if (result.proof.status != ProofStatus::Proven || !result.binding) return failure();
+  return result.binding;
 }

@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Analysis/LayoutConversionChoice.h"
+#include "Dialect/Frisk/Analysis/LayoutProfile.h"
 #include "Dialect/Frisk/Analysis/LayoutCostModel.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
 #include "Dialect/Frisk/IR/FriskAttributes.h"
@@ -114,7 +115,7 @@ FailureOr<CostEstimate> rematerialize(
     if (!from) return failure();
     LayoutConversionEdge boundary;
     boundary.insertionPoint = at;
-    auto cost = evaluateLayoutConversionCost(*var, from, encoding, boundary);
+    auto cost = evaluateLayoutConversionCost(*var, from, encoding, boundary, target.boundaryFrequencyMode());
     if (failed(cost)) return failure();
     total = addLayoutCosts(total, *cost);
     // Saturating addition for diagnostic traffic metadata as well as scores.
@@ -127,7 +128,7 @@ FailureOr<CostEstimate> rematerialize(
     LayoutVar synthetic;
     synthetic.kind = LayoutKind::Distributed;
     synthetic.shapedType = op->getResult(0).getType();
-    auto clone = evaluateLayoutCloneCost(synthetic, encoding, at);
+    auto clone = evaluateLayoutCloneCost(synthetic, encoding, at, target.boundaryFrequencyMode());
     if (failed(clone)) return failure();
     total = addLayoutCosts(total, *clone);
   }
@@ -136,6 +137,11 @@ FailureOr<CostEstimate> rematerialize(
   edge.insertionPoint = at;
   edge.sharedLeader = edge.constraint;
   edge.loopDepth = getLayoutLoopDepth(at);
+  auto frequency = getLayoutBoundaryFrequency(at, target.boundaryFrequencyMode());
+  edge.frequencyFactor = frequency.factor;
+  edge.frequencyUsesProxy = frequency.usesProxy;
+  edge.frequencySaturated = frequency.saturated;
+  edge.staticTripCountFrequency = target.boundaryFrequencyMode() == LayoutBoundaryFrequencyMode::StaticTripCount;
   edge.costProvenance = "pure-slice-byte-work-v1";
   edge.rematerialization = std::move(slice);
   return total;
@@ -144,7 +150,8 @@ FailureOr<CostEstimate> rematerialize(
 
 FailureOr<LayoutConversionChoices> chooseLayoutConversions(
     const LayoutConstraintGraph &graph, const CandidateAssignment &assignment,
-    LayoutTarget &target) {
+    LayoutTarget &target, LayoutCostObserver *observer) {
+  LayoutProfile::Scope profile(LayoutProfileKind::ConversionChoice);
   LayoutConversionChoices result;
   struct Group { SmallVector<LayoutConversionEdge> edges; SmallVector<CostEstimate> costs; };
   SmallVector<Group, 0> groups;
@@ -163,10 +170,11 @@ FailureOr<LayoutConversionChoices> chooseLayoutConversions(
     edge.constraint = edge.sharedLeader = c.id;
     edge.insertionPoint = c.use->getOwner();
     edge.resolution = EdgeResolutionKind::Convert;
-    auto cost = evaluateLayoutConversionCost(var, from, to, edge);
+    auto cost = evaluateLayoutConversionCost(var, from, to, edge, target.boundaryFrequencyMode());
     if (failed(cost)) return failure();
     if (c.existingConversion) {
       result.cost = addLayoutCosts(result.cost, *cost);
+      if (observer) observer->recordCost("conversion", c.id, *cost);
       continue;
     }
     auto found = llvm::find_if(groups, [&](const Group &g) {
@@ -194,6 +202,7 @@ FailureOr<LayoutConversionChoices> chooseLayoutConversions(
     // rematerialize proves all leaves and hard constraints at that position;
     // no cross-block/global CSE or unselected cloning is introduced here.
     SmallVector<LayoutConversionEdge> independent;
+    SmallVector<CostEstimate> independentCharges;
     CostEstimate independentCost;
     for (unsigned i = 0; i < group.edges.size(); ++i) {
       auto edge = group.edges[i];
@@ -207,6 +216,7 @@ FailureOr<LayoutConversionChoices> chooseLayoutConversions(
         cost = *cloneCost;
       }
       independent.push_back(std::move(edge));
+      if (observer) independentCharges.push_back(cost);
       independentCost = addLayoutCosts(independentCost, cost);
     }
     auto shared = group.edges[leader];
@@ -224,9 +234,18 @@ FailureOr<LayoutConversionChoices> chooseLayoutConversions(
     // For a shared slice all clones and leaf conversions are charged once.
     if (independentCost.cost < sharedCost.cost) {
       result.cost = addLayoutCosts(result.cost, independentCost);
+      if (observer)
+        for (auto [edge, cost] : llvm::zip_equal(independent, independentCharges))
+          observer->recordCost(edge.resolution == EdgeResolutionKind::Rematerialize
+                                   ? "rematerialization" : "conversion",
+                               edge.sharedLeader, cost);
       llvm::append_range(result.edges, independent);
     } else {
       result.cost = addLayoutCosts(result.cost, sharedCost);
+      if (observer)
+        observer->recordCost(shared.resolution == EdgeResolutionKind::Rematerialize
+                                 ? "rematerialization" : "conversion",
+                             shared.sharedLeader, sharedCost);
       for (const auto &original : group.edges) {
         auto edge = shared;
         edge.use = original.use;
@@ -248,6 +267,10 @@ bool sameLayoutConversionPlan(const LayoutConversionEdge &a,
       a.sourceEncoding == b.sourceEncoding && a.targetEncoding == b.targetEncoding &&
       a.resolution == b.resolution && a.bytes == b.bytes &&
       a.synchronizationCost == b.synchronizationCost && a.exchange == b.exchange &&
+      a.frequencyFactor == b.frequencyFactor &&
+      a.frequencyUsesProxy == b.frequencyUsesProxy &&
+      a.frequencySaturated == b.frequencySaturated &&
+      a.staticTripCountFrequency == b.staticTripCountFrequency &&
       a.loopDepth == b.loopDepth && a.costProvenance == b.costProvenance &&
       a.insertionPoint == b.insertionPoint && a.sharedLeader == b.sharedLeader &&
       a.rematerialization == b.rematerialization;

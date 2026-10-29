@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
+#include "Dialect/Frisk/Analysis/LayoutProfile.h"
 #include "Dialect/Frisk/Analysis/BroadcastLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/InstructionLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/ReductionLayoutConstraints.h"
@@ -23,6 +24,7 @@ bool satisfiesLayoutConstraint(const LayoutConstraintGraph &graph,
                          const LayoutConstraint &constraint,
                          const DenseMap<LayoutVarID, Attribute> &assignment,
                          bool requireComplete) {
+  LayoutProfile::Scope profile(LayoutProfileKind::RelationQuery);
   if (constraint.strength != ConstraintStrength::Hard)
     return true;
   if (constraint.kind == ConstraintKind::ReductionLayout) {
@@ -90,9 +92,11 @@ LogicalResult verifyLayoutStorageCapacity(const LayoutConstraintGraph &graph,
 
 const StorageAliasFootprint &getStorageAliasFootprint(
     const LayoutConstraintGraph &graph, LayoutVarID id, Attribute candidate) {
+  LayoutProfile::Scope profile(LayoutProfileKind::FootprintCache);
   auto &cache = graph.getAliasFootprintCache();
   auto key = LayoutConstraintGraph::AliasCandidateKey{id, candidate};
   auto found = cache.find(key);
+  LayoutProfile::cacheLookup(LayoutProfileKind::FootprintCache, found != cache.end());
   if (found != cache.end()) return found->second;
   StorageAliasFootprint footprint;
   auto encoding = dyn_cast_or_null<StorageLayoutAttr>(candidate);
@@ -102,16 +106,20 @@ const StorageAliasFootprint &getStorageAliasFootprint(
   else
     footprint.proof = {ProofStatus::Unknown, {}, "missing coordinate alias metadata or storage encoding"};
   ++graph.getCandidatePreparationStatistics().footprintEvaluations;
-  return cache.try_emplace(key, std::move(footprint)).first->second;
+  auto inserted = cache.try_emplace(key, std::move(footprint));
+  if (inserted.second) LayoutProfile::cacheInsertion(LayoutProfileKind::FootprintCache);
+  return inserted.first->second;
 }
 
 LayoutProof proveAliasLayoutRelation(const LayoutConstraintGraph &graph,
                                     LayoutVarID lhs, Attribute a,
                                     LayoutVarID rhs, Attribute b) {
+  LayoutProfile::Scope profile(LayoutProfileKind::AliasPairCache);
   if (rhs < lhs) { std::swap(lhs, rhs); std::swap(a, b); }
   auto key = LayoutConstraintGraph::AliasPairKey{{lhs, a}, {rhs, b}};
   auto &cache = graph.getAliasPairCache();
   auto found = cache.find(key);
+  LayoutProfile::cacheLookup(LayoutProfileKind::AliasPairCache, found != cache.end());
   if (found != cache.end()) return found->second;
   // Populate both before taking references: DenseMap insertion may rehash.
   (void)getStorageAliasFootprint(graph, lhs, a);
@@ -119,7 +127,8 @@ LayoutProof proveAliasLayoutRelation(const LayoutConstraintGraph &graph,
   auto proof = proveStorageAliasFootprints(
       getStorageAliasFootprint(graph, lhs, a), getStorageAliasFootprint(graph, rhs, b));
   ++graph.getCandidatePreparationStatistics().pairProofEvaluations;
-  cache.try_emplace(key, proof);
+  if (cache.try_emplace(key, proof).second)
+    LayoutProfile::cacheInsertion(LayoutProfileKind::AliasPairCache);
   return proof;
 }
 
@@ -192,11 +201,71 @@ static bool sameLogicalType(Type lhs, Type rhs) {
          a.getShape() == b.getShape() && a.getElementType() == b.getElementType();
 }
 
+// Reassociate only checked static tensor expand/collapse relations. The stored
+// permutation maps destination rows to source rows; inverse proposals use the
+// inverse permutation and preserve every hardware column and replication bit.
+static FailureOr<Attribute> reassociateEncoding(DistributedEncodingAttr encoding,
+    DictionaryAttr transform, ShapedType target, bool inverse, ArrayAttr names) {
+  auto src = transform.getAs<DenseI64ArrayAttr>("source_widths");
+  auto dst = transform.getAs<DenseI64ArrayAttr>("result_widths");
+  auto permutation = transform.getAs<DenseI64ArrayAttr>("bit_order");
+  auto map = dyn_cast<BitLinearLayoutMapAttr>(encoding.getMap());
+  if (!src || !dst || !permutation || !map) return failure();
+  auto from = inverse ? dst : src, to = inverse ? src : dst;
+  if (map.getOutputBitWidths() != from || target.getRank() != int64_t(to.size()))
+    return failure();
+  unsigned rows = 0;
+  for (unsigned i = 0; i < to.size(); ++i) {
+    if (to[i] < 0 || to[i] >= 63 || target.getDimSize(i) != (int64_t(1) << to[i]))
+      return failure();
+    rows += to[i];
+  }
+  if (permutation.size() != rows || map.getMatrix().getType().getShape()[0] != rows)
+    return failure();
+  SmallVector<int64_t> order(permutation.asArrayRef());
+  SmallVector<bool> seen(rows, false);
+  for (int64_t row : order) {
+    if (row < 0 || row >= rows || seen[row]) return failure();
+    seen[row] = true;
+  }
+  if (inverse) {
+    auto copy = order;
+    for (unsigned i = 0; i < rows; ++i) order[copy[i]] = i;
+  }
+  Builder b(encoding.getContext());
+  if (!names)
+    if (auto tensor = dyn_cast<RankedTensorType>(target))
+      if (auto declared = dyn_cast_or_null<DistributedEncodingAttr>(tensor.getEncoding()))
+        if (auto declaredMap = dyn_cast<BitLinearLayoutMapAttr>(declared.getMap()))
+          names = declaredMap.getOutputNames();
+  if (!names) {
+    SmallVector<Attribute> generated;
+    for (unsigned i = 0; i < to.size(); ++i)
+      generated.push_back(b.getStringAttr("d" + std::to_string(i)));
+    names = b.getArrayAttr(generated);
+  }
+  if (names.size() != to.size()) return failure();
+  unsigned columns = map.getMatrix().getType().getShape()[1];
+  auto old = map.getMatrix().getValues<APInt>();
+  SmallVector<APInt> bits;
+  for (int64_t row : order)
+    for (unsigned col = 0; col < columns; ++col)
+      bits.push_back(old[row * columns + col]);
+  auto projected = BitLinearLayoutMapAttr::get(encoding.getContext(),
+      map.getInputNames(), map.getInputBitWidths(), names, to,
+      DenseIntElementsAttr::get(map.getMatrix().getType(), bits));
+  return Attribute(DistributedEncodingAttr::get(encoding.getContext(), projected,
+      encoding.getTopology(), encoding.getReplication()));
+}
+
 static FailureOr<Attribute> permuteEncoding(Attribute candidate,
                                            Attribute transform,
                                            ShapedType target, bool inverse,
                                            ArrayAttr outputNames = {}) {
   auto encoding = dyn_cast<DistributedEncodingAttr>(candidate);
+  if (encoding)
+    if (auto reassociation = dyn_cast_or_null<DictionaryAttr>(transform))
+      return reassociateEncoding(encoding, reassociation, target, inverse, outputNames);
   auto permutation = dyn_cast_or_null<DenseI64ArrayAttr>(transform);
   if (!encoding || !permutation)
     return failure();

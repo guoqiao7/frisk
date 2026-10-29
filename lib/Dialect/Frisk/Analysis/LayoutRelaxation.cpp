@@ -1,5 +1,7 @@
 #include "Dialect/Frisk/Analysis/LayoutRelaxation.h"
+#include "Dialect/Frisk/Analysis/LayoutCostModel.h"
 #include "Dialect/Frisk/Analysis/LayoutStatistics.h"
+#include "Dialect/Frisk/Analysis/LayoutTrace.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
@@ -24,17 +26,21 @@ Location location(const LayoutConstraintGraph &graph) {
 // failures without parsing diagnostic text or relaxing after an unknown proof.
 FailureOr<LayoutSolution> runAttempt(LayoutConstraintGraph &graph,
     LayoutTarget &target, SolverOptions options, LayoutSolveFailure *why,
-    LayoutAttemptStatistics *statistics) {
+    LayoutAttemptStatistics *statistics, LayoutTrace *trace) {
   if (statistics) prepareLayoutStatistics(graph, *statistics);
+  if (trace) {
+    trace->recordGraph(graph);
+    trace->recordDomains(graph, "prepared");
+  }
   auto before = graph;
   auto start = LayoutClock::now();
-  auto propagated = propagateCommonToFixedPoint(graph);
+  auto propagated = propagateCommonToFixedPoint(graph, trace);
   if (statistics) statistics->propagationTime = std::chrono::nanoseconds(layoutElapsedNS(start));
   if (failed(propagated)) {
     graph = std::move(before);
     ScopedDiagnosticHandler quiet(location(graph).getContext(),
                                  [](Diagnostic &) { return success(); });
-    auto diagnosis = solveLayoutGraph(graph, target, options, why, statistics);
+    auto diagnosis = solveLayoutGraph(graph, target, options, why, statistics, trace, true);
     if (succeeded(diagnosis)) {
       *why = {LayoutSolveFailureKind::Unsupported, UINT32_MAX, UINT32_MAX,
               "propagation rejected a solver-supported graph"};
@@ -42,9 +48,14 @@ FailureOr<LayoutSolution> runAttempt(LayoutConstraintGraph &graph,
     if (statistics) finishLayoutStatistics(graph, *why, nullptr, *statistics);
     return failure();
   }
-  auto result = solveLayoutGraph(graph, target, options, why, statistics);
+  auto result = solveLayoutGraph(graph, target, options, why, statistics, trace);
   auto proofStart = LayoutClock::now();
   auto proof = succeeded(result) ? verifySolvedLayoutGraph(graph, *result, target, location(graph)) : success();
+  if (trace && succeeded(result)) {
+    auto summary = trace->getSummary();
+    summary.verificationStatus = failed(proof) ? "failed" : "solved-graph-verified";
+    trace->setSummary(summary);
+  }
   if (statistics) statistics->verificationTime = std::chrono::nanoseconds(layoutElapsedNS(proofStart));
   if (failed(proof)) {
     *why = {LayoutSolveFailureKind::Unsupported, UINT32_MAX, UINT32_MAX,
@@ -58,7 +69,19 @@ FailureOr<LayoutSolution> runAttempt(LayoutConstraintGraph &graph,
 FailureOr<LayoutSolution> attemptControlledRelaxation(
     LayoutConstraintGraph &graph, LayoutTarget &target, SolverOptions options,
     SmallVectorImpl<RelaxationRecord> &records, LayoutSolveFailure *why,
-    LayoutStatisticsReport *statistics) {
+    LayoutStatisticsReport *statistics, LayoutTrace *trace) {
+  if (trace && !trace->enabled()) trace = nullptr;
+  if (trace) {
+    trace->setSolverOptions(options);
+    auto summary = trace->getSummary();
+    summary.costModelID = normalizeLayoutCostModelID(target.costModelID()).str();
+    summary.staticTripCountFrequency = target.boundaryFrequencyMode() == LayoutBoundaryFrequencyMode::StaticTripCount;
+    trace->setSummary(summary);
+  }
+  if (statistics) {
+    statistics->costModelID = normalizeLayoutCostModelID(target.costModelID()).str();
+    statistics->staticTripCountFrequency = target.boundaryFrequencyMode() == LayoutBoundaryFrequencyMode::StaticTripCount;
+  }
   records.clear();
   LayoutSolveFailure local;
   if (!why) why = &local;
@@ -83,8 +106,14 @@ FailureOr<LayoutSolution> attemptControlledRelaxation(
   // Empty/invalid graphs must go through the solver's input validation first.
   if (graph.getVariables().empty() || !graph.getVariables().front().shapedType) {
     if (statistics) statistics->attempts.emplace_back();
-    return solveLayoutGraph(graph, target, options, why,
-                            statistics ? &statistics->attempts.back() : nullptr);
+    if (trace) {
+      trace->beginAttempt("initial");
+      trace->recordDomains(graph, "prepared");
+    }
+    auto result = solveLayoutGraph(graph, target, options, why,
+                            statistics ? &statistics->attempts.back() : nullptr, trace);
+    if (trace) trace->finishAttempt(*why, succeeded(result) ? &*result : nullptr);
+    return result;
   }
   auto original = graph;
   Location loc = location(original);
@@ -104,8 +133,10 @@ FailureOr<LayoutSolution> attemptControlledRelaxation(
       return success();
     });
     if (statistics) statistics->attempts.emplace_back();
+    if (trace) trace->beginAttempt(kind);
     auto result = runAttempt(attempt, target, options, why,
-                              statistics ? &statistics->attempts.back() : nullptr);
+                              statistics ? &statistics->attempts.back() : nullptr, trace);
+    if (trace) trace->finishAttempt(*why, succeeded(result) ? &*result : nullptr);
     if (statistics) statistics->attempts.back().kind = kind.str();
     return result;
   };

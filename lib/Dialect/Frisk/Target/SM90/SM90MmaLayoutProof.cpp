@@ -23,6 +23,7 @@ bool bounded(int64_t a, int64_t b) {
 }
 
 FailureOr<SM90MmaGeometry> mlir::frisk::getSM90MmaGeometry(MmaOp op, int64_t threads) {
+  if (op.getPolicy() == attr::GemmWarpPolicy::Auto) return failure();
   int64_t m = op.getMAttr().getInt(), n = op.getNAttr().getInt(), k = op.getKAttr().getInt();
   if (!isSM90WGMMAThreadCount(threads) ||
       !bounded(m,n) || !bounded(m,k) || !bounded(n,k) || m % 64 || k % 16 || n < 8)
@@ -46,6 +47,93 @@ FailureOr<SM90MmaGeometry> mlir::frisk::getSM90MmaGeometry(MmaOp op, int64_t thr
     return failure();
   return SM90MmaGeometry{m,n,k,threads,bestM,bestN,atomN,
                         m/(64*bestM),n/(atomN*bestN),k/16};
+}
+
+// Semantic instruction geometries, independent of the generated proof domain.
+// Explicit bindings must still reach the fragment proof when replication puts
+// an otherwise valid geometry beyond its hardware enumeration budget.
+static FailureOr<SmallVector<SM90MmaGeometry>> getSM90MmaSemanticGeometries(
+    MmaOp op, int64_t threads) {
+  if (op.getPolicy() != attr::GemmWarpPolicy::Auto) {
+    auto legacy = getSM90MmaGeometry(op, threads);
+    if (failed(legacy)) return failure();
+    return SmallVector<SM90MmaGeometry>{*legacy};
+  }
+  int64_t m = op.getM(), n = op.getN(), k = op.getK();
+  if (!isSM90WGMMAThreadCount(threads) || !bounded(m,n) ||
+      !bounded(m,k) || !bounded(n,k) || m % 64 || k % 16 || n < 8)
+    return failure();
+  SmallVector<SM90MmaGeometry> result;
+  bool rs = isa<RankedTensorType>(op.getA().getType());
+  for (int64_t gm = 1; gm <= threads/128; gm *= 2) {
+    int64_t gn = threads/128/gm;
+    if (m % (64*gm) || n % (8*gn)) continue;
+    int64_t atomN = 256;
+    while ((n/gn) % atomN) atomN /= 2;
+    if (!lookupSM90WGMMA(cast<ShapedType>(op.getA().getType()).getElementType(),
+        cast<ShapedType>(op.getResult().getType()).getElementType(),
+        rs ? "rs" : "ss",64,atomN,16,threads,"k","k")) continue;
+    result.push_back({m,n,k,threads,gm,gn,atomN,m/(64*gm),n/(atomN*gn),k/16});
+  }
+  if (result.empty() || result.size() > 4) return failure();
+  return result;
+}
+
+FailureOr<SmallVector<SM90MmaGeometry>> mlir::frisk::getSM90MmaGeometries(
+    MmaOp op, int64_t threads) {
+  auto result = getSM90MmaSemanticGeometries(op,threads);
+  if (failed(result)) return failure();
+  if (op.getPolicy() == attr::GemmWarpPolicy::Auto && isa<RankedTensorType>(op.getA().getType()))
+    llvm::erase_if(*result,[](const SM90MmaGeometry &g) {
+      // Keep the bounded generated domain unchanged, including RS replication.
+      return g.m*g.k > 65536/g.gN;
+    });
+  if (result->empty()) return failure();
+  return result;
+}
+
+DictionaryAttr mlir::frisk::encodeSM90MmaGeometry(MLIRContext *ctx,
+                                                const SM90MmaGeometry &g) {
+  Builder b(ctx);
+  return b.getDictionaryAttr({
+      b.getNamedAttr("kind", b.getStringAttr("sm90-mma-geometry")),
+      b.getNamedAttr("version", b.getI64IntegerAttr(1)),
+      b.getNamedAttr("shape", b.getDenseI64ArrayAttr({g.m,g.n,g.k})),
+      b.getNamedAttr("threads", b.getI64IntegerAttr(g.threads)),
+      b.getNamedAttr("grid", b.getDenseI64ArrayAttr({g.gM,g.gN})),
+      b.getNamedAttr("atom", b.getDenseI64ArrayAttr({64,g.atomN,16})),
+      b.getNamedAttr("repeats", b.getDenseI64ArrayAttr({g.mRepeat,g.nRepeat,g.kRepeat}))});
+}
+
+FailureOr<SM90MmaGeometry> mlir::frisk::decodeSM90MmaGeometry(
+    MmaOp op, int64_t threads, Attribute candidate) {
+  auto dictionary = dyn_cast_or_null<DictionaryAttr>(candidate);
+  if (!dictionary || dictionary.size() != 7) return failure();
+  auto legal = getSM90MmaSemanticGeometries(op,threads);
+  if (failed(legal)) return failure();
+  // Exact checked serialization validates every field, type and semantic
+  // relationship without arithmetic on attacker-supplied grid/repeat values.
+  for (const auto &g : *legal)
+    if (dictionary == encodeSM90MmaGeometry(op.getContext(),g)) return g;
+  return failure();
+}
+
+FailureOr<SM90MmaGeometry> mlir::frisk::getSM90MmaContractGeometry(
+    MmaOp op, int64_t threads, Attribute binding) {
+  auto contract = dyn_cast_or_null<MmaInstructionContractAttr>(binding);
+  if (!contract) return failure();
+  auto p = contract.getPayload();
+  ScopedDiagnosticHandler quiet(op.getContext(), [](Diagnostic &) { return success(); });
+  if (failed(MmaInstructionContractAttr::verify([&] { return op.emitOpError(); },p)))
+    return failure();
+  auto legal = getSM90MmaSemanticGeometries(op,threads);
+  if (failed(legal)) return failure();
+  for (const auto &g : *legal) {
+    auto encoded = encodeSM90MmaGeometry(op.getContext(),g);
+    if (p.get("grid") == encoded.get("grid") && p.get("atom") == encoded.get("atom") &&
+        p.get("repeats") == encoded.get("repeats")) return g;
+  }
+  return failure();
 }
 
 std::array<int64_t,2> mlir::frisk::getSM90MmaFragmentCoordinate(
@@ -175,8 +263,8 @@ LayoutProof mlir::frisk::verifySM90MmaDescriptor(const StorageAliasInfo &info,
 
 LayoutProof mlir::frisk::verifySM90MmaContract(const LayoutConstraintGraph &graph,
     const LayoutConstraint &constraint, ArrayRef<Attribute> encodings, Attribute binding) {
-  if (!constraint.instruction || constraint.vars.size()!=4 || encodings.size()!=4)
-    return reject("mma-joint-contract: expected four roles and an MMA source");
+  if (!constraint.instruction || constraint.vars.size()!=5 || encodings.size()!=5)
+    return reject("mma-joint-contract: expected five roles and an MMA source");
   auto op = dyn_cast_or_null<MmaOp>(constraint.instruction->source);
   auto contract = dyn_cast_or_null<MmaInstructionContractAttr>(binding);
   if (!op || !contract) return reject("mma-joint-contract: unknown instruction or missing typed binding");
@@ -196,7 +284,7 @@ LayoutProof mlir::frisk::verifySM90MmaContract(const LayoutConstraintGraph &grap
       p.getAs<TypeAttr>("accumulator_type").getValue()!=result.getElementType())
     return reject("sm90-mma-fragment: requires f16/bf16 inputs and f32 accumulator");
   int64_t threads = graph.getVariable(constraint.vars[3]).requiredThreads;
-  auto g = getSM90MmaGeometry(op,threads);
+  auto g = getSM90MmaContractGeometry(op,threads,binding);
   if (failed(g)) {
     auto exceeds = [](ShapedType t) {
       return t.getRank()==2 && t.getDimSize(0)>0 && t.getDimSize(1)>0 &&
@@ -205,14 +293,13 @@ LayoutProof mlir::frisk::verifySM90MmaContract(const LayoutConstraintGraph &grap
     if (exceeds(result) || exceeds(cast<ShapedType>(op.getA().getType())) ||
         exceeds(cast<ShapedType>(op.getB().getType())))
       return unknown("sm90-mma-fragment: logical point budget exceeds 65536");
-    return reject("sm90-mma-thread-group: unsupported tile, threads or policy grouping");
+    return reject("sm90-mma-thread-group: unsupported binding geometry, tile, threads or policy grouping");
   }
   if (auto attr = op->getAttrOfType<IntegerAttr>("frisk.execution_threads"))
     if (attr.getInt()!=threads) return reject("sm90-mma-thread-group: explicit threads conflict with execution scope");
-  if (p.getAs<DenseI64ArrayAttr>("grid").asArrayRef()!=ArrayRef<int64_t>({g->gM,g->gN}) ||
-      p.getAs<DenseI64ArrayAttr>("atom").asArrayRef()!=ArrayRef<int64_t>({64,g->atomN,16}) ||
-      p.getAs<DenseI64ArrayAttr>("repeats").asArrayRef()!=ArrayRef<int64_t>({g->mRepeat,g->nRepeat,g->kRepeat}))
-    return reject("sm90-mma-thread-group: binding disagrees with deterministic policy geometry");
+  if (failed(decodeSM90MmaGeometry(op,threads,encodings[4])) ||
+      encodings[4] != encodeSM90MmaGeometry(op.getContext(),*g))
+    return reject("sm90-mma-thread-group: selected geometry disagrees with binding");
   bool rs = isa<RankedTensorType>(op.getA().getType());
   if (p.getAs<StringAttr>("form").getValue()!=(rs ? "rs" : "ss"))
     return reject("mma-joint-contract: instruction form disagrees with operand A");

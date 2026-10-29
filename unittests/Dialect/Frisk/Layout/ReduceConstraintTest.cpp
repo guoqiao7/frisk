@@ -30,11 +30,11 @@ TEST(ReduceConstraintTest, VerifiesKindsDtypesShapesAndThreads) {
       auto module=parseSourceString<ModuleOp>(text,&context);
       EXPECT_EQ(bool(module),kind!="add" && kind!="mul" && dtype!="f64" && dtype!="i32");
     }
-  for (StringRef source:{"4x4","4x3","4x1","4x?","4"})
+  for (StringRef source:{"4x4","4x3","4x1","4x0","4x?","4"})
     for (int64_t axis:{-1,0,1,2}) {
       std::string text="func.func @f(%x:tensor<"+source.str()+"xf32>) { %r=frisk.reduce_tensor %x {kind=\"sum\",dim="+std::to_string(axis)+":i64} : tensor<"+source.str()+"xf32> -> tensor<4xf32> return }";
       auto module=parseSourceString<ModuleOp>(text,&context);
-      EXPECT_EQ(bool(module),source=="4x4" && (axis==0 || axis==1));
+      EXPECT_EQ(bool(module),(source=="4x4" && (axis==0 || axis==1)) || (source=="4x1" && axis==1));
     }
 }
 

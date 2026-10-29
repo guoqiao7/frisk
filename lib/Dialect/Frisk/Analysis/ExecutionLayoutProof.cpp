@@ -1,4 +1,6 @@
 #include "Dialect/Frisk/Analysis/ExecutionLayoutProof.h"
+#include "Dialect/Frisk/Analysis/LayoutProfile.h"
+#include "Dialect/Frisk/Analysis/LinearExecutionLayout.h"
 #include "Dialect/Frisk/Analysis/LayoutConstraint.h"
 #include "Dialect/Frisk/IR/FriskAttributes.h"
 #include "llvm/ADT/STLExtras.h"
@@ -19,6 +21,7 @@ LayoutProof proven() { return {ProofStatus::Proven, {}, "bounded execution proof
 using Enumeration = ExecutionEnumeration;
 LayoutProof enumerate(DistributedEncodingAttr execution, RankedTensorType type,
                       StringRef policy, Enumeration &out) {
+  LayoutProfile::Scope profile(LayoutProfileKind::ExecutionEnumeration);
   if (policy != "all" && policy != "first_owner")
     return reject("unknown writer policy");
   if (!execution || !type || !type.hasStaticShape())
@@ -132,8 +135,45 @@ LayoutProof mlir::frisk::enumerateExecutionLayout(DistributedEncodingAttr execut
 
 LayoutProof mlir::frisk::proveExecutionOwnership(DistributedEncodingAttr execution,
     RankedTensorType logicalType, StringRef writerPolicy) {
-  Enumeration points;
-  return enumerate(execution, logicalType, writerPolicy, points);
+  if (writerPolicy != "all" && writerPolicy != "first_owner")
+    return reject("unknown writer policy");
+  LinearExecutionLayout layout;
+  auto proof = analyzeLinearExecutionLayout(execution, logicalType, layout);
+  if (proof.status != ProofStatus::Proven) return proof;
+  // A zero-row or zero-column map has rank zero. Handle that domain before
+  // requesting nonempty GF2 algebra, then retain the same coverage,
+  // replication and writer-policy checks below.
+  FailureOr<GF2Matrix> matrix = failure();
+  unsigned rank = 0;
+  if (layout.logicalBits && layout.hardwareBits) {
+    matrix = layout.getMatrix();
+    if (succeeded(matrix)) rank = matrix->rank();
+  }
+  if (rank != layout.logicalBits) {
+    // A nonzero left-kernel vector separates the image from at least one
+    // coordinate unit vector. That unit is a deterministic uncovered value.
+    APInt missing(std::max(1u, layout.logicalBits), 0);
+    unsigned bit = 0;
+    if (succeeded(matrix))
+      bit = matrix->transpose().kernelBasis().front().countTrailingZeros();
+    missing.setBit(bit);
+    return reject("symbolic ownership: logical coordinate has no hardware owner",
+                  layout.logicalCoordinate(missing));
+  }
+  unsigned replicationBits = layout.hardwareBits - layout.logicalBits;
+  // The attribute is a positive signed 64-bit value. Never form 2^k when it
+  // cannot be represented, and never multiply the complete hardware domain.
+  if (replicationBits >= 63 ||
+      execution.getReplication().getValue().getZExtValue() != (uint64_t(1) << replicationBits))
+    return reject("symbolic ownership: replication does not match actual hardware ownership");
+  if (writerPolicy == "all" && rank != layout.hardwareBits) {
+    APInt duplicate(std::max(1u, layout.hardwareBits), 0);
+    if (succeeded(matrix)) duplicate = matrix->kernelBasis().front();
+    else duplicate.setBit(0);
+    return reject("symbolic ownership: multiple writers; hardware counterexample in cta,warp_group,warp,lane,register order",
+                  layout.hardwareCoordinate(duplicate));
+  }
+  return {ProofStatus::Proven, {}, "symbolic execution ownership proof"};
 }
 
 static LayoutProof proveAccess(DistributedEncodingAttr execution,

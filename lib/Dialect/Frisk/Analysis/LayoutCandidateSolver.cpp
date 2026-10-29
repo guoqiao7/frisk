@@ -1,5 +1,7 @@
 #include "Dialect/Frisk/Analysis/LayoutSolver.h"
+#include "Dialect/Frisk/Analysis/LayoutProfile.h"
 #include "Dialect/Frisk/Analysis/LayoutStatistics.h"
+#include "Dialect/Frisk/Analysis/LayoutTrace.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/DenseSet.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
@@ -60,10 +62,26 @@ getHardConstraintComponents(const LayoutConstraintGraph &graph) {
 FailureOr<LayoutSolution>
 solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
                  SolverOptions options, LayoutSolveFailure *why,
-                 LayoutAttemptStatistics *statistics) {
+                 LayoutAttemptStatistics *statistics, LayoutTrace *trace,
+                 bool diagnostic) {
+  if (trace && !trace->enabled()) trace = nullptr;
+  if (trace) {
+    trace->setSolverOptions(options);
+    auto summary = trace->getSummary();
+    summary.costModelID = normalizeLayoutCostModelID(target.costModelID()).str();
+    summary.staticTripCountFrequency = target.boundaryFrequencyMode() == LayoutBoundaryFrequencyMode::StaticTripCount;
+    trace->setSummary(summary);
+  }
   LayoutSolveFailure localFailure;
   if (!why) why = &localFailure;
   LayoutSolution solution;
+  if (trace) trace->recordEvent([&] { return llvm::json::Object{
+      {"event", "solver-options"}, {"diagnostic", diagnostic},
+      {"exactCombinationLimit", options.exactCombinationLimit},
+      {"beamWidth", options.beamWidth}, {"maxExpandedStates", options.maxExpandedStates},
+      {"refineBeamSolution", options.refineBeamSolution},
+      {"maxRefinementProbes", options.maxRefinementProbes},
+      {"costCoverage", target.costCoverage()}}; });
   bool solved = false;
   auto start = LayoutClock::now();
   if (statistics && !statistics->prepared) prepareLayoutStatistics(graph, *statistics);
@@ -128,8 +146,25 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
     }
     return value * factor;
   };
+  auto evaluateComplete = [&](const CandidateAssignment &assignment,
+      SmallVectorImpl<LayoutConversionEdge> *edges = nullptr) -> FailureOr<CostEstimate> {
+    auto *observer = edges && !diagnostic ? trace : nullptr;
+    auto cost = target.evaluate(graph, assignment, observer);
+    if (failed(cost)) return failure();
+    auto choices = chooseLayoutConversions(graph, assignment, target, observer);
+    if (failed(choices)) return failure();
+    if (edges) llvm::append_range(*edges, choices->edges);
+    return addLayoutCosts(*cost, choices->cost);
+  };
+  struct PendingComponent {
+    CandidateAssignment original, refined;
+    CostEstimate originalCost, refinedCost;
+    size_t solutionIndex, statisticsIndex;
+  };
+  SmallVector<PendingComponent, 1> pending;
   for (auto component : getHardConstraintComponents(graph)) {
     bool emptyComponent = false;
+    bool selectedComponent = false;
     LayoutSolution::ComponentStatistics stats;
     stats.root = component.front();
     stats.beamWidth = options.beamWidth;
@@ -145,6 +180,9 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
         aggregate.peakVariableDomain = std::max<uint64_t>(aggregate.peakVariableDomain, domain);
       statistics->mrvProbes += stats.mrvProbes;
       statistics->expandedNodes += stats.expandedNodes;
+      statistics->refinementProbes += stats.refinementProbes;
+      statistics->refinementSweeps += stats.refinementSweeps;
+      statistics->refinementAccepted += stats.refinementAccepted;
       llvm::json::Array domains;
       for (auto domain : stats.domains) domains.push_back(domain);
       statistics->components.push_back(llvm::json::Object{
@@ -154,6 +192,14 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
         {"mode", stats.usedBeam ? "beam" : "exact"}, {"beamWidth", stats.beamWidth},
         {"expanded", stats.expanded}, {"peakFrontier", stats.peakFrontier},
         {"mrvProbes", stats.mrvProbes}, {"expandedNodes", stats.expandedNodes},
+        {"refinementProbes", stats.refinementProbes},
+        {"refinementSweeps", stats.refinementSweeps},
+        {"refinementAccepted", stats.refinementAccepted},
+        {"refinementStartCost", stats.refinementStopReason == "no-incumbent" ? llvm::json::Value(nullptr) : llvm::json::Value(layoutCostJSON(stats.refinementStartCost))},
+        {"refinementEndCost", stats.refinementStopReason == "no-incumbent" ? llvm::json::Value(nullptr) : llvm::json::Value(layoutCostJSON(stats.refinementEndCost))},
+        {"refinementStopReason", stats.refinementStopReason},
+        {"refinementGlobalFallback", stats.refinementGlobalFallback},
+        {"selectedCost", selectedComponent ? llvm::json::Value(layoutCostJSON(stats.cost)) : llvm::json::Value(nullptr)},
         {"exhaustive", stats.exhaustive}});
     });
     SmallVector<LayoutConstraintID> constraints;
@@ -208,6 +254,8 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
                   succeeded(verifyLayoutStorageCapacity(graph, var, candidate.value));
         }
         LayoutConstraintID rejected = UINT32_MAX;
+        StringRef rejectionStatus = "Unknown";
+        SmallVector<int64_t> counterexample;
         // A failed target/capacity decoder has no three-valued proof here.
         // Treat it as unsupported, never as proven emptiness for relaxation.
         LayoutSolveFailureKind rejectedKind = valid
@@ -225,9 +273,12 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
               rejectedKind = LayoutSolveFailureKind::HardConflict;
               reason = "hard constraint not proven: ";
               reason += stringifyConstraintKind(c.kind).str();
+              rejectionStatus = c.kind == ConstraintKind::RequireEncoding ? "Disproven" : "NoSupport";
               if (isSupportedUnaryLayoutConstraint(c.kind)) {
                 auto proof = proveUnaryLayoutConstraint(graph, c, candidate.value);
                 reason += ": " + proof.reason;
+                rejectionStatus = proof.status == ProofStatus::Unknown ? "Unknown" : "Disproven";
+                if (trace) counterexample = proof.counterexample;
                 rejectedKind = proof.status == ProofStatus::Unknown
                     ? LayoutSolveFailureKind::Unsupported
                     : LayoutSolveFailureKind::EmptyDomain;
@@ -237,6 +288,9 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
           }
         if (valid) kept.push_back(candidate);
         else {
+          if (trace) trace->recordRejection(id, candidate.value, rejected,
+              diagnostic ? "diagnostic-filter" : "search-filter",
+              rejectionStatus, reason, counterexample);
           solution.rejections.push_back(
               {id, layoutCandidateKey(candidate.value), reason, rejected});
           if (rejection.kind == LayoutSolveFailureKind::EmptyDomain ||
@@ -339,9 +393,11 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
     };
     // Cache complete relation checks by immutable canonical-domain indices.
     // Partial tuple/pair support checks remain attribute keyed.
-    std::map<std::vector<unsigned>, bool> relationCache;
+    struct ConstraintCheck { bool legal; StringRef status; };
+    std::map<std::vector<unsigned>, ConstraintCheck> relationCache;
     bool unknownRelation = false;
-    auto viable = [&](const State &s) {
+    auto viable = [&](const State &s, StringRef *status = nullptr,
+                      LayoutConstraintID *rejected = nullptr) {
       for (auto cid : constraints) {
         const auto &c = graph.getConstraint(cid);
         std::vector<unsigned> key{cid};
@@ -349,42 +405,47 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
           auto it = llvm::find(component, id);
           key.push_back(s.key[it - component.begin()]);
         }
+        LayoutProfile::Scope profile(LayoutProfileKind::RelationCache);
         auto found = relationCache.find(key);
-        bool ok;
-        if (found != relationCache.end()) ok = found->second;
+        LayoutProfile::cacheLookup(LayoutProfileKind::RelationCache, found != relationCache.end());
+        ConstraintCheck check{true, "Proven"};
+        if (found != relationCache.end()) check = found->second;
         else {
-          ok = satisfiesLayoutConstraint(graph, c, s.assignment.values, false);
-          if (!ok && c.kind != ConstraintKind::InstructionContract &&
+          check.legal = satisfiesLayoutConstraint(graph, c, s.assignment.values, false);
+          if (!check.legal) check.status = "NoSupport";
+          if (!check.legal && c.kind != ConstraintKind::InstructionContract &&
               c.kind != ConstraintKind::ReductionLayout &&
               llvm::all_of(c.vars, [&](auto id) { return s.assignment.values.count(id); })) {
+            bool unknown = false;
             if (isSupportedUnaryLayoutConstraint(c.kind))
-              unknownRelation |= proveUnaryLayoutConstraint(graph, c,
+              unknown = proveUnaryLayoutConstraint(graph, c,
                   s.assignment.values.lookup(c.vars.front())).status == ProofStatus::Unknown;
             else if (isSupportedLayoutRelation(c.kind))
               for (auto id : llvm::drop_begin(c.vars))
-                unknownRelation |= proveLayoutRelation(graph, c,
+                unknown |= proveLayoutRelation(graph, c,
                     c.vars.front(), s.assignment.values.lookup(c.vars.front()),
                     id, s.assignment.values.lookup(id)).status == ProofStatus::Unknown;
+            unknownRelation |= unknown;
+            check.status = unknown ? "Unknown" : "Disproven";
           }
-          relationCache.emplace(std::move(key), ok);
+          if (relationCache.emplace(std::move(key), check).second)
+            LayoutProfile::cacheInsertion(LayoutProfileKind::RelationCache);
         }
-        if (!ok) return false;
+        if (!check.legal) {
+          if (status) *status = check.status;
+          if (rejected) *rejected = cid;
+          return false;
+        }
       }
       return true;
     };
     auto evaluate = [&](State &s, bool complete,
                         SmallVectorImpl<LayoutConversionEdge> *edges = nullptr) {
-      auto cost = complete ? target.evaluate(graph, s.assignment)
+      auto cost = complete ? evaluateComplete(s.assignment, edges)
                            : target.lowerBound(graph, s.assignment);
       if (failed(cost)) return failure();
       // Boundary choices may later share a conversion or replace it with a
       // cheap clone. Zero is a safe partial bound; per-use charges are not.
-      if (complete) {
-        auto choices = chooseLayoutConversions(graph, s.assignment, target);
-        if (failed(choices)) return failure();
-        *cost = addLayoutCosts(*cost, choices->cost);
-        if (edges) llvm::append_range(*edges, choices->edges);
-      }
       s.bound = *cost;
       return success();
     };
@@ -400,7 +461,28 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
     frontier.push_back(std::move(initial));
     stats.peakFrontier = 1;
     for (size_t depth = 0; depth < component.size(); ++depth) {
+      const auto probesBefore = stats.mrvProbes, expandedBefore = stats.expandedNodes;
+      const auto rejectedBefore = stats.hardRejected;
+      // Counts, not a second search tree. Allocation is trace-only.
+      std::map<LayoutVarID, uint64_t> selections;
       SmallVector<State> next;
+      bool completedDepth = false;
+      auto finishDepth = llvm::make_scope_exit([&] {
+        if (!trace || completedDepth) return;
+        trace->recordEvent([&] {
+          llvm::json::Array mrv;
+          for (auto [id, count] : selections)
+            mrv.push_back(llvm::json::Object{{"variable", id}, {"count", count}});
+          return llvm::json::Object{{"event", "search-depth"}, {"diagnostic", diagnostic},
+              {"component", stats.root}, {"depth", depth}, {"completed", false},
+              {"costKind", !emptyComponent && depth + 1 == component.size() ? "complete" : "partial-lower-bound"},
+              {"mrvSelections", std::move(mrv)}, {"probes", stats.mrvProbes - probesBefore},
+              {"expanded", stats.expandedNodes - expandedBefore}, {"hardRejected", stats.hardRejected - rejectedBefore},
+              {"retained", 0}, {"beamDiscarded", 0}, {"pending", next.size()},
+              {"retainedExamples", llvm::json::Array{}}, {"discardedExamples", llvm::json::Array{}},
+              {"stopReason", why->reason}};
+        });
+      });
       for (const auto &state : frontier) {
         size_t chosen = component.size();
         SmallVector<State> children;
@@ -436,6 +518,8 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
           }
           if (children.empty()) break;
         }
+        if (trace && trace->acceptingEvents() && chosen != component.size())
+          ++selections[component[chosen]];
         for (auto &child : children) {
           ++stats.expandedNodes;
           if (failed(evaluate(child, !emptyComponent &&
@@ -449,6 +533,33 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
         }
       }
       llvm::sort(next, less);
+      if (trace) trace->recordEvent([&] {
+        const size_t retained = stats.usedBeam ? std::min<size_t>(next.size(), options.beamWidth) : next.size();
+        auto examples = [&](size_t begin, size_t end) {
+          llvm::json::Array states;
+          for (size_t i = begin; i < std::min(end, begin + 4); ++i) {
+            llvm::json::Array key;
+            for (size_t j = 0; j < component.size(); ++j)
+              key.push_back(next[i].key[j] == UINT32_MAX ? llvm::json::Value(nullptr) :
+                  llvm::json::Value(LayoutTrace::candidateID(graph.getVariable(component[j]).candidates[next[i].key[j]].value)));
+            states.push_back(llvm::json::Object{{"key", std::move(key)}, {"cost", layoutCostJSON(next[i].bound)}});
+          }
+          return states;
+        };
+        llvm::json::Array mrv, variables;
+        for (auto id : component) variables.push_back(id);
+        for (auto [id, count] : selections) mrv.push_back(llvm::json::Object{{"variable", id}, {"count", count}});
+        return llvm::json::Object{{"event", "search-depth"}, {"diagnostic", diagnostic},
+            {"completed", true},
+            {"component", stats.root}, {"variables", std::move(variables)}, {"depth", depth},
+            {"costKind", !emptyComponent && depth + 1 == component.size() ? "complete" : "partial-lower-bound"},
+            {"mrvSelections", std::move(mrv)}, {"probes", stats.mrvProbes - probesBefore},
+            {"expanded", stats.expandedNodes - expandedBefore}, {"hardRejected", stats.hardRejected - rejectedBefore},
+            {"retained", retained}, {"beamDiscarded", next.size() - retained},
+            {"discardReason", "beam-ranking-not-proof-rejection"},
+            {"retainedExamples", examples(0, retained)}, {"discardedExamples", examples(retained, next.size())}};
+      });
+      completedDepth = true;
       if (stats.usedBeam && next.size() > options.beamWidth) {
         stats.beamDiscarded += next.size() - options.beamWidth;
         next.resize(options.beamWidth);
@@ -478,15 +589,114 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
     // are meaningful. The deferred EmptyDomain still rejects the original graph.
     if (emptyComponent) continue;
     auto &best = frontier.front();
-    if (failed(evaluate(best, true, &solution.conversions))) {
-      *why = {LayoutSolveFailureKind::CostFailure, stats.root, UINT32_MAX,
-              "selected boundary cost evaluation failed"};
-      return failure();
+    bool mayRefine = stats.usedBeam && options.refineBeamSolution && options.maxRefinementProbes;
+    CandidateAssignment original;
+    if (mayRefine) original = best.assignment;
+    stats.refinementStartCost = stats.refinementEndCost = best.bound;
+    stats.refinementStopReason = !stats.usedBeam ? "exact-mode" : "disabled";
+    if (mayRefine) {
+      stats.refinementStopReason.clear();
+      auto finishRefinement = llvm::make_scope_exit([&] {
+        stats.refinementEndCost = best.bound;
+        if (trace) trace->recordEvent([&] { return llvm::json::Object{
+            {"event", "refinement-stop"}, {"diagnostic", diagnostic},
+            {"component", stats.root}, {"reason", stats.refinementStopReason},
+            {"probes", stats.refinementProbes}, {"sweeps", stats.refinementSweeps},
+            {"accepted", stats.refinementAccepted},
+            {"startCost", layoutCostJSON(stats.refinementStartCost)},
+            {"endCost", layoutCostJSON(stats.refinementEndCost)}}; });
+      });
+      if (trace) trace->recordEvent([&] { return llvm::json::Object{
+          {"event", "refinement-start"}, {"diagnostic", diagnostic},
+          {"component", stats.root}, {"cost", layoutCostJSON(best.bound)}}; });
+      auto budgetExhausted = [&] {
+        if (stats.expanded == options.maxExpandedStates)
+          stats.refinementStopReason = "total-budget";
+        else if (stats.refinementProbes == options.maxRefinementProbes)
+          stats.refinementStopReason = "refinement-budget";
+        return !stats.refinementStopReason.empty();
+      };
+      while (!budgetExhausted()) {
+        ++stats.refinementSweeps;
+        State improving = best;
+        size_t changed = component.size();
+        for (size_t index = 0; index < component.size(); ++index) {
+          auto id = component[index];
+          const auto &domain = graph.getVariable(id).candidates;
+          for (unsigned ci = 0; ci < domain.size(); ++ci) {
+            if (ci == best.key[index]) continue;
+            if (budgetExhausted()) break;
+            ++stats.expanded;
+            ++stats.refinementProbes;
+            State neighbor = best;
+            neighbor.key[index] = ci;
+            neighbor.assignment.values[id] = domain[ci].value;
+            StringRef status = "Proven";
+            LayoutConstraintID rejected = UINT32_MAX;
+            bool legal = viable(neighbor, &status, &rejected);
+            bool priced = legal && succeeded(evaluate(neighbor, true));
+            bool improves = priced && neighbor.bound.cost < best.bound.cost;
+            if (trace) trace->recordEvent([&] { return llvm::json::Object{
+                {"event", "refinement-probe"}, {"diagnostic", diagnostic},
+                {"component", stats.root}, {"sweep", stats.refinementSweeps},
+                {"probe", stats.refinementProbes}, {"variable", id},
+                {"oldCandidate", LayoutTrace::candidateID(best.assignment.values.lookup(id))},
+                {"newCandidate", LayoutTrace::candidateID(domain[ci].value)},
+                {"status", status}, {"constraint", rejected}, {"legal", legal},
+                {"result", !legal ? "constraint-not-proven" : !priced ? "cost-failure" :
+                    improves ? "strict-improvement" : "not-improving"},
+                {"cost", priced ? llvm::json::Value(layoutCostJSON(neighbor.bound)) : llvm::json::Value(nullptr)}}; });
+            if (legal && !priced) {
+              stats.refinementStopReason = "cost-failure";
+              *why = {LayoutSolveFailureKind::CostFailure, id, UINT32_MAX,
+                      "refinement cost evaluation failed"};
+              emitError(loc) << "refinement cost evaluation failed; not a free solution";
+              return failure();
+            }
+            if (improves && less(neighbor, improving)) {
+              improving = std::move(neighbor);
+              changed = index;
+            }
+          }
+          if (!stats.refinementStopReason.empty()) break;
+        }
+        // Even an interrupted sweep may retain its best verified improvement.
+        if (changed != component.size()) {
+          ++stats.refinementAccepted;
+          auto id = component[changed];
+          if (trace) trace->recordEvent([&] { return llvm::json::Object{
+              {"event", "refinement-accepted"}, {"diagnostic", diagnostic},
+              {"component", stats.root}, {"sweep", stats.refinementSweeps},
+              {"variable", id}, {"accepted", true},
+              {"oldCandidate", LayoutTrace::candidateID(best.assignment.values.lookup(id))},
+              {"newCandidate", LayoutTrace::candidateID(improving.assignment.values.lookup(id))},
+              {"cost", layoutCostJSON(improving.bound)}}; });
+          best = std::move(improving);
+        } else if (!budgetExhausted()) {
+          stats.refinementStopReason = "no-improvement";
+        }
+        if (!stats.refinementStopReason.empty()) break;
+      }
+    }
+    if (mayRefine) {
+      // Saturation can erase an earlier improvement while preserving a worse
+      // later dimension. Defer only mutable beam selections until the whole
+      // saturated totals can be compared; never undo observed contributions.
+      pending.push_back({std::move(original), best.assignment,
+          stats.refinementStartCost, best.bound, solution.components.size(),
+          statistics ? statistics->components.size() : 0});
+    } else {
+      if (failed(evaluate(best, true, &solution.conversions))) {
+        *why = {LayoutSolveFailureKind::CostFailure, stats.root, UINT32_MAX,
+                "selected boundary cost evaluation failed"};
+        return failure();
+      }
+      selectedComponent = true;
+      solution.cost = addLayoutCosts(solution.cost, best.bound);
+      for (auto id : component)
+        solution.assignments[id] = best.assignment.values.lookup(id);
     }
     stats.cost = best.bound;
-    solution.cost = addLayoutCosts(solution.cost, best.bound);
-    for (auto id : component)
-      solution.assignments[id] = best.assignment.values.lookup(id);
     solution.components.push_back(stats);
   }
   if (emptyFailure.kind != LayoutSolveFailureKind::None) {
@@ -495,6 +705,38 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
     emitError(getVariableLoc(var)) << "no proven layout candidate for "
         << var.stableName << " (hard constraints not proven): " << why->reason;
     return failure();
+  }
+  if (!pending.empty()) {
+    CostEstimate originalCost = solution.cost, refinedCost = solution.cost;
+    for (const auto &p : pending) {
+      originalCost = addLayoutCosts(originalCost, p.originalCost);
+      refinedCost = addLayoutCosts(refinedCost, p.refinedCost);
+    }
+    bool fallback = originalCost.cost < refinedCost.cost;
+    if (trace) trace->recordEvent([&] { return llvm::json::Object{
+        {"event", "refinement-global-selection"}, {"diagnostic", diagnostic},
+        {"fallback", fallback}, {"originalCost", layoutCostJSON(originalCost)},
+        {"refinedCost", layoutCostJSON(refinedCost)},
+        {"selectedCost", layoutCostJSON(fallback ? originalCost : refinedCost)}}; });
+    for (const auto &p : pending) {
+      auto &stats = solution.components[p.solutionIndex];
+      const auto &assignment = fallback ? p.original : p.refined;
+      stats.refinementGlobalFallback = fallback;
+      if (statistics)
+        (*statistics->components[p.statisticsIndex].getAsObject())["refinementGlobalFallback"] = fallback;
+      auto cost = evaluateComplete(assignment, &solution.conversions);
+      if (failed(cost)) {
+        *why = {LayoutSolveFailureKind::CostFailure, stats.root, UINT32_MAX,
+                "selected boundary cost evaluation failed"};
+        return failure();
+      }
+      stats.cost = *cost;
+      if (statistics)
+        (*statistics->components[p.statisticsIndex].getAsObject())["selectedCost"] = layoutCostJSON(*cost);
+      solution.cost = addLayoutCosts(solution.cost, *cost);
+      for (auto [id, value] : assignment.values)
+        solution.assignments[id] = value;
+    }
   }
   llvm::sort(solution.conversions, [&](const auto &a, const auto &b) {
     return graph.getConstraint(a.constraint).stableUseKey <
@@ -515,6 +757,7 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
   *why = {};
   if (statistics) finishLayoutStatistics(graph, *why, &solution, *statistics);
   solved = true;
+  if (trace && !diagnostic) trace->recordSolution(graph, solution);
   return solution;
 }
 

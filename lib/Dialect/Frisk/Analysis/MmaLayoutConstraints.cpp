@@ -50,9 +50,14 @@ LogicalResult collectMmaLayoutConstraints(Operation *root,
       if (var.kind == LayoutKind::Distributed) var.requiredThreads = threads;
     }
     (void)builder.same(roles[2], roles[3], mma, "mma-accumulator-slot");
+    auto geometry = graph.addVariable(LayoutKind::Instruction,
+        mma.getResult().getType(), graph.getVariable(roles[3]).stableName + "/geometry", mma);
+    graph.getVariable(geometry).instructionRole = true;
+    graph.getVariable(geometry).requiredThreads = threads;
+    roles.push_back(geometry);
     auto id = graph.addConstraint(ConstraintKind::InstructionContract,
         ConstraintStrength::Hard, roles, mma, "mma-joint-contract",
-        "A/B/init/result must satisfy the same instruction contract");
+        "A/B/init/result/geometry must satisfy the same instruction contract");
     graph.getConstraints()[id].instruction = InstructionLayoutContract{
         mma, mma->getAttr("frisk.mma_contract"), {}};
     return WalkResult::advance();

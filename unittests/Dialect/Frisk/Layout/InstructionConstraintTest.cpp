@@ -161,6 +161,26 @@ TEST_F(InstructionConstraintTest, ExplicitBindingOnlyVerifiesAndRepeatedRolesEnu
   EXPECT_TRUE(succeeded(propagateStrict(graph)));
 }
 
+TEST_F(InstructionConstraintTest, DetailedConstructionDoesNotRepeatTargetProof) {
+  class DetailedTarget final : public FiniteInstructionTarget {
+    InstructionContractBuildResult buildInstructionContractDetailed(
+        const LayoutConstraintGraph &, const LayoutConstraint &c,
+        ArrayRef<Attribute> encodings) const override {
+      ++builds;
+      bool valid = encodings[2] == encodings[3];
+      return {valid ? Attribute(StringAttr::get(c.instruction->source->getContext(), "plan")) : Attribute{},
+          {valid ? ProofStatus::Proven : ProofStatus::Disproven, {}, "existing checked result"},
+          valid ? "" : "test-rejection", {}};
+    }
+  } target;
+  makeGraph();
+  contract(ids);
+  ASSERT_TRUE(succeeded(prepareInstructionTuples(graph, target, b.getUnknownLoc())));
+  EXPECT_EQ(target.builds, 16u);
+  EXPECT_EQ(target.proofs, 0u);
+  EXPECT_EQ(graph.getConstraints().front().instruction->tuples.size(), 8u);
+}
+
 TEST_F(InstructionConstraintTest, FourCandidateDomainsHaveExactly256Combinations) {
   makeGraph();
   for (auto &var : graph.getVariables())

@@ -1,7 +1,9 @@
 #include "Dialect/Frisk/Target/SM90/SM90CostModel.h"
 #include "Dialect/Frisk/Analysis/ExecutionLayoutProof.h"
 #include "Dialect/Frisk/Analysis/LayoutCostModel.h"
+#include "Dialect/Frisk/Analysis/LayoutProfile.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
+#include "Dialect/Frisk/Analysis/InstructionLayoutConstraints.h"
 #include "Dialect/Frisk/Target/SM90/SM90MmaLayoutProof.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
 #include "llvm/Support/MathExtras.h"
@@ -10,6 +12,10 @@
 
 using namespace mlir;
 using namespace mlir::frisk;
+
+StringRef mlir::frisk::getSM90LegacyCostModelID() {
+  return "sm90-layout-lex9-legacy-v1";
+}
 
 namespace {
 // Warp issues are grouped by physical warp and register vector, never across
@@ -31,6 +37,7 @@ DictionaryAttr selectedCopy(const LayoutConstraintGraph &graph, Operation *op,
 
 FailureOr<CostEstimate> accessCost(const LayoutConstraintGraph &graph,
     const LayoutConstraint &c, const CandidateAssignment &assignment) {
+  LayoutProfile::Scope profile(LayoutProfileKind::AccessCost);
   const auto &a = graph.getVariable(c.vars[0]), &b = graph.getVariable(c.vars[1]);
   const auto &execution = a.kind == LayoutKind::Distributed ? a : b;
   const auto &storage = a.kind == LayoutKind::Storage ? a : b;
@@ -117,18 +124,23 @@ FailureOr<CostEstimate> accessCost(const LayoutConstraintGraph &graph,
 } // namespace
 
 FailureOr<CostEstimate> mlir::frisk::evaluateSM90LayoutCost(
-    const LayoutConstraintGraph &graph, const CandidateAssignment &assignment) {
-  auto total = evaluateStaticLayoutCost(graph, assignment);
+    const LayoutConstraintGraph &graph, const CandidateAssignment &assignment,
+    LayoutCostObserver *observer, LayoutBoundaryFrequencyMode mode) {
+  (void)mode; // Ordinary arithmetic and resource terms remain static.
+  auto total = evaluateStaticLayoutCost(graph, assignment, observer);
   if (failed(total)) return failure();
   for (const auto &c : graph.getConstraints()) {
     bool complete = llvm::all_of(c.vars, [&](auto id) { return assignment.values.count(id); });
     if (!complete) continue;
     CostEstimate extra;
+    StringRef kind;
     if (c.kind == ConstraintKind::StorageAccess) {
+      kind = "access";
       auto cost = accessCost(graph, c, assignment);
       if (failed(cost)) return failure();
       extra = *cost;
     } else if (c.instruction && isa_and_nonnull<CopyOp>(c.instruction->source)) {
+      kind = "copy-setup";
       auto binding = selectedCopy(graph, c.instruction->source, assignment);
       if (!binding) return failure();
       auto type = cast<ShapedType>(graph.getVariable(c.vars[0]).shapedType);
@@ -140,12 +152,16 @@ FailureOr<CostEstimate> mlir::frisk::evaluateSM90LayoutCost(
       extra.cost.instructionPathAndWork = path == "tma" ? 4 + llvm::divideCeil(bytes, uint64_t{1024}) :
           (path == "cp.async" ? 2 : 0);
     } else if (c.instruction && isa_and_nonnull<MmaOp>(c.instruction->source)) {
+      kind = "mma";
       auto op = cast<MmaOp>(c.instruction->source);
-      auto geometry = getSM90MmaGeometry(op, graph.getVariable(c.vars[3]).requiredThreads);
+      auto tuple = findInstructionSupport(graph,c,assignment.values);
+      if (!tuple) return failure();
+      auto geometry = getSM90MmaContractGeometry(op, graph.getVariable(c.vars[3]).requiredThreads,tuple->binding);
       if (failed(geometry)) return failure();
       extra.cost.instructionPathAndWork = geometry->gM * geometry->gN *
           geometry->mRepeat * geometry->nRepeat * geometry->kRepeat;
     } else if (c.kind == ConstraintKind::ReductionLayout) {
+      kind = "reduction";
       auto source = cast<ShapedType>(graph.getVariable(c.vars[0]).shapedType);
       auto result = cast<ShapedType>(graph.getVariable(c.vars[1]).shapedType);
       extra.cost.instructionPathAndWork = source.getNumElements() - result.getNumElements();
@@ -156,6 +172,7 @@ FailureOr<CostEstimate> mlir::frisk::evaluateSM90LayoutCost(
     // ample room for the <=31-byte base phase. Cross-constraint accumulation
     // uses the shared saturating helper, including its saturation flag.
     *total = addLayoutCosts(*total, extra);
+    if (observer && !kind.empty()) observer->recordCost(kind, c.id, extra);
   }
   return *total;
 }

@@ -2,7 +2,10 @@
 #include "LegacyFragmentNormalization.h"
 
 #include "Dialect/Frisk/Analysis/LayoutSolver.h"
+#include "Dialect/Frisk/Analysis/LayoutCostModel.h"
 #include "Dialect/Frisk/Analysis/LayoutStatistics.h"
+#include "Dialect/Frisk/Analysis/LayoutTrace.h"
+#include "Dialect/Frisk/Analysis/LayoutProfile.h"
 #include "Dialect/Frisk/Analysis/LayoutRelaxation.h"
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
@@ -30,29 +33,95 @@ public:
   FriskInferLayoutsPass(const FriskInferLayoutsPass &other)
       : impl::FriskInferLayoutsBase<FriskInferLayoutsPass>(other),
         authorizeInternalOptimization(other.authorizeInternalOptimization),
-        statistics(other.statistics), scope(other.scope) {}
+        statistics(other.statistics), scope(other.scope), trace(other.trace), profile(other.profile) {}
   bool authorizeInternalOptimization = false;
   LayoutStatisticsReport *statistics = nullptr;
   LayoutStatisticsScope scope = LayoutStatisticsScope::Standalone;
+  LayoutTrace *trace = nullptr;
+  LayoutProfile *profile = nullptr;
   explicit FriskInferLayoutsPass(const SolverOptions &options, bool authorize,
-                                 LayoutStatisticsReport *statistics, LayoutStatisticsScope scope)
-      : authorizeInternalOptimization(authorize), statistics(statistics), scope(scope) {
+                                 LayoutStatisticsReport *statistics, LayoutStatisticsScope scope, LayoutTrace *trace,
+                                 LayoutProfile *profile, LayoutBoundaryFrequencyMode mode)
+      : authorizeInternalOptimization(authorize), statistics(statistics), scope(scope), trace(trace), profile(profile) {
+    boundaryFrequency = mode == LayoutBoundaryFrequencyMode::Legacy ? "legacy" : "static-trip-count";
     exactCombinationLimit = options.exactCombinationLimit;
     beamWidth = options.beamWidth;
     maxExpandedStates = options.maxExpandedStates;
+    refineBeamSolution = options.refineBeamSolution;
+    maxRefinementProbes = options.maxRefinementProbes;
   }
   void runOnOperation() override {
+    LayoutProfile ownedProfile(!profileFile.empty());
+    auto *activeProfile = ownedProfile.enabled() ? &ownedProfile : profile;
+    LayoutProfile::Invocation profileInvocation(activeProfile);
     auto start = LayoutClock::now();
     LayoutStatisticsReport local;
     auto &report = statistics ? *statistics : local;
     if (scope == LayoutStatisticsScope::Standalone) report = {};
+    if (boundaryFrequency != "legacy" && boundaryFrequency != "static-trip-count") {
+      getOperation().emitError("invalid boundary-frequency: expected legacy or static-trip-count");
+      report.status = "failed"; report.failureKind = "boundary-frequency";
+      report.costModelID = "unversioned-target";
+      signalPassFailure(); return;
+    }
+    auto mode = boundaryFrequency == "legacy" ? LayoutBoundaryFrequencyMode::Legacy : LayoutBoundaryFrequencyMode::StaticTripCount;
+    auto target = createSM90LayoutTarget(mode);
+    report.costModelID = normalizeLayoutCostModelID(target->costModelID()).str();
+    report.staticTripCountFrequency = mode == LayoutBoundaryFrequencyMode::StaticTripCount;
+    auto initializeTrace = [&](LayoutTrace *recorder) {
+      if (!recorder) return;
+      recorder->setSolverOptions({exactCombinationLimit, beamWidth, maxExpandedStates,
+                                 refineBeamSolution, maxRefinementProbes});
+      auto summary = recorder->getSummary();
+      summary.target = "SM90";
+      summary.costCoverage = target->costCoverage().str();
+      summary.costModelID = report.costModelID;
+      summary.staticTripCountFrequency = report.staticTripCountFrequency;
+      recorder->setSummary(summary);
+    };
+    // A caller-owned recorder already exists: initialize its known metadata
+    // even when validation rejects this invocation before creating owned output.
+    initializeTrace(trace);
     ModuleOp original = getOperation();
+    LayoutTraceOptions traceOptions{traceFile, traceMaxEvents, traceMaxBytes};
+    std::string error;
+    if (failed(LayoutProfile::validate(profileFile, statsFile, traceFile, error))) {
+      original.emitError(error);
+      report.status = "failed";
+      report.failureKind = "profile-options";
+      report.failureReason = error;
+      signalPassFailure();
+      return;
+    }
+    if (failed(traceOptions.validate(statsFile, error))) {
+      original.emitError(error);
+      report.status = "failed";
+      report.failureKind = "trace-options";
+      report.failureReason = error;
+      signalPassFailure();
+      return;
+    }
+    std::optional<LayoutTrace> ownedTrace;
+    auto *activeTrace = trace;
+    if (!traceFile.empty()) {
+      ownedTrace.emplace(traceOptions);
+      activeTrace = &*ownedTrace;
+      initializeTrace(activeTrace);
+    }
     // A requested statistics write is part of the transaction, not an IR side effect.
     OwningOpRef<ModuleOp> staged;
-    if (!statsFile.empty()) staged = cast<ModuleOp>(original->clone());
+    if (!statsFile.empty() || ownedTrace || ownedProfile.enabled()) staged = cast<ModuleOp>(original->clone());
     ModuleOp module = staged ? *staged : original;
-    auto result = infer(module, report);
+    auto result = infer(module, report, activeTrace, *target);
     report.timings["inference_total_ns"] = layoutElapsedNS(start);
+    if (activeTrace) {
+      auto summary = activeTrace->getSummary();
+      summary.analysisStatus = failed(result) ? "failed" : "solved";
+      summary.failureKind = report.failureKind;
+      summary.failureReason = report.failureReason;
+      if (failed(result)) summary.hasFinalCost = false;
+      activeTrace->setSummary(summary);
+    }
     if (!statsFile.empty()) {
       std::string error;
       if (failed(writeLayoutStatistics(statsFile, report, error))) {
@@ -64,22 +133,38 @@ public:
         return;
       }
     }
+    if (ownedTrace && failed(ownedTrace->publish(error))) {
+      report.status = "failed";
+      report.failureKind = "trace-write";
+      report.failureReason = error;
+      original.emitError("cannot write layout trace '") << traceFile << "': " << error;
+      signalPassFailure();
+      return;
+    }
+    if (failed(ownedProfile.publish(profileFile, report.status, error))) {
+      report.status = "failed";
+      report.failureKind = "profile-write";
+      report.failureReason = error;
+      original.emitError("cannot write layout profile '") << profileFile << "': " << error;
+      signalPassFailure();
+      return;
+    }
     if (failed(result)) { signalPassFailure(); return; }
     if (staged && !analysisOnly) {
       original->setAttrs((*staged)->getAttrs());
       original.getBodyRegion().takeBody(staged->getBodyRegion());
     }
   }
-  LogicalResult infer(ModuleOp module, LayoutStatisticsReport &report) {
+  LogicalResult infer(ModuleOp module, LayoutStatisticsReport &report,
+                      LayoutTrace *activeTrace, LayoutTarget &target) {
     report.status = "failed";
     report.failureKind = "input-verification";
     if (failed(verifyNoLegacyLayoutIR(module)) || failed(verifySM90TargetBoundary(module)))
       return failure();
     report.failureKind.clear();
-    std::unique_ptr<LayoutTarget> target = createSM90LayoutTarget();
     FailureOr<LayoutConstraintGraph> graph =
-        collectLayoutConstraints(module, *target,
-                                 LayoutCollectionMode::InitializeForRelaxation, &report);
+        collectLayoutConstraints(module, target,
+                                 LayoutCollectionMode::InitializeForRelaxation, &report, activeTrace);
     if (failed(graph)) {
       report.failureKind = "collection";
       return failure();
@@ -88,8 +173,9 @@ public:
     LayoutSolveFailure why;
     auto solveStart = LayoutClock::now();
     FailureOr<LayoutSolution> solution =
-        attemptControlledRelaxation(*graph, *target,
-            {exactCombinationLimit, beamWidth, maxExpandedStates}, relaxations, &why, &report);
+        attemptControlledRelaxation(*graph, target,
+            {exactCombinationLimit, beamWidth, maxExpandedStates,
+             refineBeamSolution, maxRefinementProbes}, relaxations, &why, &report, activeTrace);
     report.timings["propagation_search_retries_ns"] = layoutElapsedNS(solveStart);
     if (dumpAnalysis) printRelaxationRecords(relaxations, llvm::errs());
     if (failed(solution)) {
@@ -97,9 +183,14 @@ public:
       return failure();
     }
     auto proofStart = LayoutClock::now();
-    auto proof = verifySolvedLayoutGraph(*graph, *solution, *target, module.getLoc());
+    auto proof = verifySolvedLayoutGraph(*graph, *solution, target, module.getLoc());
     report.timings["verification_ns"] += layoutElapsedNS(proofStart);
     if (failed(proof)) {
+      if (activeTrace) {
+        auto summary = activeTrace->getSummary();
+        summary.verificationStatus = "failed";
+        activeTrace->setSummary(summary);
+      }
       report.status = "failed";
       report.failureKind = "solved-graph-verification";
       return failure();
@@ -107,7 +198,7 @@ public:
     report.failureKind.clear(); report.failureReason.clear();
     report.failureVariable.clear(); report.failureConstraint.clear();
     if (dumpAnalysis) {
-      printLayoutSolutionStatistics(*graph, *solution, *target, llvm::errs());
+      printLayoutSolutionStatistics(*graph, *solution, target, llvm::errs());
       graph->print(llvm::errs());
       for (const auto &var : graph->getVariables())
         if (var.kind == LayoutKind::Distributed)
@@ -125,20 +216,35 @@ public:
                      << " slice-ops=" << edge.rematerialization.size() << '\n';
     }
     report.status = "solved";
+    if (activeTrace) {
+      auto summary = activeTrace->getSummary();
+      summary.verificationStatus = "solved-graph-verified";
+      activeTrace->setSummary(summary);
+    }
     if (analysisOnly) return success();
     auto materializeStart = LayoutClock::now();
     auto materialized = materializeLayouts(module, *graph, *solution,
-                                           authorizeInternalOptimization);
+                                           authorizeInternalOptimization, &target);
     report.timings["materialization_ns"] = layoutElapsedNS(materializeStart);
     auto verificationStart = LayoutClock::now();
-    auto verified = succeeded(materialized) ? verifyMaterializedLayouts(module, *target) : failure();
+    auto verified = succeeded(materialized) ? verifyMaterializedLayouts(module, target) : failure();
     report.timings["verification_ns"] += layoutElapsedNS(verificationStart);
     if (failed(materialized) || failed(verified)) {
+      if (activeTrace && succeeded(materialized)) {
+        auto summary = activeTrace->getSummary();
+        summary.verificationStatus = "failed";
+        activeTrace->setSummary(summary);
+      }
       report.status = "failed";
       report.failureKind = "materialization-or-verification";
       return failure();
     }
     report.status = "materialized";
+    if (activeTrace) {
+      auto summary = activeTrace->getSummary();
+      summary.verificationStatus = "materialized-verified";
+      activeTrace->setSummary(summary);
+    }
     return success();
   }
 };
@@ -150,8 +256,8 @@ std::unique_ptr<Pass> createFriskInferLayoutsPass() {
 std::unique_ptr<Pass> createFriskInferLayoutsPass(const SolverOptions &options,
                                               bool authorizeInternalOptimization,
                                               LayoutStatisticsReport *statistics,
-                                              LayoutStatisticsScope scope) {
-  return std::make_unique<FriskInferLayoutsPass>(options, authorizeInternalOptimization, statistics, scope);
+                                              LayoutStatisticsScope scope, LayoutTrace *trace, LayoutProfile *profile, LayoutBoundaryFrequencyMode mode) {
+  return std::make_unique<FriskInferLayoutsPass>(options, authorizeInternalOptimization, statistics, scope, trace, profile, mode);
 }
 
 } // namespace mlir::frisk

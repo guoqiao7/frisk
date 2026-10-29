@@ -4,6 +4,7 @@
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
 #include "Dialect/Frisk/Target/SM90/SM90LayoutTarget.h"
+#include "Dialect/Frisk/Target/SM90/SM90MmaLayoutProof.h"
 #include "gtest/gtest.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -214,8 +215,8 @@ TEST_F(ReduceLayoutIntegrationTest, MmaResultInherits128Threads) {
   ASSERT_TRUE(m); ASSERT_TRUE(succeeded(infer(*m)));
   EXPECT_EQ(reduce(*m)->getAttrOfType<IntegerAttr>("frisk.execution_threads").getInt(),128);
   auto once=print(*m); ASSERT_TRUE(succeeded(infer(*m))); EXPECT_EQ(once,print(*m));
-  // Adding real store endpoints produces nine connected variables. Re-solving
-  // must preserve the MMA/reduction bindings and materialize the entire chain.
+  // Adding real store endpoints produces nine connected data variables plus
+  // one singleton geometry. Re-solving must preserve the actual bindings.
   auto function=*m->getOps<func::FuncOp>().begin();
   OpBuilder b(function.getBody().front().getTerminator());
   auto memory=MemRefType::get({128},b.getF32Type(),MemRefLayoutAttrInterface{},b.getI64IntegerAttr(1));
@@ -223,8 +224,49 @@ TEST_F(ReduceLayoutIntegrationTest, MmaResultInherits128Threads) {
   auto view=b.create<LayoutViewOp>(m->getLoc(),memory,allocation,StorageLayoutAttr());
   b.create<TileStoreOp>(m->getLoc(),reduce(*m).getResult(),view);
   auto graph=collectLayoutConstraints(*m,target); ASSERT_TRUE(succeeded(graph));
-  EXPECT_EQ(graph->getVariables().size(),9u);
+  unsigned storage = 0, distributed = 0, instructions = 0;
+  uint64_t dataCombinations = 1;
+  for (const auto &var : graph->getVariables()) {
+    storage += var.kind == LayoutKind::Storage;
+    distributed += var.kind == LayoutKind::Distributed;
+    instructions += var.kind == LayoutKind::Instruction;
+    ASSERT_FALSE(var.candidates.empty()); EXPECT_LE(var.candidates.size(),4u);
+    if (var.kind != LayoutKind::Instruction) dataCombinations *= var.candidates.size();
+  }
+  EXPECT_EQ(storage,3u); EXPECT_EQ(distributed,6u); ASSERT_EQ(instructions,1u);
+  EXPECT_EQ(graph->getVariables().size(),10u);
+  const LayoutConstraint *mmaContract = nullptr;
+  for (const auto &c : graph->getConstraints()) if (c.instruction) {
+    ASSERT_FALSE(mmaContract); mmaContract = &c;
+  }
+  ASSERT_TRUE(mmaContract); ASSERT_EQ(mmaContract->vars.size(),5u);
+  auto mma = dyn_cast_or_null<MmaOp>(mmaContract->instruction->source); ASSERT_TRUE(mma);
+  EXPECT_EQ(mma.getPolicy(),attr::GemmWarpPolicy::Square);
+  auto &geometryRole = graph->getVariable(mmaContract->vars[4]);
+  EXPECT_EQ(geometryRole.kind,LayoutKind::Instruction); EXPECT_EQ(geometryRole.anchor,mma.getOperation());
+  EXPECT_TRUE(geometryRole.instructionRole); EXPECT_FALSE(geometryRole.value); EXPECT_FALSE(geometryRole.use);
+  EXPECT_FALSE(geometryRole.functionResult); EXPECT_EQ(geometryRole.requiredThreads,128);
+  EXPECT_EQ(geometryRole.shapedType,mma.getResult().getType());
+  auto raw = getSM90MmaGeometries(mma,128); ASSERT_TRUE(succeeded(raw)); ASSERT_EQ(raw->size(),1u);
+  EXPECT_EQ(raw->front().gM,1); EXPECT_EQ(raw->front().gN,1);
+  auto geometry = encodeSM90MmaGeometry(&context,raw->front());
+  ASSERT_EQ(geometryRole.candidates.size(),1u); EXPECT_EQ(geometryRole.candidates.front().value,geometry);
+  // Keep the original nine-data-role product bound; geometry adds factor one,
+  // not another four-way data domain or a larger support-proof budget.
+  EXPECT_LE(dataCombinations,262144u);
+  EXPECT_EQ(dataCombinations * geometryRole.candidates.size(),dataCombinations);
+  EXPECT_LE(graph->getCandidatePreparationStatistics().instructionCombinations,256u);
+  auto fixedBinding = mma->getAttr("frisk.mma_contract"); ASSERT_TRUE(fixedBinding);
+  EXPECT_EQ(mmaContract->instruction->binding,fixedBinding);
+  auto selected = getSM90MmaContractGeometry(mma,128,fixedBinding); ASSERT_TRUE(succeeded(selected));
+  EXPECT_EQ(encodeSM90MmaGeometry(&context,*selected),geometry);
+  ASSERT_FALSE(mmaContract->instruction->tuples.empty());
+  for (const auto &tuple : mmaContract->instruction->tuples) {
+    ASSERT_EQ(tuple.encodings.size(),5u);
+    EXPECT_EQ(tuple.encodings[4],geometry); EXPECT_EQ(tuple.binding,fixedBinding);
+  }
   ASSERT_TRUE(succeeded(infer(*m)));
+  m->walk([&](MmaOp op) { EXPECT_EQ(op->getAttr("frisk.mma_contract"),fixedBinding); });
   target.generations=target.proofs=0;
   EXPECT_TRUE(succeeded(verifyMaterializedLayouts(*m,target)));
   EXPECT_EQ(target.generations,0u);
@@ -408,6 +450,82 @@ TEST_F(ReduceLayoutIntegrationTest, ParallelScopeAgreementAndMismatch) {
     ASSERT_TRUE(m);
     ScopedDiagnosticHandler quiet(&context,[](Diagnostic&){return success();});
     EXPECT_EQ(succeeded(infer(*m)),!mismatch);
+  }
+}
+} // namespace
+
+namespace {
+TEST_F(ReduceLayoutIntegrationTest, UnitAxesInferenceReplayAndStaticViews) {
+  for (auto spec : {std::array<StringRef,2>{"1x8","1"},{"8x1","8"},{"1x1","1"}}) {
+    std::string src="tensor<"+spec[0].str()+"xf32>", dst="tensor<"+spec[1].str()+"xf32>";
+    auto m=parseSourceString<ModuleOp>("module { func.func @unit() { %a=arith.constant dense<1.0> : "+src+
+        " %r=frisk.reduce_tensor %a {kind=\"sum\",dim=1:i64} : "+src+" -> "+dst+" return } }",&context);
+    ASSERT_TRUE(m); ASSERT_TRUE(succeeded(infer(*m)));
+    EXPECT_TRUE(reduce(*m)->getAttrOfType<ReductionContractAttr>("frisk.reduction_contract"));
+    // A malformed unit-axis solved contract must not partially rewrite IR.
+    auto graph=collectLayoutConstraints(*m,target); ASSERT_TRUE(succeeded(graph));
+    auto solved=solveLayoutGraph(*graph,target); ASSERT_TRUE(succeeded(solved));
+    ASSERT_FALSE(solved->reductionBindings.empty());
+    auto &binding=solved->reductionBindings.begin()->second;
+    NamedAttrList payload(cast<ReductionContractAttr>(binding).getPayload());
+    payload.set("kind",StringAttr::get(&context,"max"));
+    binding=ReductionContractAttr::get(&context,payload.getDictionary(&context));
+    auto before=print(*m);
+    { ScopedDiagnosticHandler quiet(&context,[](Diagnostic&){return success();});
+      EXPECT_TRUE(failed(materializeLayouts(*m,*graph,*solved))); }
+    EXPECT_EQ(before,print(*m));
+    target.generations=0;
+    ASSERT_TRUE(succeeded(verifyMaterializedLayouts(*m,target))); EXPECT_EQ(target.generations,0u);
+    auto once=print(*m); ASSERT_TRUE(succeeded(infer(*m))); EXPECT_EQ(once,print(*m));
+    auto parsed=parseSourceString<ModuleOp>(once,&context); ASSERT_TRUE(parsed);
+    ASSERT_TRUE(succeeded(infer(*parsed))); EXPECT_EQ(once,print(*parsed));
+  }
+  auto m=parseSourceString<ModuleOp>(R"mlir(module { func.func @views() {
+    %a=arith.constant dense<1.0> : tensor<8xf32>
+    %e=tensor.expand_shape %a [[0,1]] output_shape [1,8] : tensor<8xf32> into tensor<1x8xf32>
+    %empty=tensor.empty() : tensor<8x1xf32>
+    %t=linalg.transpose ins(%e:tensor<1x8xf32>) outs(%empty:tensor<8x1xf32>) permutation=[1,0]
+    %c=tensor.collapse_shape %t [[0,1]] : tensor<8x1xf32> into tensor<8xf32>
+    %r=frisk.reduce_tensor %t {kind="sum",dim=1:i64} : tensor<8x1xf32> -> tensor<8xf32>
+    return } })mlir",&context);
+  ASSERT_TRUE(m); ASSERT_TRUE(succeeded(infer(*m)));
+  EXPECT_TRUE(succeeded(verifyMaterializedLayouts(*m,target)));
+  auto once=print(*m); ASSERT_TRUE(succeeded(infer(*m))); EXPECT_EQ(once,print(*m));
+  auto parsed=parseSourceString<ModuleOp>(once,&context); ASSERT_TRUE(parsed);
+  ASSERT_TRUE(succeeded(infer(*parsed))); EXPECT_EQ(once,print(*parsed));
+}
+} // namespace
+
+namespace {
+TEST_F(ReduceLayoutIntegrationTest, StaticReassociationCoordinatesAndActualTampering) {
+  for (auto spec : {std::array<StringRef,3>{"tensor<8xf32>","tensor<2x1x4xf32>","[2,1,4]"},
+      {"tensor<1xf32>","tensor<1x1x1xf32>","[1,1,1]"}}) {
+    auto a=spec[0].str(), b=spec[1].str();
+    auto m=parseSourceString<ModuleOp>("module {func.func @view() { %a=arith.constant dense<1.0> : "+a+
+        " %e=tensor.expand_shape %a [[0,1,2]] output_shape "+spec[2].str()+" : "+a+" into "+b+
+        " %c=tensor.collapse_shape %e [[0,1,2]] : "+b+" into "+a+" return }}",&context);
+    ASSERT_TRUE(m); ASSERT_TRUE(succeeded(infer(*m)));
+    m->walk([&](Operation *op) {
+      if (!isa<tensor::ExpandShapeOp,tensor::CollapseShapeOp>(op)) return;
+      auto src=cast<RankedTensorType>(op->getOperand(0).getType());
+      auto dst=cast<RankedTensorType>(op->getResult(0).getType());
+      ExecutionEnumeration x,y;
+      ASSERT_EQ(enumerateExecutionLayout(cast<DistributedEncodingAttr>(src.getEncoding()),src,x).status,ProofStatus::Proven);
+      ASSERT_EQ(enumerateExecutionLayout(cast<DistributedEncodingAttr>(dst.getEncoding()),dst,y).status,ProofStatus::Proven);
+      EXPECT_EQ(x.topology,y.topology);
+      EXPECT_EQ(x.logical,y.logical); // independently flattened element identity
+    });
+    target.generations=0;
+    ASSERT_TRUE(succeeded(verifyMaterializedLayouts(*m,target))); EXPECT_EQ(target.generations,0u);
+    tensor::ExpandShapeOp expand; m->walk([&](tensor::ExpandShapeOp op){expand=op;});
+    auto type=cast<RankedTensorType>(expand.getResult().getType());
+    auto encoding=cast<DistributedEncodingAttr>(type.getEncoding());
+    Builder builder(&context);
+    auto broken=DistributedEncodingAttr::get(&context,encoding.getMap(),encoding.getTopology(),
+        builder.getI64IntegerAttr(encoding.getReplication().getInt()*2));
+    expand.getResult().setType(RankedTensorType::get(type.getShape(),type.getElementType(),broken));
+    ScopedDiagnosticHandler quiet(&context,[](Diagnostic&){return success();});
+    EXPECT_TRUE(failed(verifyMaterializedLayouts(*m,target))); EXPECT_EQ(target.generations,0u);
   }
 }
 } // namespace

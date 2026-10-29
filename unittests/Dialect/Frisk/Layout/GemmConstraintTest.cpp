@@ -120,6 +120,8 @@ TEST_F(GemmMathTest, JointProofNamesFailingInstructionRole) {
     roles.push_back(graph.addVariable(index==1?LayoutKind::Storage:LayoutKind::Distributed,type,(Twine("role")+Twine(index)).str(),mma));
     graph.getVariable(roles.back()).requiredThreads=128;
   }
+  roles.push_back(graph.addVariable(LayoutKind::Instruction,mma.getResult().getType(),"geometry",mma));
+  graph.getVariable(roles.back()).requiredThreads=128;
   LayoutConstraint c;c.vars=roles;c.instruction=InstructionLayoutContract{};c.instruction->source=mma;
   auto descriptor=MmaDescriptorPlanAttr::get(&context,b.getDictionaryAttr({
     b.getNamedAttr("major",b.getStringAttr("mn")),b.getNamedAttr("swizzle",b.getI64IntegerAttr(0)),
@@ -131,7 +133,9 @@ TEST_F(GemmMathTest, JointProofNamesFailingInstructionRole) {
     b.getNamedAttr("accumulator_type",TypeAttr::get(b.getF32Type())),b.getNamedAttr("atom",b.getDenseI64ArrayAttr({64,128,16})),
     b.getNamedAttr("grid",b.getDenseI64ArrayAttr({1,1})),b.getNamedAttr("repeats",b.getDenseI64ArrayAttr({2,1,4})),
     b.getNamedAttr("packing",b.getStringAttr("f16x2-low-high")),b.getNamedAttr("b_descriptor",descriptor)}));
-  SmallVector<Attribute> encodings(4);
+  SmallVector<Attribute> encodings(5);
+  auto geometry=getSM90MmaGeometry(mma,128);ASSERT_TRUE(succeeded(geometry));
+  encodings[4]=encodeSM90MmaGeometry(&context,*geometry);
   EXPECT_NE(verifySM90MmaContract(graph,c,encodings,binding).reason.find("init"),std::string::npos);
   auto g=getSM90MmaGeometry(mma,128);ASSERT_TRUE(succeeded(g));
   auto accum=buildSM90MmaFragment(&context,*g,false,false);ASSERT_TRUE(succeeded(accum));

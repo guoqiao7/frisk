@@ -1,6 +1,18 @@
 # Frisk SM90 MLIR-native 布局推断系统设计
 
-> P0 方案 A（2026-10-14，方案已确认、详细契约待审阅）：基线已提交为 `219c0cf`。下一增量依次补强固定外部行主序 Attention、可选有界决策 trace、原预算内的 beam 解单变量邻域改进。接口、预算、失败语义与验收见 [P0 设计](optimize_plan/p0_implementation_design.md)。尚未实现，不改变历史完成状态；不扩展 GPU lowering、自动分块或成本模型。
+> 2026-10-29：P1.3c已完成验收，完整源码、驱动、数据与文档独立复审通过。默认legacy保留；显式`boundary-frequency=static-trip-count`统一转换/clone与受限外提的频率口径。Release主单测570、选择质量20，相关Debug/lit及辅助守门通过；18次语义核验与36次串行CPU调用通过，身份复验不变。下一独立任务为最小形状支持，GPU和跨框架比较尚未实施。见[阶段报告](inference_detail/p1_3c_implementation_report.md)。
+
+> 2026-10-28：P1.3b已完成验收，最终独立复审通过。 规范ranked-Tensor Broadcast按原子SSA边界统计，非规范region仍unavailable；两类完整Attention均available，每线程峰值106逻辑槽/424字节，Shared活跃峰值/声明容量均6144字节。最终Debug定向50、全Release549（65 suites）、lit Debug5/Release8、CTest4及Python守门通过。15语义核验与36串行CPU观测通过，IR/完整成本/非计时求解统计/旧arith诊断不变，身份复验未变化。不涉及P1.3c/GPU或物理寄存器/occupancy，不自动提交/推送。 见[完整Attention资源报告](inference_detail/p1_3b_attention_resource_report.md)。
+
+> 历史检查点（P1.3a，2026-10-26，已验收；后续P1.3b进展见2026-10-28记录）：完整模型ID与JSON格式版本分离，九项代理的单位/未覆盖范围明确；默认关闭的实际IR算术诊断在最终验证后收集，与可加成本及布局选择分离。524项不同Debug测试的分阶段覆盖、70 lit及最终修复定向测试通过，12次基线/开关/重放核验与36次串行观测保持IR/成本不变。JSON结果独立持有动态字符串，不借用已销毁的报告或MLIR上下文。见[报告](inference_detail/p1_3a_implementation_report.md)。资源存活峰值、静态循环频率仍分别属于后续P1.3b/c。
+
+> P1.2（2026-10-24，已完成）：按获批契约实现 Copy→MMA 三路径固定 ABI 集成及详细证明诊断、调用级可关闭 profile，以及 Auto MMA 的第五 geometry 角色和有界联合选择。成本从实际绑定读取；旧 policy/显式布局保持，预算不足仍为 Unknown。505 unit / 69 lit 与辅助守门通过，独立源码复审通过；54 次 CPU 采样调用＋9 次 trace 核对保持 legacy IR/成本及 profile 开关等价。详见 [实施报告](optimize_plan/p1_2_implementation_report.md)与[执行计划](optimize_plan/p1_2_execution_plan.md)。保留 P0/P1.1 未提交修改；不宣称 GPU 加速，P1.3/P1.4 本轮未实施。下方提案状态为确认前历史记录。
+
+> 历史提案（P1.2–P1.4，2026-10-24，确认前审计；后续批准与实施见最新记录）：按用户选择的方案 A，已核对剩余 O04–O11。拟分为有限 MMA grid/Copy 集成与观测、模型/存活资源诊断与循环频率、单位轴与完整 Attention GPU 执行。具体契约及未纳入目标见[阶段设计提案](optimize_plan/p1_2_to_p1_4_design_proposal.md)。本轮仅文档修改，没有新生产实现、测试或 GPU 验收；不覆盖下述既有实现边界。
+
+> P1.1（2026-10-21，已完成）：以已有 GF(2) 代数证明静态 bit-linear ownership 与 Broadcast 同线程可取关系，保留具体地址表的 65536 点枚举限制及既有形状/成本/搜索预算。465 unit、64 lit 及辅助守门、独立复审通过；部分超界关系可证明，局部证明开销降低，两类 Attention 全链时间基本持平、IR/stats/trace 不变。详见 [设计](optimize_plan/p1_1_implementation_design.md)与[实施报告](optimize_plan/p1_1_implementation_report.md)。未宣称 GPU 性能收益，P1.2–P1.4 未实施。
+
+> P0 方案 A（2026-10-14，已完成实现与验收）：基线提交 `219c0cf`。完成固定外部行主序 Attention 验收、有界决策 trace、原预算内 beam 解单变量改进及饱和全局不退化保护。450 unit、64 lit、7 Debug CTest、1 Release generator CTest、Python/API/tool 检查及独立源码复审通过；8 组开关配置各 5 次串行测量通过。自由布局 Attention 成本从 `[8293,608,64,0,428,6144,6,0,0]` 降为 `[8293,544,0,0,428,6144,6,0,0]`，CPU 推断中位时间约增加 25%。接口见 [P0 设计](optimize_plan/p0_implementation_design.md)，证据与命令见 [实施报告](optimize_plan/p0_implementation_report.md)。不扩展 GPU lowering、自动分块或成本模型；改动尚未提交/推送。
 
 > 后续方案 A（2026-10-10，已实现并通过回归）：修复 Global 根身份/SSA 作用域混用及 packed 零输出位宽拒绝，新增受限 Tensor broadcast，完成单 tile Attention 布局推断。417 unit、61 lit、7 Debug CTest、1 Release generator CTest、5 Python normalization 及 API/tool 检查全部通过；逐任务及整体源码复审通过。契约如下；这不代表任意算子或完整 Attention lowering 已支持。
 

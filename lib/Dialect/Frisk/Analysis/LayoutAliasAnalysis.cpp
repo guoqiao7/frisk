@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Analysis/LayoutAliasAnalysis.h"
+#include "Dialect/Frisk/Analysis/LayoutProfile.h"
 #include "Dialect/Frisk/IR/FriskAttributes.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -282,6 +283,7 @@ LayoutProof proof(ProofStatus status, const Twine &reason,
 
 LayoutProof indexCandidate(const StorageAliasInfo &info, StorageLayoutAttr candidate,
                             SmallVectorImpl<PointAddress> &index) {
+  LayoutProfile::Scope profile(LayoutProfileKind::AddressEnumeration);
   auto unknown = [&](const Twine &why) { return proof(ProofStatus::Unknown, why); };
   if (!info.root || !info.rootType || !info.viewType || !info.viewToRoot || !candidate)
     return unknown("missing static storage alias descriptor");

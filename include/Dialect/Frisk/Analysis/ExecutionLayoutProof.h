@@ -28,7 +28,9 @@ struct ExecutionEnumeration {
 };
 LayoutProof enumerateExecutionLayout(DistributedEncodingAttr execution,
     RankedTensorType logicalType, ExecutionEnumeration &out);
-/// Pure bounded proof (65536 hardware/logical points). Ownership failures name
+/// Symbolic bit-linear ownership proof (256 hardware/logical bits); does not
+/// construct an enumeration table or lift vector/storage enumeration budgets.
+/// Ownership failures name
 /// logical coordinates; duplicate/vector hardware counterexamples use canonical
 /// (cta, warp_group, warp, lane, register) order, independent of map input order.
 LayoutProof proveExecutionOwnership(DistributedEncodingAttr execution,

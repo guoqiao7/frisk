@@ -20,7 +20,7 @@ struct RelaxationRecord {
 FailureOr<LayoutSolution> attemptControlledRelaxation(
     LayoutConstraintGraph &graph, LayoutTarget &target, SolverOptions options,
     SmallVectorImpl<RelaxationRecord> &records, LayoutSolveFailure *why = nullptr,
-    LayoutStatisticsReport *statistics = nullptr);
+    LayoutStatisticsReport *statistics = nullptr, LayoutTrace *trace = nullptr);
 void printRelaxationRecords(ArrayRef<RelaxationRecord> records, raw_ostream &os);
 } // namespace mlir::frisk
 #endif

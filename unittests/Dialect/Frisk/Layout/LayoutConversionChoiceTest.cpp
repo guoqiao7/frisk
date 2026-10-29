@@ -1,6 +1,10 @@
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
 #include "Dialect/Frisk/Analysis/LayoutConversionChoice.h"
 #include "Dialect/Frisk/Analysis/LayoutCostModel.h"
+#include "Dialect/Frisk/Analysis/LayoutIRDiagnostics.h"
+#include "Dialect/Frisk/Analysis/LayoutStatistics.h"
+#include "Dialect/Frisk/Transforms/Passes.h"
+#include "mlir/Pass/PassManager.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
 #include "Dialect/Frisk/Target/SM90/SM90LayoutTarget.h"
@@ -10,6 +14,7 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "gtest/gtest.h"
+#include "LayoutCostObserverTestSupport.h"
 
 using namespace mlir;
 using namespace mlir::frisk;
@@ -66,6 +71,41 @@ TEST_F(LayoutConversionChoiceTest, SameBlockConsumersShareOneConversion) {
   module->walk([&](ConvertLayoutOp) { ++count; });
   EXPECT_EQ(count, 1u);
   module->walk([&](arith::AddFOp add) { EXPECT_EQ(add.getLhs(), add.getRhs()); });
+}
+TEST_F(LayoutConversionChoiceTest, ObservedSharedConversionAndRematerializationChargeOnlyLeader) {
+  for (bool constant : {false, true}) {
+    auto module = parseSourceString<ModuleOp>(constant ? R"mlir(
+      func.func @shared() -> tensor<64xf32> {
+        %x = arith.constant dense<3.0> : tensor<64xf32>
+        %sum = arith.addf %x, %x : tensor<64xf32>
+        return %sum : tensor<64xf32>
+      })mlir" : R"mlir(
+      func.func @shared(%x: tensor<64xf32>) -> tensor<64xf32> {
+        %sum = arith.addf %x, %x : tensor<64xf32>
+        return %sum : tensor<64xf32>
+      })mlir", &context);
+    ASSERT_TRUE(module);
+    auto graph = collectLayoutConstraints(*module, *target);
+    ASSERT_TRUE(succeeded(graph));
+    fix(*graph, [](const LayoutVar &v) {
+      return v.value && (isa<BlockArgument>(v.value) || v.value.getDefiningOp<arith::ConstantOp>());
+    });
+    CandidateAssignment assignment;
+    for (const auto &var : graph->getVariables()) assignment.values[var.id] = var.candidates[0].value;
+    auto plain = chooseLayoutConversions(*graph, assignment, *target);
+    TestCostObserver observer;
+    auto observed = chooseLayoutConversions(*graph, assignment, *target, &observer);
+    ASSERT_TRUE(succeeded(plain));
+    ASSERT_TRUE(succeeded(observed));
+    EXPECT_EQ(plain->cost.cost, observed->cost.cost);
+    EXPECT_EQ(plain->cost.saturated, observed->cost.saturated);
+    ASSERT_EQ(observed->edges.size(), 2u);
+    EXPECT_TRUE(llvm::equal(plain->edges, observed->edges, sameLayoutConversionPlan));
+    ASSERT_EQ(observer.parts.size(), 1u);
+    EXPECT_EQ(observer.parts[0].owner, observed->edges[0].sharedLeader);
+    EXPECT_EQ(observer.parts[0].kind, constant ? "rematerialization" : "conversion");
+    observer.expectSum(observed->cost);
+  }
 }
 
 TEST_F(LayoutConversionChoiceTest, CheapConstantRematerializesAtConsumer) {
@@ -230,6 +270,148 @@ TEST_F(LayoutConversionChoiceTest, ArithmeticCloneReusesTargetLayoutLeaves) {
   ASSERT_TRUE(clone);
   EXPECT_EQ(clone.getLhs(), func.getArgument(0));
   EXPECT_EQ(clone.getRhs(), func.getArgument(0));
+  // The optimizer deletes the unused original: diagnostics must not retain its
+  // planned arithmetic count, nor multiply the surviving clone by its uses.
+  PassManager optimize(&context);
+  optimize.addPass(createOptimizeLayoutConversionsPass());
+  ASSERT_TRUE(succeeded(optimize.run(*module)));
+  unsigned actualAdds = 0;
+  module->walk([&](arith::AddFOp op) {
+    ++actualAdds;
+    EXPECT_EQ(cast<RankedTensorType>(op.getType()).getShape(), ArrayRef<int64_t>({64}));
+  });
+  EXPECT_EQ(actualAdds, 1u);
+  auto diagnostics = collectLayoutIRArithmetic(*module);
+  auto *entries = diagnostics.getArray("entries");
+  ASSERT_EQ(entries->size(), 1u);
+  EXPECT_EQ((*entries)[0].getAsObject()->getInteger("op_count"), actualAdds);
+  EXPECT_EQ((*entries)[0].getAsObject()->getInteger("element_ops"), 64);
+}
+
+TEST_F(LayoutConversionChoiceTest, ActualIRDiagnosticsCountsRetainedCloneAndSharedConversion) {
+  for (bool cloneExpected : {false, true}) {
+    auto module = parseSourceString<ModuleOp>(R"mlir(
+      func.func @actual(%x: tensor<64xf32>) -> (tensor<64xf32>, tensor<64xf32>) {
+        %s = arith.addf %x, %x : tensor<64xf32>
+        return %s, %s : tensor<64xf32>, tensor<64xf32>
+      })mlir", &context);
+    ASSERT_TRUE(module);
+    unsigned beforeAdds = 0;
+    module->walk([&](arith::AddFOp) { ++beforeAdds; });
+    ASSERT_EQ(beforeAdds, 1u);
+    auto graph = collectLayoutConstraints(*module, *target);
+    ASSERT_TRUE(succeeded(graph));
+    if (cloneExpected) {
+      auto normal = encoding();
+      auto replicated = DistributedEncodingAttr::get(&context, normal.getMap(),
+          b.getDenseI64ArrayAttr({2,32,8,1,1}), b.getI64IntegerAttr(8));
+      for (auto &v : graph->getVariables()) {
+        auto layout = v.functionResult && *v.functionResult == 1 ? encoding(true) :
+            v.value && isa<BlockArgument>(v.value) ? normal : replicated;
+        v.candidates = {{layout, kInvalidProvenanceID, 0}};
+      }
+    } else {
+      fix(*graph, [](const LayoutVar &v) { return v.value && isa<BlockArgument>(v.value); });
+    }
+    auto solution = solveLayoutGraph(*graph, *target);
+    ASSERT_TRUE(succeeded(solution));
+    ASSERT_TRUE(succeeded(materializeLayouts(*module, *graph, *solution)));
+    PassManager optimize(&context);
+    optimize.addPass(createOptimizeLayoutConversionsPass());
+    ASSERT_TRUE(succeeded(optimize.run(*module)));
+    unsigned adds = 0, conversions = 0;
+    uint64_t elements = 0;
+    module->walk([&](arith::AddFOp op) {
+      ++adds;
+      auto type = cast<RankedTensorType>(op.getType());
+      ASSERT_EQ(type.getShape(), ArrayRef<int64_t>({64}));
+      elements += 64; // Independent logical shape count, not plan/carrier size.
+    });
+    bool shared = false;
+    module->walk([&](ConvertLayoutOp op) { ++conversions; shared |= !op.getResult().hasOneUse(); });
+    EXPECT_EQ(adds, cloneExpected ? 2u : 1u);
+    auto function = *module->getOps<func::FuncOp>().begin();
+    auto ret = cast<func::ReturnOp>(function.front().getTerminator());
+    auto first = ret.getOperand(0).getDefiningOp<arith::AddFOp>();
+    auto second = ret.getOperand(1).getDefiningOp<arith::AddFOp>();
+    ASSERT_TRUE(first); ASSERT_TRUE(second);
+    EXPECT_EQ(first != second, cloneExpected);
+    EXPECT_EQ(conversions, cloneExpected ? 2u : 1u);
+    EXPECT_TRUE(shared);
+    auto diagnostics = collectLayoutIRArithmetic(*module);
+    auto *entries = diagnostics.getArray("entries");
+    ASSERT_EQ(entries->size(), 1u); // ConvertLayout is not arithmetic.
+    EXPECT_EQ((*entries)[0].getAsObject()->getInteger("op_count"), adds);
+    EXPECT_EQ((*entries)[0].getAsObject()->getInteger("element_ops"), elements);
+    auto resources = collectLayoutIRResources(*module);
+    EXPECT_EQ(resources.getString("status"), "available");
+    auto *scopes = resources.getArray("scopes");
+    ASSERT_TRUE(scopes);
+    ASSERT_EQ(scopes->size(), 1u);
+    auto *scope = scopes->front().getAsObject();
+    auto *values = scope->getArray("tensor_values");
+    ASSERT_TRUE(values);
+    // Independent oracle: inspect the final block's real definitions and uses,
+    // never the conversion plan, graph variables, or collector intervals.
+    Block &body = function.front();
+    DenseMap<Operation *, uint64_t> positions;
+    uint64_t position = 0;
+    for (Operation &op : body) positions[&op] = ++position;
+    SmallVector<Value> actualValues;
+    for (BlockArgument argument : body.getArguments())
+      if (isa<RankedTensorType>(argument.getType()) && !argument.use_empty())
+        actualValues.push_back(argument);
+    for (Operation &op : body)
+      for (Value result : op.getResults())
+        if (isa<RankedTensorType>(result.getType())) actualValues.push_back(result);
+    ASSERT_EQ(values->size(), actualValues.size());
+    for (auto [id, value] : llvm::enumerate(actualValues)) {
+      auto *entry = (*values)[id].getAsObject();
+      auto type = cast<RankedTensorType>(value.getType());
+      auto layout = cast<DistributedEncodingAttr>(type.getEncoding());
+      uint64_t definition = isa<BlockArgument>(value) ? 0 : positions.lookup(value.getDefiningOp());
+      uint64_t lastUse = definition;
+      for (OpOperand &use : value.getUses())
+        lastUse = std::max(lastUse, positions.lookup(use.getOwner()));
+      EXPECT_EQ(entry->getInteger("id"), id);
+      EXPECT_EQ(entry->getInteger("begin"), definition);
+      EXPECT_EQ(entry->getInteger("end"), lastUse);
+      EXPECT_EQ(entry->getBoolean("live_in"), isa<BlockArgument>(value));
+      EXPECT_EQ(entry->getInteger("slots_per_thread"), layout.getTopology()[0]);
+      EXPECT_EQ(entry->getInteger("bytes_per_thread"), layout.getTopology()[0] * 4);
+    }
+    uint64_t peakSlots = 0, peakBytes = 0, peakAt = 0;
+    for (uint64_t boundary = 0; boundary <= position; ++boundary) {
+      uint64_t slots = 0, bytes = 0;
+      for (Value value : actualValues) {
+        auto *definition = value.getDefiningOp();
+        uint64_t definedAt = definition ? positions.lookup(definition) : 0;
+        if (definedAt > boundary) continue;
+        bool live = definition && definedAt == boundary;
+        for (OpOperand &use : value.getUses())
+          live |= positions.lookup(use.getOwner()) >= boundary;
+        if (!live) continue;
+        auto type = cast<RankedTensorType>(value.getType());
+        uint64_t carriers = cast<DistributedEncodingAttr>(type.getEncoding()).getTopology()[0];
+        slots += carriers;
+        bytes += carriers * 4; // All actual SSA values in this fixture are f32.
+      }
+      if (slots > peakSlots) { peakSlots = slots; peakAt = boundary; }
+      peakBytes = std::max(peakBytes, bytes);
+    }
+    EXPECT_EQ(scope->getInteger("logical_live_carrier_slots_per_thread"), peakSlots);
+    EXPECT_EQ(scope->getInteger("logical_live_carrier_bytes_per_thread"), peakBytes);
+    EXPECT_EQ(scope->getInteger("peak_slots_at"), peakAt);
+    EXPECT_EQ(scope->getInteger("logical_live_shared_root_bytes"), 0);
+    EXPECT_EQ(scope->getInteger("declared_shared_root_bytes"), 0);
+    auto before = print(*module);
+    PassManager replay(&context);
+    replay.addPass(createOptimizeLayoutConversionsPass());
+    ASSERT_TRUE(succeeded(replay.run(*module)));
+    EXPECT_EQ(print(*module), before);
+    EXPECT_EQ(llvm::json::Value(collectLayoutIRArithmetic(*module)), llvm::json::Value(std::move(diagnostics)));
+    EXPECT_EQ(llvm::json::Value(collectLayoutIRResources(*module)), llvm::json::Value(std::move(resources)));
+  }
 }
 
 TEST_F(LayoutConversionChoiceTest, LeafConversionsMakeCloneMoreExpensive) {
@@ -603,5 +785,79 @@ TEST_F(LayoutConversionChoiceTest, LoopClonesStayInsideAndOuterProducerIsNotClon
     EXPECT_EQ(constants, 2u); // inner original + inner clone; not outer clone.
     EXPECT_EQ(conversions, 1u);
   });
+}
+TEST_F(LayoutConversionChoiceTest, BothModesFiniteOracleBoundsRefinementAndPlanIdentity) {
+  for (auto mode : {LayoutBoundaryFrequencyMode::Legacy, LayoutBoundaryFrequencyMode::StaticTripCount}) {
+    auto model = createSM90LayoutTarget(mode);
+    auto module = parseSourceString<ModuleOp>(R"mlir(
+      func.func @loop(%x: tensor<64xf32>) {
+        %zero = arith.constant 0 : index
+        %one = arith.constant 1 : index
+        %hundred = arith.constant 100 : index
+        scf.for %i = %zero to %hundred step %one {
+          %sum = arith.addf %x, %x : tensor<64xf32>
+        }
+        return
+      }
+    )mlir", &context);
+    ASSERT_TRUE(module);
+    arith::AddFOp use;
+    module->walk([&](arith::AddFOp op) { use = op; });
+    ASSERT_TRUE(use);
+    auto a = encoding(), z = encoding(true);
+    LayoutConstraintGraph graph;
+    auto p = graph.addVariable(LayoutKind::Distributed, use.getType(), "producer");
+    graph.getVariable(p).value = use.getLhs();
+    graph.getVariable(p).candidates = {{a}, {z}};
+    for (unsigned i = 0; i < 2; ++i) {
+      auto u = graph.addVariable(LayoutKind::Distributed, use.getType(), "use" + std::to_string(i));
+      graph.getVariable(u).use = &use->getOpOperand(i);
+      graph.getVariable(u).candidates = {{z}};
+      auto c = graph.addConstraint(ConstraintKind::Convertible, ConstraintStrength::Hard,
+                                  {p,u}, use, "boundary", "finite oracle");
+      graph.getConstraints()[c].use = &use->getOpOperand(i);
+      graph.getConstraints()[c].stableUseKey = "use/" + std::to_string(i);
+    }
+    for (auto source : {a,z}) {
+      CandidateAssignment full; full.values[p] = source;
+      full.values[1] = z; full.values[2] = z;
+      auto base = model->evaluate(graph, full);
+      auto boundary = chooseLayoutConversions(graph, full, *model);
+      ASSERT_TRUE(succeeded(base)); ASSERT_TRUE(succeeded(boundary));
+      // Independent finite oracle: two same-block consumers share one shuffle.
+      EXPECT_EQ(boundary->cost.cost.conversionBytesAndSync,
+          source == z ? 0u : 512u * (mode == LayoutBoundaryFrequencyMode::Legacy ? 2u : 100u));
+      EXPECT_EQ(boundary->cost.cost.codeSize, source == z ? 0u : 1u);
+      auto complete = addLayoutCosts(*base, boundary->cost);
+      for (unsigned mask = 0; mask < 8; ++mask) {
+        CandidateAssignment partial;
+        for (unsigned j = 0; j < 3; ++j) if (mask & (1u << j)) partial.values[j] = full.values.lookup(j);
+        auto bound = model->lowerBound(graph, partial);
+        ASSERT_TRUE(succeeded(bound)); EXPECT_FALSE(complete.cost < bound->cost);
+      }
+    }
+    auto exact = solveLayoutGraph(graph, *model);
+    auto plain = solveLayoutGraph(graph, *model, {1,1,65536,false,256});
+    auto refined = solveLayoutGraph(graph, *model, {1,1,65536,true,256});
+    ASSERT_TRUE(succeeded(exact)); ASSERT_TRUE(succeeded(plain)); ASSERT_TRUE(succeeded(refined));
+    EXPECT_EQ(exact->cost.cost.conversionBytesAndSync, 0u);
+    EXPECT_FALSE(refined->cost.cost < exact->cost.cost);
+    EXPECT_FALSE(plain->cost.cost < refined->cost.cost);
+    graph.getVariable(p).candidates = {{a}};
+    auto forced = solveLayoutGraph(graph, *model);
+    ASSERT_TRUE(succeeded(forced)); ASSERT_EQ(forced->conversions.size(), 2u);
+    LayoutAttemptStatistics statistics;
+    finishLayoutStatistics(graph, {}, &*forced, statistics);
+    EXPECT_EQ(statistics.statistics.conversionBytes, 512u);
+    EXPECT_EQ(statistics.statistics.weightedConversionBytes,
+        mode == LayoutBoundaryFrequencyMode::Legacy ? 1024u : 51200u);
+    EXPECT_EQ(statistics.statistics.uniqueConversions, 1u);
+    auto other = createSM90LayoutTarget(mode == LayoutBoundaryFrequencyMode::Legacy ?
+        LayoutBoundaryFrequencyMode::StaticTripCount : LayoutBoundaryFrequencyMode::Legacy);
+    ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
+    EXPECT_TRUE(failed(verifyLayoutConversionChoices(graph, *forced, *other, b.getUnknownLoc())));
+    auto forged = *forced; forged.conversions[0].frequencyUsesProxy = !forged.conversions[0].frequencyUsesProxy;
+    EXPECT_TRUE(failed(verifyLayoutConversionChoices(graph, forged, *model, b.getUnknownLoc())));
+  }
 }
 } // namespace

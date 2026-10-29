@@ -155,7 +155,7 @@ TEST_F(BroadcastLayoutTest, ShapeAndAxisValidation) {
   EXPECT_FALSE(validBroadcastTypes(src, dst, {1, 1}));
   EXPECT_FALSE(validBroadcastTypes(src, RankedTensorType::get({2, 4, 8}, f), {2, 0}));
   EXPECT_FALSE(validBroadcastTypes(RankedTensorType::get({}, f), dst, {0, 1}));
-  EXPECT_FALSE(validBroadcastTypes(src, RankedTensorType::get({4, 1}, f), {1}));
+  EXPECT_TRUE(validBroadcastTypes(src, RankedTensorType::get({4, 1}, f), {1}));
   EXPECT_FALSE(validBroadcastTypes(src, RankedTensorType::get({4, 3}, f), {1}));
   EXPECT_FALSE(validBroadcastTypes(src, RankedTensorType::get({4, ShapedType::kDynamic}, f), {1}));
   EXPECT_FALSE(validBroadcastTypes(src, RankedTensorType::get({4, 8}, Float16Type::get(&context)), {1}));
@@ -315,6 +315,25 @@ TEST_F(BroadcastLayoutTest, StableSoftmaxRealLoadStoreAndThreadInheritance) {
     auto once = print(*m); ASSERT_TRUE(succeeded(infer(*m))); EXPECT_EQ(once, print(*m));
     auto reparsed = parseSourceString<ModuleOp>(once, &context); ASSERT_TRUE(reparsed);
     ASSERT_TRUE(succeeded(infer(*reparsed))); EXPECT_EQ(once, print(*reparsed));
+  }
+}
+} // namespace
+
+namespace {
+TEST_F(BroadcastLayoutTest, UnitAxesInferenceReplayAndActualOnly) {
+  for (auto spec : {std::array<StringRef,3>{"tensor<1xf32>","tensor<1x8xf32>","1"},
+      {"tensor<8xf32>","tensor<8x1xf32>","1"},
+      {"tensor<1xf32>","tensor<1x1xf32>","0"},
+      {"tensor<8xf32>","tensor<1x8x1xf32>","0,2"}}) {
+    auto m=simple(spec[0],spec[1],spec[2]); ASSERT_TRUE(m);
+    ASSERT_TRUE(succeeded(infer(*m)));
+    m->walk([&](linalg::BroadcastOp op){EXPECT_TRUE(coordinates(op));});
+    BroadcastObservedTarget observed;
+    EXPECT_TRUE(succeeded(verifyMaterializedLayouts(*m,observed)));
+    EXPECT_EQ(observed.generations,0u);
+    auto once=print(*m); ASSERT_TRUE(succeeded(infer(*m))); EXPECT_EQ(once,print(*m));
+    auto parsed=parseSourceString<ModuleOp>(once,&context); ASSERT_TRUE(parsed);
+    ASSERT_TRUE(succeeded(infer(*parsed))); EXPECT_EQ(once,print(*parsed));
   }
 }
 } // namespace

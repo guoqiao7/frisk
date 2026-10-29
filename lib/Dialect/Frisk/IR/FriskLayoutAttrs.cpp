@@ -39,8 +39,8 @@ LogicalResult ReductionContractAttr::verify(
       !llvm::isPowerOf2_64(threads.getInt()))
     return emitError() << "reduction contract has invalid axis, rank or threads";
   SmallVector<int64_t> shape(src.asArrayRef());
-  if (llvm::any_of(shape, [](int64_t e) { return e <= 1 || !llvm::isPowerOf2_64(e); }))
-    return emitError() << "reduction contract requires static power-of-two extents greater than one";
+  if (llvm::any_of(shape, [](int64_t e) { return e <= 0 || !llvm::isPowerOf2_64(e); }))
+    return emitError() << "reduction contract requires static positive power-of-two extents";
   shape.erase(shape.begin()+axis.getInt());
   if (dst.asArrayRef() != ArrayRef<int64_t>(shape))
     return emitError() << "reduction contract result shape must delete axis";
@@ -367,6 +367,9 @@ FailureOr<GF2Matrix> BitLinearLayoutMapAttr::getMatrixValue() const {
   auto matrixType = cast<RankedTensorType>(getMatrix().getType());
   unsigned rowCount = matrixType.getDimSize(0);
   unsigned columnCount = matrixType.getDimSize(1);
+  // Empty maps have no nonempty GF2 representation. Reject before forming
+  // zero-width APInts or entering the nonempty-dimension matrix factory.
+  if (!rowCount || !columnCount) return failure();
   SmallVector<llvm::APInt> rows(rowCount, llvm::APInt(columnCount, 0));
   unsigned index = 0;
   for (const llvm::APInt &value : getMatrix().getValues<llvm::APInt>()) {

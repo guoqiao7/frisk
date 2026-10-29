@@ -8,6 +8,11 @@ add_test(NAME FriskLayoutBenchmarkRunnerTest
   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/test/python/layout_benchmark_runner_test.py)
 add_test(NAME FriskLayoutConversionCompilerTest
   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/test/python/layout_conversion_compiler_test.py)
+add_test(NAME FriskLayoutSelectionQualityRunnerTest
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/test/python/layout_selection_quality_test.py)
+set_tests_properties(FriskLayoutSelectionQualityRunnerTest PROPERTIES
+  ENVIRONMENT "FRISK_SELECTION_BENCH=${PROJECT_BINARY_DIR}/benchmark/layout/selection/frisk_layout_selection_bench"
+  TIMEOUT 240 LABELS "layout;selection;python;integration")
 
 configure_lit_site_cfg(
   ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in

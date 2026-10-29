@@ -84,7 +84,12 @@ TEST_F(ExecutionLayoutProofTest, MalformedTopologyAndBudget) {
   auto bad = encoding({"register"}, {2}, {8,1,1,1,1}, {1,2});
   EXPECT_EQ(proveExecutionOwnership(bad, type(), "all").status, ProofStatus::Disproven);
   auto large = encoding({"register"}, {2}, {4,32,1024,1,1}, {1,2}, 2, 32768);
-  EXPECT_EQ(proveExecutionOwnership(large, type(), "first_owner").status, ProofStatus::Unknown);
+  EXPECT_EQ(proveExecutionOwnership(large, type(), "first_owner").status, ProofStatus::Proven);
+  ExecutionEnumeration points;
+  EXPECT_EQ(enumerateExecutionLayout(large, type(), points).status, ProofStatus::Unknown);
+  EXPECT_EQ(proveExecutionOwnership(large, type(), "all").status, ProofStatus::Disproven);
+  EXPECT_EQ(vector(large, 1, 32, 0, 16, AccessKind::Read, "first_owner").status,
+            ProofStatus::Unknown);
 }
 TEST_F(ExecutionLayoutProofTest, RegisterVectorsAndIllegalWidth) {
   auto d = encoding({"register"}, {2}, {4,1,1,1,1}, {1,2});

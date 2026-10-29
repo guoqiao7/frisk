@@ -1,6 +1,22 @@
 # Triton、TileLang 与 Frisk 布局推断对比及 Frisk 架构决策
 
-> P0 增量方案 A（2026-10-14）：代码基线已提交为 `219c0cf`；[具体设计](optimize_plan/p0_implementation_design.md)待审阅，尚未实现。计划以固定外部 ABI、可复核 trace 和原预算内单变量邻域改进增强现有系统；局部改善不等于全局最优，较低 CostVector 不等于 GPU 更快。不刷新 TileLang/Triton 快照，也不声称它们缺少类似机制；待实现后记录同候选域、同成本模型及预算下的实际收益与开销。
+> 2026-10-29：P1.3c已完成验收，完整源码、驱动、数据与文档独立复审通过。默认legacy保留；显式`boundary-frequency=static-trip-count`统一转换/clone与受限外提的频率口径。Release主单测570、选择质量20，相关Debug/lit及辅助守门通过；18次语义核验与36次串行CPU调用通过，身份复验不变。下一独立任务为最小形状支持，GPU和跨框架比较尚未实施。见[阶段报告](inference_detail/p1_3c_implementation_report.md)。
+
+> 2026-10-28：P1.3b已完成验收，最终独立复审通过。 规范ranked-Tensor Broadcast按原子SSA边界统计，非规范region仍unavailable；两类完整Attention均available，每线程峰值106逻辑槽/424字节，Shared活跃峰值/声明容量均6144字节。最终Debug定向50、全Release549（65 suites）、lit Debug5/Release8、CTest4及Python守门通过。15语义核验与36串行CPU观测通过，IR/完整成本/非计时求解统计/旧arith诊断不变，身份复验未变化。不涉及P1.3c/GPU或物理寄存器/occupancy，不自动提交/推送。 见[完整Attention资源报告](inference_detail/p1_3b_attention_resource_report.md)。
+
+> 历史检查点（P1.3b，2026-10-27，已由2026-10-28结果取代）：纯资源分析器与通用pipeline接入已通过独立复审，按真实SSA存活区间统计逻辑carrier峰值，Shared别名按root合并并区分声明容量/逻辑活跃字节；不改变可加成本目标，不代表物理寄存器或occupancy。Debug/Release定向各87项、lit各4项及全Release545项通过。两类Attention仍成功推断且IR不变，但完整资源验收尚未完成（Broadcast隐式region特例待确认）。未刷新上游比较快照或GPU数据，不能据此声称跨框架性能优势。见[阶段报告](inference_detail/p1_3b_implementation_report.md)。
+
+> P1.3a（2026-10-26，已验收，最终独立复审通过）：新增完整模型身份 `sm90-layout-lex9-legacy-v1`、九项单位/覆盖说明，以及实际优化IR按opcode/结果dtype计数的默认关闭诊断。两类Attention的Mul/Sub/Exp/Div/Trunc各4096 element-op；旧基线和开关对照保持IR/完整成本/非计时求解统计一致。这里新增的是“评分代理与实际IR工作量的分离及可核验观测”，不是新性能权重、物理资源估计或独创性证明。未刷新上游快照，未运行GPU。见[报告](inference_detail/p1_3a_implementation_report.md)。
+
+> 2026-10-26（方案 A 的Q1/Q2已验收，独立最终复审通过）：[选择质量报告](inference_detail/p1_2_selection_quality_report.md)完成230行正确性矩阵和48次串行计时。原生四策略64/64成功，Auto对Square有9/16组成本更低、对FullRow16/16打平；共同冻结域的消费者实验出现3个严格geometry反转、6个局部平局消除、27个未观察到改善。C2 RS自由Reduce反转由结果载体槽位代理导致，固定消费者反转由转换代理导致，不称为已测GPU通信收益。165个完整oracle无默认搜索gap；C6 RS joint的120秒截断单列、不称最优。Auto在C1/C2的编译耗时约为FullRow的2.25/2.24倍。没有刷新上游快照或GPU数据，不据此声称独创性/跨框架性能优势。现在继续P1.3a→b→c，不将其能力预先算入本轮实验。
+
+> P1.2（2026-10-24，已完成）：Frisk 增加可审计 Copy→MMA 集成/细分诊断、调用级 profile，以及显式 geometry 身份参与联合支持表、解、绑定评分与实际 IR 重验的有界 Auto grid 选择。505 unit / 69 lit 与辅助守门、独立源码复审通过；三类输入的 legacy 最终 IR/完整成本不变，profile 开关等价，原始 CPU 样本见 [实施报告](optimize_plan/p1_2_implementation_report.md)。这验证了 Frisk 内部“计划身份—联合证明—成本—实际绑定”的一致性，不把 Auto 搜索或缓存观测本身称为独创；未展示 consumer 导致赢家反转，未刷新 TileLang/Triton 快照，未做 GPU 性能或跨框架消融。P1.3/P1.4 尚未实施，下方提案保留为审计历史。
+
+> P1.2–P1.4（2026-10-24，待确认设计）：本轮只读审计 Frisk 后提出[分阶段契约](optimize_plan/p1_2_to_p1_4_design_proposal.md)，未刷新 TileLang/Triton 快照、运行新测试或取得 GPU 数据。拟研究“显式指令计划与数据布局联合选择”“可核验代理成本与实际存活资源分离”“从证明契约到真实执行的一致性”；这些是待实施、待消融检验的设计方向，不是新能力、独创性或性能领先的既成结论。尤其不能以添加候选替代修改默认几何验证，也不能将非可加全局峰值直接放进当前分量求解器。
+
+> P1.1（2026-10-21，已完成）：Frisk 在既有 GF(2) 基础上以秩/核及像空间包含证明 ownership/Broadcast，经小域独立枚举差分检验，同时保留地址表枚举边界。465 unit、64 lit 及辅助验收通过；局部证明调用明显降低开销，但两类 Attention 全链时间基本持平，前后 IR/非计时 stats/完整 trace 相同。这是本系统可核验性与编译开销的增量，不把线性代数方法本身宣称为独有创新；本轮不刷新 TileLang/Triton 参考版本，不作 GPU 性能比较。见 [设计](optimize_plan/p1_1_implementation_design.md)和[实测报告](optimize_plan/p1_1_implementation_report.md)。
+
+> P0 增量方案 A（2026-10-14，已验收）：在同候选域、成本模型及总预算下，补齐固定外部 ABI、可复核有界 trace、单变量邻域改进与饱和全局不退化保护。自由布局 Attention 新增 70 次探测，内存事务估算 608→544，bank 代价 64→0；5 次重复采样中 CPU 推断中位时间约增加 25%，trace 额外开销约 0.4%–0.6%。450 unit/64 lit 等完整守门与独立复审通过；范围、固定 ABI 对照和全部样本见 [实施报告](optimize_plan/p0_implementation_report.md)。这些是 Frisk 本轮实现证据，不等于全局最优或 GPU 加速；未刷新 TileLang/Triton 快照，也不声称它们缺少类似机制。
 
 > **M6 完成（2026-10-10）：Task27–29 已实施并通过分项复审，最终全量回归通过。固定 TileLang 的 20 个共同域等价比较与 3 个实际拒绝通过；真实 GPU conversion 的 11 个正确性用例及 33 次 sanitizer 检查通过。Task29 经不删减证明的仿射求值优化，最终布局编译占比为 3.80%/3.97%/6.67%，runtime 比值不超过 1.00834，独立 reference 基线已接受。首轮 FAIL 保留为历史证据，整体源码及最终文档复审通过。这不构成比 TileLang/Triton 更快或完整推断策略等价的结论；口径及摘要见实现计划 §29.3 和验收文档。**
 

@@ -4,6 +4,7 @@
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
 #include "Dialect/Frisk/Target/SM90/SM90LayoutTarget.h"
+#include "Dialect/Frisk/Target/SM90/SM90MmaLayoutProof.h"
 #include "gtest/gtest.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -33,6 +34,55 @@ protected:
     PassManager pm(&context);
     buildFriskLayoutPipeline(pm, options);
     return pm.run(module);
+  }
+  void expectLegacyMmaGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
+                           unsigned storage, unsigned distributed,
+                           uint64_t dataCombinationBound, DictionaryAttr &geometry) {
+    unsigned storageCount = 0, distributedCount = 0, instructionCount = 0;
+    for (const auto &var : graph.getVariables()) {
+      storageCount += var.kind == LayoutKind::Storage;
+      distributedCount += var.kind == LayoutKind::Distributed;
+      instructionCount += var.kind == LayoutKind::Instruction;
+    }
+    EXPECT_EQ(storageCount, storage); EXPECT_EQ(distributedCount, distributed);
+    ASSERT_EQ(instructionCount, 1u);
+    EXPECT_EQ(graph.getVariables().size(), storage + distributed + 1u);
+    const LayoutConstraint *contract = nullptr;
+    for (const auto &c : graph.getConstraints()) if (c.instruction) {
+      ASSERT_FALSE(contract); contract = &c;
+    }
+    ASSERT_TRUE(contract); ASSERT_EQ(contract->vars.size(), 5u);
+    auto mma = dyn_cast_or_null<MmaOp>(contract->instruction->source); ASSERT_TRUE(mma);
+    EXPECT_EQ(mma.getPolicy(), attr::GemmWarpPolicy::Square);
+    auto &role = graph.getVariable(contract->vars[4]);
+    EXPECT_EQ(role.kind, LayoutKind::Instruction); EXPECT_EQ(role.anchor, mma.getOperation());
+    EXPECT_TRUE(role.instructionRole); EXPECT_FALSE(role.value); EXPECT_FALSE(role.use);
+    EXPECT_FALSE(role.functionResult); EXPECT_EQ(role.requiredThreads, 128);
+    EXPECT_EQ(role.shapedType, mma.getResult().getType());
+    auto raw = getSM90MmaGeometries(mma, 128); ASSERT_TRUE(succeeded(raw));
+    ASSERT_EQ(raw->size(), 1u); EXPECT_EQ(raw->front().gM, 1); EXPECT_EQ(raw->front().gN, 1);
+    geometry = encodeSM90MmaGeometry(&context, raw->front());
+    auto binding = mma->getAttr("frisk.mma_contract");
+    EXPECT_EQ(contract->instruction->binding, binding);
+    // RelationsOnly leaves geometry unseeded. Prepare proposals, not support
+    // tuples, to establish its actual singleton without rerunning tuple proofs.
+    ASSERT_TRUE(contract->instruction->tuples.empty());
+    ASSERT_TRUE(succeeded(target.prepareInstructionCandidates(graph)));
+    ASSERT_EQ(role.candidates.size(), 1u); EXPECT_EQ(role.candidates.front().value, geometry);
+    EXPECT_TRUE(contract->instruction->tuples.empty());
+    EXPECT_EQ(mma->getAttr("frisk.mma_contract"), binding);
+    uint64_t maximumCombinations = role.candidates.size();
+    for (const auto &var : graph.getVariables()) if (var.kind != LayoutKind::Instruction) {
+      EXPECT_LE(var.candidates.size(), 4u) << var.stableName;
+      maximumCombinations *= 4;
+    }
+    // The Instruction singleton contributes factor one: retain each fixture's
+    // original worst-case four-candidate DATA-domain product, not a larger cap.
+    EXPECT_EQ(maximumCombinations, dataCombinationBound);
+    if (binding) {
+      auto selected = getSM90MmaContractGeometry(mma,128,binding); ASSERT_TRUE(succeeded(selected));
+      EXPECT_EQ(encodeSM90MmaGeometry(&context,*selected),geometry);
+    }
   }
   OwningOpRef<ModuleOp> legacyMma(bool rs, bool reduction) {
     std::string outputType = reduction ? "memref<64xf32,1>" : "memref<64x64xf32,1>";
@@ -176,7 +226,10 @@ TEST_F(LayoutPipelineTest, LegacySSAndRSMmaReachExternalStoreWithinBudget) {
     auto target = createSM90LayoutTarget();
     auto graph = collectLayoutConstraints(*module, *target, LayoutCollectionMode::RelationsOnly);
     ASSERT_TRUE(succeeded(graph));
-    EXPECT_LE(graph->getVariables().size(), 8u);
+    DictionaryAttr geometry;
+    expectLegacyMmaGraph(*graph,*target,rs ? 2u : 3u,rs ? 6u : 4u,
+                         rs ? 65536u : 16384u,geometry);
+    EXPECT_LE(graph->getVariables().size() - 1u, 8u); // Data-variable budget is unchanged.
     EXPECT_TRUE(succeeded(verifyMaterializedLayouts(*module, *target)));
   }
 }
@@ -191,12 +244,17 @@ TEST_F(LayoutPipelineTest, NineVariableFullChainMaterializesAndReplays) {
   auto target = createSM90LayoutTarget();
   auto graph = collectLayoutConstraints(*normalized, *target, LayoutCollectionMode::RelationsOnly);
   ASSERT_TRUE(succeeded(graph));
-  EXPECT_EQ(graph->getVariables().size(), 9u);
+  DictionaryAttr geometry;
+  expectLegacyMmaGraph(*graph,*target,3u,6u,262144u,geometry);
+  ASSERT_TRUE(geometry); // Nine data roles, plus one singleton geometry role.
   ASSERT_TRUE(succeeded(run(*module)));
   unsigned mma = 0, reductions = 0, stores = 0;
   module->walk([&](MmaOp op) {
     ++mma;
-    EXPECT_TRUE(op->getAttrOfType<MmaInstructionContractAttr>("frisk.mma_contract"));
+    auto binding = op->getAttrOfType<MmaInstructionContractAttr>("frisk.mma_contract");
+    ASSERT_TRUE(binding);
+    for (StringRef field : {"grid","atom","repeats"})
+      EXPECT_EQ(binding.getPayload().get(field),geometry.get(field));
   });
   module->walk([&](ReduceTensorOp op) {
     ++reductions;

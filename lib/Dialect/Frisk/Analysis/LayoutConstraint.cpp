@@ -341,7 +341,8 @@ LogicalResult LayoutConstraintGraph::verifyInvariants(Location loc) const {
     if (constraint.instruction) {
       const auto &instruction = *constraint.instruction;
       if (constraint.kind != ConstraintKind::InstructionContract ||
-          constraint.vars.size() != 4 || !instruction.source ||
+          !instruction.source ||
+          constraint.vars.size() != (instruction.source->getName().getStringRef() == "frisk.mma" ? 5u : 4u) ||
           provenances[constraint.provenance].source != instruction.source ||
           instruction.tuples.size() > 256)
         return emitError(loc) << "invalid instruction role count, source or tuple budget";
@@ -394,6 +395,16 @@ LogicalResult LayoutConstraintGraph::verifyInvariants(Location loc) const {
         }
         if (instruction.binding != op->getAttr("frisk.mma_contract"))
           return emitError(loc) << "MMA instruction binding differs from actual operation attribute";
+        const auto &geometry = variables[constraint.vars[4]];
+        if (geometry.kind != LayoutKind::Instruction || geometry.anchor != op ||
+            geometry.value || geometry.use || geometry.functionResult ||
+            geometry.operationExecution || !geometry.instructionRole ||
+            geometry.shapedType != op->getResult(0).getType() ||
+            geometry.requiredThreads != variables[constraint.vars[3]].requiredThreads)
+          return emitError(loc) << "MMA geometry role does not match actual operation";
+        for (const auto &edge : constraints)
+          if (edge.kind == ConstraintKind::Convertible && llvm::is_contained(edge.vars,geometry.id))
+            return emitError(loc) << "MMA geometry role cannot have a conversion edge";
       }
     }
     if (constraint.kind == ConstraintKind::RootStorageContract) {

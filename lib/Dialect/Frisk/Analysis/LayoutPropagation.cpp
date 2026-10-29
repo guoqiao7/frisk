@@ -1,5 +1,6 @@
 #include "Dialect/Frisk/Analysis/LayoutSolver.h"
 #include "Dialect/Frisk/Analysis/LayoutStatistics.h"
+#include "Dialect/Frisk/Analysis/LayoutTrace.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "Dialect/Frisk/Analysis/OperationLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
@@ -36,13 +37,27 @@ void updateState(LayoutVar &var) {
 
 bool filterCompatible(LayoutConstraintGraph &graph, LayoutVar &var,
                       LayoutVarID otherID, ArrayRef<LayoutCandidate> other,
-                      const LayoutConstraint &relation) {
+                      const LayoutConstraint &relation, LayoutTrace *trace,
+                      StringRef stage) {
   size_t oldSize = var.candidates.size();
   llvm::erase_if(var.candidates, [&](const LayoutCandidate &candidate) {
-    return llvm::none_of(other, [&](const LayoutCandidate &otherCandidate) {
-      return layoutRelationCompatible(graph, relation, var.id, candidate.value,
+    bool unknown = false;
+    LayoutProof last;
+    bool removed = llvm::none_of(other, [&](const LayoutCandidate &otherCandidate) {
+      auto proof = proveLayoutRelation(graph, relation, var.id, candidate.value,
                                       otherID, otherCandidate.value);
+      unknown |= proof.status == ProofStatus::Unknown;
+      bool proven = proof.status == ProofStatus::Proven;
+      if (trace && !proven && (!unknown || proof.status == ProofStatus::Unknown))
+        last = std::move(proof);
+      return proven;
     });
+    if (removed && trace)
+      trace->recordRejection(var.id, candidate.value, relation.id, stage,
+          unknown ? "Unknown" : other.empty() ? "NoSupport" : "Disproven",
+          other.empty() ? "current domain has no support" : last.reason,
+          unknown ? ArrayRef<int64_t>{} : ArrayRef<int64_t>(last.counterexample));
+    return removed;
   });
   updateState(var);
   return oldSize != var.candidates.size();
@@ -89,7 +104,8 @@ LogicalResult emitConflict(const LayoutConstraintGraph &graph,
 
 LogicalResult applyEqualityConstraint(LayoutConstraintGraph &graph,
                                       const LayoutConstraint &constraint,
-                                      bool &changed) {
+                                      bool &changed, LayoutTrace *trace,
+                                      StringRef stage) {
   if (constraint.vars.size() < 2)
     return success();
   for (size_t lhsIndex = 0; lhsIndex < constraint.vars.size(); ++lhsIndex) {
@@ -99,8 +115,8 @@ LogicalResult applyEqualityConstraint(LayoutConstraintGraph &graph,
       LayoutVar &rhs = graph.getVariable(constraint.vars[rhsIndex]);
       SmallVector<LayoutCandidate> lhsSnapshot(lhs.candidates);
       SmallVector<LayoutCandidate> rhsSnapshot(rhs.candidates);
-      changed |= filterCompatible(graph, lhs, rhs.id, rhsSnapshot, constraint);
-      changed |= filterCompatible(graph, rhs, lhs.id, lhsSnapshot, constraint);
+      changed |= filterCompatible(graph, lhs, rhs.id, rhsSnapshot, constraint, trace, stage);
+      changed |= filterCompatible(graph, rhs, lhs.id, lhsSnapshot, constraint, trace, stage);
       if (lhs.state == LayoutState::Conflict ||
           rhs.state == LayoutState::Conflict) {
         lhs.state = LayoutState::Conflict;
@@ -346,7 +362,8 @@ LayoutConstraintBuilder::lookup(Value value, LayoutKind kind) const {
 
 FailureOr<LayoutConstraintGraph>
 collectLayoutConstraints(Operation *root, LayoutTarget &target,
-                         LayoutCollectionMode mode, LayoutStatisticsReport *statistics) {
+    LayoutCollectionMode mode, LayoutStatisticsReport *statistics, LayoutTrace *trace) {
+  if (trace && !trace->enabled()) trace = nullptr;
   auto collectionStart = LayoutClock::now();
   auto phaseStart = collectionStart;
   bool preparing = false;
@@ -355,6 +372,8 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
     if (!statistics) return;
     statistics->timings[preparing ? "preparation_ns" : "collection_ns"] += layoutElapsedNS(phaseStart);
     statistics->rawGeneratedProposals = graph.getCandidatePreparationStatistics().generatedProposals;
+    statistics->instructionCombinations = graph.getCandidatePreparationStatistics().instructionCombinations;
+    statistics->instructionFragmentPrechecks = graph.getCandidatePreparationStatistics().instructionFragmentPrechecks;
   });
   LayoutConstraintBuilder builder(graph);
   DenseMap<Value, SmallVector<LayoutVarID>> viewsBySource;
@@ -547,15 +566,17 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
       return failure();
     }
   }
-  if (failed(prepareInstructionTuples(graph, target, root->getLoc())))
+  if (failed(prepareInstructionTuples(graph, target, root->getLoc(), trace)))
     return failure();
   if (failed(prepareReductionPairs(graph, target, root->getLoc())))
     return failure();
+  if (trace) trace->recordGraph(graph);
   return graph;
 }
 
 static LogicalResult runPropagationWorklist(LayoutConstraintGraph &graph,
-                                            bool strict) {
+                                            bool strict, LayoutTrace *trace) {
+  StringRef stage = strict ? "strict" : "common";
   auto &stats = strict ? graph.getPropagationStatistics().strict
                        : graph.getPropagationStatistics().common;
   stats = {};
@@ -616,8 +637,11 @@ static LogicalResult runPropagationWorklist(LayoutConstraintGraph &graph,
         llvm::erase_if(var.candidates, [&](const auto &candidate) {
           DenseMap<LayoutVarID, Attribute> assignment;
           assignment[varID] = candidate.value;
-          return reduction ? !findReductionSupport(graph, relation, assignment)
-                           : !findInstructionSupport(graph, relation, assignment);
+          bool removed = reduction ? !findReductionSupport(graph, relation, assignment)
+                                   : !findInstructionSupport(graph, relation, assignment);
+          if (removed && trace) trace->recordRejection(varID, candidate.value,
+              relation.id, stage, "NoSupport", "current support table has no support");
+          return removed;
         });
         updateState(var);
         if (var.state == LayoutState::Conflict) result = failure();
@@ -627,9 +651,18 @@ static LogicalResult runPropagationWorklist(LayoutConstraintGraph &graph,
       auto &var = graph.getVariable(relation.vars.front());
       std::string reason;
       llvm::erase_if(var.candidates, [&](const auto &candidate) {
-        if (require) return candidate.value != relation.requiredEncoding;
+        if (require) {
+          bool removed = candidate.value != relation.requiredEncoding;
+          if (removed && trace) trace->recordRejection(var.id, candidate.value,
+              relation.id, stage, "Disproven", "does not match required encoding");
+          return removed;
+        }
         auto proof = proveUnaryLayoutConstraint(graph, relation, candidate.value);
         if (proof.status != ProofStatus::Proven) reason = proof.reason;
+        if (trace && proof.status != ProofStatus::Proven)
+          trace->recordRejection(var.id, candidate.value, relation.id, stage,
+              proof.status == ProofStatus::Unknown ? "Unknown" : "Disproven",
+              proof.reason, proof.counterexample);
         return proof.status != ProofStatus::Proven;
       });
       updateState(var);
@@ -639,7 +672,7 @@ static LogicalResult runPropagationWorklist(LayoutConstraintGraph &graph,
       }
     } else {
       bool changed = false;
-      result = applyEqualityConstraint(graph, relation, changed);
+      result = applyEqualityConstraint(graph, relation, changed, trace, stage);
     }
     for (auto [var, size] : before) {
       size_t after = graph.getVariable(var).candidates.size();
@@ -659,14 +692,20 @@ static LogicalResult runPropagationWorklist(LayoutConstraintGraph &graph,
   return success();
 }
 
-LogicalResult propagateStrict(LayoutConstraintGraph &graph) {
+LogicalResult propagateStrict(LayoutConstraintGraph &graph, LayoutTrace *trace) {
+  if (trace && !trace->enabled()) trace = nullptr;
   graph.getPropagationStatistics().common = {};
-  return runPropagationWorklist(graph, true);
+  auto result = runPropagationWorklist(graph, true, trace);
+  if (trace) trace->recordDomains(graph, "strict");
+  return result;
 }
 
-LogicalResult propagateCommonToFixedPoint(LayoutConstraintGraph &graph) {
-  if (failed(propagateStrict(graph))) return failure();
-  return runPropagationWorklist(graph, false);
+LogicalResult propagateCommonToFixedPoint(LayoutConstraintGraph &graph, LayoutTrace *trace) {
+  if (trace && !trace->enabled()) trace = nullptr;
+  if (failed(propagateStrict(graph, trace))) return failure();
+  auto result = runPropagationWorklist(graph, false, trace);
+  if (trace) trace->recordDomains(graph, "common");
+  return result;
 }
 
 } // namespace mlir::frisk

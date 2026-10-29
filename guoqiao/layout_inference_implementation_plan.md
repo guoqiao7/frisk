@@ -1,15 +1,78 @@
+> 2026-10-29 P1.4a：最小形状支持已完整验收，功能回归、独立源码及最终证据/文档复审均通过。静态正二次幂单位轴、插入轴Broadcast、rank≥2到rank≥1 Reduce及静态expand/collapse/transpose闭环；575 Release主单测、20 selection，双配置最终15聚焦/5lit及辅助守门通过。GPU基础后端及后续路线未完成。见[实施报告](inference_detail/p1_4a_implementation_report.md)。
+
 # Frisk Layout Inference System Implementation Plan
 
-## P0 增量（2026-10-14，方案 A 已确认，详细契约待审阅）
+> 2026-10-29：P1.3c已完成验收，完整源码、驱动、数据与文档独立复审通过。默认legacy保留；显式`boundary-frequency=static-trip-count`统一转换/clone与受限外提的频率口径。Release主单测570、选择质量20，相关Debug/lit及辅助守门通过；18次语义核验与36次串行CPU调用通过，身份复验不变。下一独立任务为最小形状支持，GPU和跨框架比较尚未实施。见[阶段报告](inference_detail/p1_3c_implementation_report.md)。
 
-实现前基线：`219c0cf`，本地 main，未推送。具体边界与验收见 [P0 设计](optimize_plan/p0_implementation_design.md)，推进顺序 O01→O03→O02。以下为待实施工作，不改变既有里程碑完成状态。
+> 2026-10-28：P1.3b已完成验收，最终独立复审通过。 规范ranked-Tensor Broadcast按原子SSA边界统计，非规范region仍unavailable；两类完整Attention均available，每线程峰值106逻辑槽/424字节，Shared活跃峰值/声明容量均6144字节。最终Debug定向50、全Release549（65 suites）、lit Debug5/Release8、CTest4及Python守门通过。15语义核验与36串行CPU观测通过，IR/完整成本/非计时求解统计/旧arith诊断不变，身份复验未变化。不涉及P1.3c/GPU或物理寄存器/occupancy，不自动提交/推送。 见[完整Attention资源报告](inference_detail/p1_3b_attention_resource_report.md)。
 
-- [ ] P0-1：固定外部行主序 Attention；验证对齐、静态偏移、硬冲突、地址与数据流、重放/回滚。
-- [ ] P0-2：独立有界 trace；阶段候选、支持/拒绝、搜索事件、九项成本来源、文件失败和开关等价。
-- [ ] P0-3：beam 合法解的确定性单变量改进；默认至多 256 邻域探测且共用 65536 总预算；完整成本与约束、统计和已知漏选回归。
-- [ ] P0-4：全量 unit/lit、既有 CTest/Python 守门，重复性能采样与完整推断报告，更新维护文档。
+## 选择质量实验 → P1.3（2026-10-26，Q1/Q2已验收，继续P1.3）
 
-实现直接在源目录进行，不创建 worktree。先完成详细契约审阅再开始测试驱动实现；不扩大形状/指令支持域、不实现 GPU lowering、不自动提交或推送后续实现。
+用户指定的Auto/固定策略对照及消费者联合选择实验已完成，见[报告](inference_detail/p1_2_selection_quality_report.md)。按[实验设计](optimize_plan/p1_2_selection_quality_design.md)执行原生四policy＋共同冻结域geometry限制的双层对照：64原生配置、36消费者图，独立有界oracle区分局部打平、严格反转与搜索差异。保留原始数据后继续P1.3a→b→c，不改写本次实验基线。
+
+- [x] 核对现有代码、历史证据与 P1.3 契约，写入实验设计并自审。
+- [x] 用户确认方案 A 书面契约，编写[执行计划](optimize_plan/p1_2_selection_quality_execution_plan.md)，保存脏源码/工具基线。
+- [x] 实施驱动/测试/实验，形成 `inference_detail/p1_2_selection_quality_report.md`，独立最终复审通过。
+- [x] 实验报告验收后，依次细化并实施 P1.3a、P1.3b、P1.3c；不同时改变候选与成本模型来影响实验基线。
+
+按任务实施和独立复审后逐项验收；以下Task1/2描述保留阶段检查点，最终验收以Task4为准。不覆盖下方P1.2历史状态，不自动commit/push。
+
+阶段进度：Task 1 原生实验驱动已完成并经独立复审，Release 9项、Debug原7项＋修复定向3项通过；64项输入生成已验证，但不等于64项推断实验已全部执行。C1 SS/RS 的实际ABI/重放与跨构建一致性样例通过。固定消费者原始Convert输入的验证入口限制已记入实验设计§5.1，该组用受控求解/物化后完整流水线验收，不改变生产验证器。
+
+Task 2 已完成并独立复审通过：冻结域/geometry限制、独立有界oracle、完整成本对账、原生/受控域身份匹配与oracle方案独立副本物化重验。Release 20项、Debug定向8项通过，13个持久化CLI样例中12个请求的oracle全部完成，且实际走过独立副本验证。
+
+Task 3 批量驱动/分类/报告工具已完成，25项Python测试及真实CLI集成通过；独立复审关闭核心验收门槛、同geometry分类、报告重载身份校验三项问题。Task 4 正式230行矩阵、Debug/Release新增各20项、原MMA/流水线24项和48次串行计时已完成，严格重载/合并及独立最终复审通过。165个完整oracle与默认最优成本一致，1个C6 RS joint超时单列；消费者3个严格反转、6个平局消除、27个未改善。数据/源码/IR/日志归档见[报告](inference_detail/p1_2_selection_quality_report.md)，现在推进P1.3，不将Q1/Q2完成等同于整个P1完成。
+
+P1.3a已完成模型身份/覆盖表和实际优化IR算术诊断，实现任务、整体源码及最终证据/文档复审均通过；完成524个不同Debug单测的分阶段覆盖、70 lit及最终修复定向验收，并保存12次语义核验＋36次串行观测。两类Attention的Mul/Sub/Exp/Div/Trunc各4096 element-op，旧基线/新默认/诊断开启的IR、完整成本与非计时求解统计保持一致。详见[报告](inference_detail/p1_3a_implementation_report.md)及[执行计划](optimize_plan/p1_3a_execution_plan.md)；P1.3b进展见下方阶段记录，P1.3c现已完成实现、功能回归、正式观测及最终独立复审。
+
+## P1.2–P1.4 契约（2026-10-24；P1.2a/b 已完成）
+
+用户确认的方案 A 已完成 P1.2a→P1.2b。审计、源码依据、实例和验收标准见[阶段设计](optimize_plan/p1_2_to_p1_4_design_proposal.md)，任务见 [执行计划](optimize_plan/p1_2_execution_plan.md)，实际结果见 [实施报告](optimize_plan/p1_2_implementation_report.md)。以下未勾选项尚未实施，不将 O04–O11 的所有长期目标标为完成。
+
+- [x] 审计现有候选/指令证明、Copy、shape、成本/转换及可执行后端；核实 P1.1 后续编号此前未定义。审计阶段未重新构建或运行测试，后续实施证据单独登记。
+- [x] 建立 P1.2–P1.4 与 O04–O11 的映射、拟议契约、验收案例及剩余项，登记长期文档。
+- [x] 用户确认具体契约，编写 [P1.2 执行计划](optimize_plan/p1_2_execution_plan.md)；本轮仅实施 P1.2a→P1.2b。
+- [x] P1.2a：固定外部 ABI 的 vector/cp.async/TMA Copy→MMA 集成、细分证明状态/原因/坐标、默认关闭且调用隔离的热点/缓存观测。
+- [x] P1.2b：显式 Auto、第五 Instruction geometry 角色、有界 grid 联合选择及完整成本 oracle；旧 policy/显式绑定保持，成本读取实际选中绑定；预算不足保留 Unknown。
+- [x] P1.3a：模型身份/覆盖与实际优化IR逐opcode算术计数；最终证据/文档复审通过。
+- [x] P1.3b：实际 IR 存活资源诊断的实现、回归及实验已完成；最终独立证据/文档复审已通过，全局峰值不写入可加成本目标。
+- P1.3b [具体执行契约](optimize_plan/p1_3b_execution_plan.md)的纯分析器、通用pipeline集成及规范ranked-Tensor Broadcast原子SSA窄特例已实现并经独立源码复审。最终Debug定向50、全Release549（65 suites）、lit Debug5/Release8、CTest4及Python守门通过；15次语义核验先于36次串行CPU观测（6次预热、30次采样）。两类完整Attention均available，各16个Tensor SSA、3个Shared根，每线程峰值106逻辑槽/424字节，Shared活跃峰值/声明容量均6144字节；旧/新与开关对照的IR、完整成本及非计时求解统计不变，旧arith诊断不变，最终IR重放核验IR与诊断等价。模型仍为 `sm90-layout-lex9-legacy-v1`，不推断物理寄存器/occupancy；P1整体及O06全目标尚未完成。最终独立证据/文档复审已通过，见[阶段报告](inference_detail/p1_3b_implementation_report.md)与[完整Attention资源报告](inference_detail/p1_3b_attention_resource_report.md)。
+- [x] P1.3c：显式开启的静态 for 次数模型，保留legacy默认和原通信/外提合法性边界；完整回归、正式观测与独立最终复审通过。
+- [x] P1.4a：静态非零 rank 的单位轴、广播/Reduce/投影及完整链；不扩张成通用 ragged/dynamic 支持。
+- [ ] P1.4b：消费实际物化契约的固定 shape/ABI Attention GPU lowering、数值和安全验收，保留弱对齐语义。
+- [ ] P1.4c/d：cp.async 与 TMA 独立执行验收、同算法布局性能对照及后续成本校准依据。
+
+### P1.3b历史检查点（2026-10-27，已由2026-10-28实现与实验结果取代）
+
+P1.3b [具体执行契约](optimize_plan/p1_3b_execution_plan.md)的Task1纯分析器及Task2通用pipeline集成已通过独立复审：真实SSA峰值、Shared根去重/声明与活跃容量分离、capture和保守异步生命周期检查；诊断开关不改变布局/成本。Debug/Release最终定向各87项、相关lit各4项、全Release545项及相关Python/工具回归通过。两类Attention探针推断成功，IR与P1.3a相同，但第20、25个Broadcast令资源报告unavailable。named Broadcast隐式region窄特例仍待确认，完整资源/计时实验及整体最终复审未完成。见[阶段报告](inference_detail/p1_3b_implementation_report.md)。
+
+以下为P1.2历史验收记录：
+
+最终验收：505/505 Debug unit、69/69 lit、60 项 Release 受影响测试（以及测试同步后的 3 项）、8 Debug/2 选定 Release CTest、5 Python normalization 与 API/tool 守门通过，独立源码复审通过。54 次串行调用与 9 次 trace 调用保持 legacy 最终 IR/九项成本；profile 开关保持 IR、非计时 stats 和完整 trace。两类 Attention 的 profile 中位开销约 0.15%/0.10%；小图约 1.33%，只作为本机 CPU 观测，不声称 GPU 加速。Auto 消费者案例未展示赢家反转，全 atom/tile/线程搜索仍不在本轮范围。
+
+直接在源目录 main 工作，保留未提交 P0/P1.1，不自动提交或推送。完整 Attention GPU 后端是新增实质工作，不能以已有 conversion 微基准、推断 IR 或手写替代 kernel 宣称完成。
+
+## P1.1 增量（2026-10-21，已完成实现与验收）
+
+采用方案 A 分阶段推进 P1，本轮仅实施 O07 的 ownership/Broadcast 受限符号证明与编译开销验收。具体边界见 [P1.1 设计](optimize_plan/p1_1_implementation_design.md)，任务见 [执行计划](optimize_plan/p1_1_execution_plan.md)。保留 P0 未提交成果，不自动提交或推送。
+
+- [x] 保存实际 P0 工作区基线，测量阶段时间与 RSS；两个 Attention 各 1 次预热/5 次测量成功，详见 [P1.1 实施报告](optimize_plan/p1_1_implementation_report.md)。
+- [x] ownership 秩/核证明及枚举 oracle 差分；16 项局部与当时 457 项 Release 全量 unit 通过，独立 spec/quality 复审通过，后纳入下述最终 Debug 回归。
+- [x] Broadcast 同线程像空间包含证明及超界正反例；32,768 组小矩阵差分、40 项局部/Attention unit、4 项 lit 和独立复审通过；具体地址表仍受枚举上限约束。
+- [x] 完整回归、独立复审、微基准与 Attention 对照、维护文档同步。修正 Debug 负例构造后 465/465 unit、64/64 lit、8/8 Debug CTest、2/2 Release CTest、5/5 Python normalization 与 API/tool 守门通过；7 案例微基准及两类 Attention 各 1 warmup/5 samples 完成。局部证明降低开销，但 Attention 时间基本持平（中位数约下降 0.21%/0.17%），IR/非计时 stats/完整 trace 一致；原始测量随报告保存，不宣称 GPU 加速。
+
+地址表枚举仍保持 65536 点上限；不扩展形状、GPU lowering 或 CostVector。P1.2–P1.4 尚未实施。
+
+## P0 增量（2026-10-14，已完成实现与验收）
+
+实现前基线：`219c0cf`，设计提交 `b237911`，本地 main，未推送。具体边界见 [P0 设计](optimize_plan/p0_implementation_design.md)，按 O01→O03→O02 完成；实际命令、样本和验收见 [实施报告](optimize_plan/p0_implementation_report.md)。以下增量不改变既有里程碑的历史证据。
+
+- [x] P0-1：固定外部行主序 Attention；验证对齐、静态偏移、硬冲突、地址与数据流、重放/回滚。仅补测试，无生产修改；16 项局部 unit、1 项新增 lit 及独立复审通过，已纳入最终全量回归。
+- [x] P0-2：独立有界 trace；阶段候选、支持/拒绝、搜索事件、九项成本来源、文件失败和开关等价。基础模块 52 项、接入 59 项局部 unit 与 4 项 lit 及复审修复覆盖测试通过；最终两类 Attention 日志未截断，完整成本可复核，trace 开关语义相同。
+- [x] P0-3：beam 合法解的确定性单变量改进；默认至多 256 邻域探测且共用 65536 总预算；完整成本与约束、统计和漏选回归。补齐整体复审发现的饱和全局不退化保护，最终方案/转换/成本日志一致。自由布局 Attention 完整向量从 `[8293,608,64,0,428,6144,6,0,0]` 改进至 `[8293,544,0,0,428,6144,6,0,0]`，新增 70 次探测、4 次接受；独立源码复审通过。
+- [x] P0-4：修复后 450/450 unit、64/64 lit、7/7 Debug CTest、1/1 Release generator、5/5 Python normalization 及 API/tool 守门通过。8 组开关配置各 5 次测量，另有 4 组多分量基准各 30 次采样；维护文档及报告已同步。较低模型成本不等于 GPU 加速，自由布局推断时间中位数约增加 25%。
+
+实现直接在源目录进行，未创建 worktree。按 [执行计划](optimize_plan/p0_execution_plan.md)测试驱动实施并逐任务/整体复审；不扩大形状/指令支持域，不实现 GPU lowering，后续实现仍未提交或推送。
 
 > **M6 完成（2026-10-10）：Task27–29 实现及分项复审通过，最终 405/405 unit、58/58 lit、7/7 CTest、Python/生产 API 隔离通过。真实 GPU 的 11 个正确性用例、33 次 sanitizer 检查通过；三个必测用例 runtime 比值不超过 1.00834，布局编译占比 3.80%/3.97%/6.67%，参考基线已独立评审接受。整体源码及最终文档复审通过，按已声明支持域完成 M6 验收。首轮失败与修复过程保留在 §29.2，最终验收见 §29.3 及 `layout_inference_acceptance.md`。未 commit/push。**
 

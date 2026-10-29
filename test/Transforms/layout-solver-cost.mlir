@@ -9,6 +9,9 @@
 // RUN: if frisk-opt %s --frisk-infer-layouts='beam-width=0' > %t.err 2>&1; then exit 1; fi
 // RUN: FileCheck %s --check-prefix=INVALID < %t.err
 // RUN: frisk-opt %s --frisk-layout-pipeline='beam-width=8 exact-combination-limit=16 max-expanded-states=4096' -verify-each > %t.out
+// RUN: frisk-opt %s --frisk-infer-layouts='analysis-only refine-beam-solution=false max-refinement-probes=3' -verify-each > %t.disabled
+// RUN: frisk-opt %s --frisk-infer-layouts='analysis-only max-refinement-probes=0' -verify-each > %t.zero
+// RUN: diff %t.disabled %t.zero
 // CHECK: cost coverage: bounded-owner-proof-v1 with cta-staging-upper-bound-v1 fallback
 // CHECK-SAME: sm90-shape-work-v1
 // CHECK-SAME: warp-issue-32B-sectors-v1

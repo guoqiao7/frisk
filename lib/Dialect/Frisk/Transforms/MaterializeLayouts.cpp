@@ -4,6 +4,7 @@
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
 #include "Dialect/Frisk/Target/SM90/SM90LayoutTarget.h"
+#include "Dialect/Frisk/Target/SM90/SM90MmaLayoutProof.h"
 #include "Dialect/Frisk/Transforms/LayoutTypeConverter.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/IRMapping.h"
@@ -324,13 +325,14 @@ private:
 LogicalResult materializeDistributedLayouts(
     Operation *root, const LayoutConstraintGraph &graph,
     const LayoutSolution &solution, ArrayRef<LayoutConversionEdge> conversions,
-    bool authorizeInternalOptimization) {
+    bool authorizeInternalOptimization, LayoutTarget *target) {
   auto module = dyn_cast<ModuleOp>(root);
   if (!module) return root->emitError("layout materialization requires a module root");
   if (conversions.size() != solution.conversions.size() ||
       !llvm::equal(conversions, solution.conversions, sameLayoutConversionPlan))
     return root->emitError("conversion argument differs from selected layout solution");
-  auto target = createSM90LayoutTarget();
+  auto ownedTarget = target ? nullptr : createSM90LayoutTarget();
+  if (!target) target = ownedTarget.get();
   if (failed(verifySolvedLayoutGraph(graph, solution, *target, root->getLoc())))
     return failure();
   LayoutRebuild rebuild(graph, solution, authorizeInternalOptimization);
@@ -348,9 +350,9 @@ LogicalResult materializeDistributedLayouts(
 LogicalResult materializeLayouts(Operation *root,
                                  const LayoutConstraintGraph &graph,
                                  const LayoutSolution &solution,
-                                 bool authorizeInternalOptimization) {
+                                 bool authorizeInternalOptimization, LayoutTarget *target) {
   return materializeDistributedLayouts(root, graph, solution, solution.conversions,
-                                      authorizeInternalOptimization);
+                                      authorizeInternalOptimization, target);
 }
 
 LogicalResult verifyMaterializedLayouts(Operation *root,
@@ -382,10 +384,18 @@ LogicalResult verifyMaterializedLayouts(Operation *root,
       if (!encoding)
         return var.anchor->emitError("unresolved storage layout for materialized view");
     } else if (var.kind == LayoutKind::Instruction) {
-      auto binding = var.anchor->getAttrOfType<DictionaryAttr>("frisk.copy_contract");
-      if (!binding || !binding.getAs<StringAttr>("path"))
-        return var.anchor->emitError("unresolved materialized Copy instruction path");
-      encoding = binding.getAs<StringAttr>("path");
+      if (auto mma = dyn_cast_or_null<MmaOp>(var.anchor)) {
+        auto geometry = getSM90MmaContractGeometry(mma, var.requiredThreads,
+            mma->getAttr("frisk.mma_contract"));
+        if (failed(geometry))
+          return mma.emitError("unresolved materialized MMA geometry");
+        encoding = encodeSM90MmaGeometry(mma.getContext(), *geometry);
+      } else {
+        auto binding = var.anchor->getAttrOfType<DictionaryAttr>("frisk.copy_contract");
+        if (!binding || !binding.getAs<StringAttr>("path"))
+          return var.anchor->emitError("unresolved materialized Copy instruction path");
+        encoding = binding.getAs<StringAttr>("path");
+      }
     } else if (var.operationExecution) {
       for (StringRef name : {"frisk.execution_layout", "frisk.execution_threads",
                              "frisk.writer_policy", "frisk.vector_bytes"})

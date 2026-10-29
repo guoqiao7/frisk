@@ -102,6 +102,10 @@ struct LayoutConversionEdge {
   LayoutConstraintID constraint = std::numeric_limits<LayoutConstraintID>::max();
   ConversionExchangeKind exchange = ConversionExchangeKind::Identity;
   uint64_t loopDepth = 0;
+  uint64_t frequencyFactor = 1;
+  bool frequencyUsesProxy = false, frequencySaturated = false;
+  // Model identity is needed even where both modes estimate the same factor.
+  bool staticTripCountFrequency = false;
   std::string costProvenance;
   Operation *insertionPoint = nullptr;
   // The earliest use's constraint owns a shared conversion. Each use still has
@@ -233,6 +237,8 @@ struct LayoutCandidatePreparationStatistics {
   uint64_t footprintEvaluations = 0;
   uint64_t pairProofEvaluations = 0;
   uint64_t instructionCombinations = 0;
+  // Geometry-conditioned role proofs, separately from complete tuple attempts.
+  uint64_t instructionFragmentPrechecks = 0;
   uint64_t reductionCombinations = 0;
 };
 

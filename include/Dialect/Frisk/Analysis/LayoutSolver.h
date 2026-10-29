@@ -11,6 +11,7 @@
 namespace mlir::frisk {
 struct LayoutAttemptStatistics;
 struct LayoutStatisticsReport;
+class LayoutTrace;
 
 struct LayoutSolution {
   DenseMap<LayoutVarID, Attribute> assignments;
@@ -24,6 +25,12 @@ struct LayoutSolution {
     uint64_t expanded = 0, hardRejected = 0, beamDiscarded = 0;
     uint64_t deduplicated = 0;
     uint64_t peakFrontier = 0, mrvProbes = 0, expandedNodes = 0;
+    uint64_t refinementProbes = 0, refinementSweeps = 0, refinementAccepted = 0;
+    CostEstimate refinementStartCost, refinementEndCost;
+    std::string refinementStopReason = "no-incumbent";
+    // Local refinement history is retained even when global saturation makes
+    // the original incumbent preferable. `cost` describes the selected plan.
+    bool refinementGlobalFallback = false;
     bool rawProductOverflow = false, productOverflow = false;
     bool usedBeam = false, exhaustive = false;
     unsigned beamWidth = 0;
@@ -35,7 +42,7 @@ struct LayoutSolution {
     std::string candidate, reason;
     LayoutConstraintID constraint;
   };
-  SmallVector<ComponentStatistics> components;
+  SmallVector<ComponentStatistics, 1> components;
   SmallVector<CandidateRejection> rejections;
 };
 
@@ -43,6 +50,8 @@ struct SolverOptions {
   uint64_t exactCombinationLimit = 256;
   unsigned beamWidth = 32;
   uint64_t maxExpandedStates = 65536;
+  bool refineBeamSolution = true;
+  uint64_t maxRefinementProbes = 256;
 };
 
 enum class LayoutSolveFailureKind {
@@ -59,7 +68,8 @@ struct LayoutSolveFailure {
 FailureOr<LayoutSolution>
 solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
                  SolverOptions options = {}, LayoutSolveFailure *why = nullptr,
-                 LayoutAttemptStatistics *statistics = nullptr);
+                 LayoutAttemptStatistics *statistics = nullptr,
+                 LayoutTrace *trace = nullptr, bool diagnostic = false);
 void printLayoutSolutionStatistics(const LayoutConstraintGraph &graph,
                                    const LayoutSolution &solution,
                                    LayoutTarget &target, llvm::raw_ostream &os);
@@ -111,7 +121,7 @@ enum class LayoutCollectionMode {
 FailureOr<LayoutConstraintGraph> collectLayoutConstraints(
     Operation *root, LayoutTarget &target,
     LayoutCollectionMode mode = LayoutCollectionMode::InitializeCandidates,
-    LayoutStatisticsReport *statistics = nullptr);
+    LayoutStatisticsReport *statistics = nullptr, LayoutTrace *trace = nullptr);
 
 /// Extends the graph before finalization, including structured Tensor joins.
 LogicalResult collectDistributedLayoutConstraints(
@@ -121,8 +131,8 @@ LogicalResult collectDistributedLayoutConstraints(
 LogicalResult initializeStorageAliasCandidates(
     Operation *root, LayoutConstraintGraph &graph, LayoutTarget &target);
 
-LogicalResult propagateStrict(LayoutConstraintGraph &graph);
-LogicalResult propagateCommonToFixedPoint(LayoutConstraintGraph &graph);
+LogicalResult propagateStrict(LayoutConstraintGraph &graph, LayoutTrace *trace = nullptr);
+LogicalResult propagateCommonToFixedPoint(LayoutConstraintGraph &graph, LayoutTrace *trace = nullptr);
 
 } // namespace mlir::frisk
 

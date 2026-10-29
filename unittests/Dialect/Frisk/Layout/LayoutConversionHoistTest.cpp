@@ -43,8 +43,8 @@ protected:
   std::string print(ModuleOp module) {
     std::string s; llvm::raw_string_ostream os(s); module.print(os); return s;
   }
-  LogicalResult run(ModuleOp module) {
-    PassManager pm(&context); pm.addPass(createOptimizeLayoutConversionsPass());
+  LogicalResult run(ModuleOp module, LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy) {
+    PassManager pm(&context); pm.addPass(createOptimizeLayoutConversionsPass(mode));
     return pm.run(module);
   }
   OwningOpRef<ModuleOp> make(bool loop, bool shuffle = false, bool hard = false) {
@@ -116,6 +116,44 @@ TEST_F(LayoutConversionHoistTest, HoistsOnlyRegisterExchangeOutOfFor) {
   m->walk([&](ConvertLayoutOp c) { ++count; EXPECT_FALSE(c->getParentOfType<scf::ForOp>()); });
   EXPECT_EQ(count, 1u);
 }
+TEST_F(LayoutConversionHoistTest, StaticZeroOneAndHundredRequireStrictBenefit) {
+  for (int64_t count : {0, 1, 100}) {
+    auto m = make(true);
+    m->walk([&](scf::ForOp loop) {
+      b.setInsertionPoint(loop);
+      loop.setUpperBound(b.create<arith::ConstantIndexOp>(b.getUnknownLoc(), count));
+    });
+    ASSERT_TRUE(succeeded(run(*m, LayoutBoundaryFrequencyMode::StaticTripCount)));
+    unsigned conversions = 0;
+    m->walk([&](ConvertLayoutOp c) {
+      ++conversions;
+      EXPECT_EQ(bool(c->getParentOfType<scf::ForOp>()), count <= 1);
+    });
+    EXPECT_EQ(conversions, 1u);
+  }
+}
+TEST_F(LayoutConversionHoistTest, StaticLoopCarriedSourceStaysInside) {
+  auto loc = b.getUnknownLoc();
+  OwningOpRef<ModuleOp> m = ModuleOp::create(loc);
+  b.setInsertionPointToStart(m->getBody());
+  auto f = b.create<func::FuncOp>(loc, "carried", b.getFunctionType({type(false), type(true)}, {type(true)}));
+  f.addEntryBlock(); b.setInsertionPointToStart(&f.front());
+  auto zero = b.create<arith::ConstantIndexOp>(loc, 0);
+  auto one = b.create<arith::ConstantIndexOp>(loc, 1);
+  auto hundred = b.create<arith::ConstantIndexOp>(loc, 100);
+  auto loop = b.create<scf::ForOp>(loc, zero, hundred, one, f.getArguments(),
+      [&](OpBuilder &nested, Location l, Value, ValueRange args) {
+        Value c = nested.create<ConvertLayoutOp>(l, type(true), args[0]);
+        Value sum = nested.create<arith::AddFOp>(l, c, args[1]);
+        nested.create<scf::YieldOp>(l, ValueRange{args[0],sum});
+      });
+  b.create<func::ReturnOp>(loc, loop.getResult(1));
+  ASSERT_TRUE(succeeded(verify(*m)));
+  ASSERT_TRUE(succeeded(run(*m, LayoutBoundaryFrequencyMode::StaticTripCount)));
+  unsigned count = 0;
+  m->walk([&](ConvertLayoutOp c) { ++count; EXPECT_TRUE(c->getParentOfType<scf::ForOp>()); });
+  EXPECT_EQ(count, 1u);
+}
 TEST_F(LayoutConversionHoistTest, CommutesTypeChangingExtension) {
   auto m = make(false);
   auto f = *m->getOps<func::FuncOp>().begin();
@@ -144,10 +182,14 @@ TEST_F(LayoutConversionHoistTest, CommutesTypeChangingExtension) {
   EXPECT_EQ(count, 1u);
 }
 TEST_F(LayoutConversionHoistTest, DoesNotSpeculateShuffle) {
-  auto m = make(true, true); ASSERT_TRUE(succeeded(run(*m)));
+  for (auto mode : {LayoutBoundaryFrequencyMode::Legacy, LayoutBoundaryFrequencyMode::StaticTripCount}) {
+
+  auto m = make(true, true); ASSERT_TRUE(succeeded(run(*m, mode)));
   unsigned count = 0;
   m->walk([&](ConvertLayoutOp c) { ++count; EXPECT_TRUE(c->getParentOfType<scf::ForOp>()); });
   EXPECT_EQ(count, 1u);
+
+  }
 }
 TEST_F(LayoutConversionHoistTest, PreservesHardAnnotatedProducer) {
   auto m = make(false, false, true);
@@ -184,6 +226,8 @@ TEST_F(LayoutConversionHoistTest, DoesNotGrowTwoIndependentConversions) {
   EXPECT_EQ(count, 1u);
 }
 TEST_F(LayoutConversionHoistTest, DoesNotCrossBarrierOrUnknownRegion) {
+  for (auto mode : {LayoutBoundaryFrequencyMode::Legacy, LayoutBoundaryFrequencyMode::StaticTripCount}) {
+
   for (bool region : {false, true}) {
     auto m = make(true);
     m->walk([&](scf::ForOp loop) {
@@ -196,10 +240,12 @@ TEST_F(LayoutConversionHoistTest, DoesNotCrossBarrierOrUnknownRegion) {
         b.create<scf::YieldOp>(b.getUnknownLoc());
       }
     });
-    ASSERT_TRUE(succeeded(run(*m)));
+    ASSERT_TRUE(succeeded(run(*m, mode)));
     unsigned count = 0;
     m->walk([&](ConvertLayoutOp c) { ++count; EXPECT_TRUE(c->getParentOfType<scf::ForOp>()); });
     EXPECT_EQ(count, 1u);
+  }
+
   }
 }
 TEST_F(LayoutConversionHoistTest, RejectsBrokenDominanceWithoutMutation) {

@@ -8,6 +8,14 @@ struct SM90MmaGeometry {
   int64_t m, n, k, threads, gM, gN, atomN, mRepeat, nRepeat, kRepeat;
 };
 FailureOr<SM90MmaGeometry> getSM90MmaGeometry(MmaOp op, int64_t threads);
+/// Bounded generated proof domain in ascending gM order, at most four grids;
+/// legacy policies are singletons.
+FailureOr<SmallVector<SM90MmaGeometry>> getSM90MmaGeometries(MmaOp op, int64_t threads);
+DictionaryAttr encodeSM90MmaGeometry(MLIRContext *context, const SM90MmaGeometry &geometry);
+/// Strict schema and membership checks against the operation's shape/policy/dtype/threads.
+/// Semantic validity does not imply the fragment proof fits its hardware budget.
+FailureOr<SM90MmaGeometry> decodeSM90MmaGeometry(MmaOp op, int64_t threads, Attribute candidate);
+FailureOr<SM90MmaGeometry> getSM90MmaContractGeometry(MmaOp op, int64_t threads, Attribute binding);
 /// Logical (row,column) for register/lane/warp/warp_group carriers. A slots
 /// denote successive low/high halfwords of four packed 32-bit registers.
 std::array<int64_t, 2> getSM90MmaFragmentCoordinate(

@@ -2,12 +2,14 @@
 #include "Dialect/Frisk/IR/FriskAttributes.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "mlir/AsmParser/AsmParser.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/Parser/Parser.h"
 #include "gtest/gtest.h"
+#include "LayoutCostObserverTestSupport.h"
 
 using namespace mlir;
 using namespace mlir::frisk;
@@ -33,6 +35,23 @@ TEST(LayoutCostModelTest, AdditionSaturatesEveryFieldAndPreservesFlag) {
     EXPECT_TRUE(addLayoutCosts(sum, {}).saturated);
   }
   EXPECT_FALSE(addLayoutCosts({}, {}).saturated);
+}
+TEST(LayoutCostModelTest, LegacyTargetObserverDefaultsToActualAggregate) {
+  struct LegacyTarget : LayoutTarget {
+    void enumerateCandidates(const LayoutVar &, SmallVectorImpl<LayoutCandidate> &) const override {}
+    LogicalResult verifyCandidate(const LayoutVar &, Attribute, Location) const override { return success(); }
+    FailureOr<CostVector> evaluate(const CandidateAssignment &) const override {
+      CostVector cost; cost.codeSize = UINT64_MAX; return cost;
+    }
+  } target;
+  LayoutConstraintGraph graph;
+  CandidateAssignment assignment;
+  TestCostObserver observer;
+  auto result = static_cast<LayoutTarget &>(target).evaluate(graph, assignment, &observer);
+  ASSERT_TRUE(succeeded(result));
+  ASSERT_EQ(observer.parts.size(), 1u);
+  EXPECT_EQ(observer.parts[0].kind, "target-aggregate");
+  observer.expectSum(*result);
 }
 class StaticLayoutCostTest : public testing::Test {
 protected:
@@ -233,12 +252,44 @@ TEST_F(StaticLayoutCostTest, ProducerIsChargedOnceNotPerUse) {
   auto cost = evaluateStaticLayoutCost(graph, assignment);
   ASSERT_TRUE(succeeded(cost)); EXPECT_EQ(cost->cost.spillRiskAndRegisters, 2u);
   EXPECT_EQ(cost->cost.replication, 0u);
+  TestCostObserver observer;
+  auto observed = evaluateStaticLayoutCost(graph, assignment, &observer);
+  ASSERT_TRUE(succeeded(observed));
+  EXPECT_EQ(observed->cost, cost->cost);
+  EXPECT_EQ(observed->saturated, cost->saturated);
+  ASSERT_EQ(observer.parts.size(), 1u);
+  EXPECT_EQ(observer.parts[0].owner, def);
+  observer.expectSum(*observed);
 }
 TEST_F(StaticLayoutCostTest, UnknownStaticEstimateFails) {
   LayoutConstraintGraph graph;
   auto id = graph.addVariable(LayoutKind::Distributed, {}, "unknown");
   CandidateAssignment assignment; assignment.values[id] = encoding();
   EXPECT_TRUE(failed(evaluateStaticLayoutCost(graph, assignment)));
+}
+TEST_F(StaticLayoutCostTest, ObservedChargesSaturateAndIgnoreAssignmentInsertionOrder) {
+  LayoutConstraintGraph graph;
+  auto type = RankedTensorType::get({int64_t{1} << 61}, b.getI1Type());
+  auto layout = permutedEncoding(int64_t{1} << 60, 1, 0, 0, 2);
+  for (unsigned i = 0; i < 17; ++i)
+    graph.addVariable(LayoutKind::Distributed, type, "v" + std::to_string(i));
+  for (bool reverse : {false, true}) {
+    CandidateAssignment assignment;
+    for (unsigned i = 0; i < 17; ++i)
+      assignment.values[reverse ? 16 - i : i] = layout;
+    TestCostObserver observer;
+    auto plain = evaluateStaticLayoutCost(graph, assignment);
+    auto observed = evaluateStaticLayoutCost(graph, assignment, &observer);
+    ASSERT_TRUE(succeeded(plain));
+    ASSERT_TRUE(succeeded(observed));
+    EXPECT_EQ(plain->cost, observed->cost);
+    EXPECT_EQ(plain->saturated, observed->saturated);
+    EXPECT_TRUE(observed->saturated);
+    EXPECT_EQ(observed->cost.spillRiskAndRegisters, UINT64_MAX);
+    ASSERT_EQ(observer.parts.size(), 17u);
+    for (unsigned i = 0; i < 17; ++i) EXPECT_EQ(observer.parts[i].owner, i);
+    observer.expectSum(*observed);
+  }
 }
 TEST_F(StaticLayoutCostTest, ReplicationCountsExtraOwners) {
   auto encodingBase = encoding();
@@ -283,6 +334,16 @@ TEST_F(StaticLayoutCostTest, SharedAliasRootCountsOnceAndDistinctRootsSum) {
   }
   auto cost = evaluateStaticLayoutCost(graph, assignment);
   ASSERT_TRUE(succeeded(cost)); EXPECT_EQ(cost->cost.sharedBytesAndOccupancy, 32u);
+  TestCostObserver observer;
+  auto observed = evaluateStaticLayoutCost(graph, assignment, &observer);
+  ASSERT_TRUE(succeeded(observed));
+  EXPECT_EQ(observed->cost, cost->cost);
+  EXPECT_EQ(observed->saturated, cost->saturated);
+  ASSERT_EQ(observer.parts.size(), 2u);
+  EXPECT_EQ(observer.parts[0].kind, "shared-root");
+  EXPECT_EQ(observer.parts[0].owner, 0u);
+  EXPECT_EQ(observer.parts[1].owner, 2u);
+  observer.expectSum(*observed);
 }
 TEST_F(StaticLayoutCostTest, SyntheticSharedRootsAreNotConflated) {
   auto type = MemRefType::get({4}, b.getI32Type(), MemRefLayoutAttrInterface{}, b.getI64IntegerAttr(3));
@@ -347,6 +408,14 @@ TEST_F(StaticLayoutCostTest, OffsetAliasesChargeMaximumRootEndInEitherOrder) {
     // Occupied intervals are [4,12) and [20,28). Count the root-origin span,
     // not their 8-byte lengths, their sum, or the entire 32-byte allocation.
     EXPECT_EQ(cost->cost.sharedBytesAndOccupancy, 28u);
+    TestCostObserver observer;
+    auto observed = evaluateStaticLayoutCost(graph, assignment, &observer);
+    ASSERT_TRUE(succeeded(observed));
+    EXPECT_EQ(observed->cost, cost->cost);
+    EXPECT_EQ(observed->saturated, cost->saturated);
+    ASSERT_EQ(observer.parts.size(), 1u);
+    EXPECT_EQ(observer.parts[0].owner, 0u);
+    observer.expectSum(*observed);
   }
 }
 TEST_F(StaticLayoutCostTest, GlobalStorageHasNoSharedChargeInComponentAssignment) {
@@ -363,5 +432,70 @@ TEST_F(StaticLayoutCostTest, GlobalStorageHasNoSharedChargeInComponentAssignment
   assignment.values[id] = layout;
   auto cost = evaluateStaticLayoutCost(graph, assignment);
   ASSERT_TRUE(succeeded(cost)); EXPECT_EQ(cost->cost.sharedBytesAndOccupancy, 0u);
+}
+TEST_F(StaticLayoutCostTest, StaticFrequencyWeightsOnlyDynamicConversionAndClone) {
+  context.getOrLoadDialect<arith::ArithDialect>();
+  auto module = parseSourceString<ModuleOp>(R"mlir(
+    func.func @frequency() {
+      %zero = arith.constant 0 : index
+      %one = arith.constant 1 : index
+      %hundred = arith.constant 100 : index
+      scf.for %i = %zero to %hundred step %one {
+        %marker = arith.constant 0 : i32
+      }
+      return
+    }
+  )mlir", &context);
+  ASSERT_TRUE(module);
+  Operation *at = nullptr;
+  module->walk([&](arith::ConstantOp op) { if (op.getType().isInteger(32)) at = op; });
+  ASSERT_TRUE(at);
+  LayoutVar var; var.kind = LayoutKind::Distributed;
+  var.shapedType = RankedTensorType::get({128}, b.getF32Type());
+  auto a = permutedEncoding(4, 1, 0, 0), z = permutedEncoding(4, 1, 0, 1);
+  LayoutConversionEdge edge; edge.insertionPoint = at;
+  auto legacy = evaluateLayoutConversionCost(var, a, z, edge);
+  ASSERT_TRUE(succeeded(legacy)); EXPECT_EQ(legacy->cost.conversionBytesAndSync, 1024u);
+  auto cost = evaluateLayoutConversionCost(var, a, z, edge, LayoutBoundaryFrequencyMode::StaticTripCount);
+  ASSERT_TRUE(succeeded(cost)); EXPECT_EQ(cost->cost.conversionBytesAndSync, 51200u);
+  EXPECT_EQ(cost->cost.codeSize, 1u); EXPECT_EQ(edge.bytes, 512u);
+  EXPECT_EQ(edge.frequencyFactor, 100u); EXPECT_FALSE(edge.frequencyUsesProxy);
+  auto clone = evaluateLayoutCloneCost(var, a, at, LayoutBoundaryFrequencyMode::StaticTripCount);
+  ASSERT_TRUE(succeeded(clone)); EXPECT_EQ(clone->cost.conversionBytesAndSync, 51200u);
+  EXPECT_EQ(clone->cost.spillRiskAndRegisters, 4u); EXPECT_EQ(clone->cost.codeSize, 1u);
+}
+TEST_F(StaticLayoutCostTest, ZeroWorkAndEmptyLoopsPreserveSaturationSemantics) {
+  context.getOrLoadDialect<arith::ArithDialect>();
+  for (bool empty : {false,true}) {
+    std::string text = R"mlir(func.func @huge() {
+      %lb = arith.constant -9223372036854775808 : index
+      %ub = arith.constant 9223372036854775807 : index
+      %zero = arith.constant 0 : index
+      %one = arith.constant 1 : index
+      scf.for %i = %lb to %ub step %one {
+        scf.for %j = %lb to %ub step %one {
+          scf.for %k = %zero to )mlir";
+    text += empty ? "%zero" : "%one";
+    text += R"mlir( step %one { %marker = arith.constant 0 : i32 }
+        }
+      }
+      return
+    })mlir";
+    auto module = parseSourceString<ModuleOp>(text, &context); ASSERT_TRUE(module);
+    Operation *at = nullptr;
+    module->walk([&](arith::ConstantOp op) { if (op.getType().isInteger(32)) at = op; });
+    LayoutVar var; var.kind = LayoutKind::Distributed;
+    var.shapedType = RankedTensorType::get({64}, b.getF32Type());
+    LayoutConversionEdge edge; edge.insertionPoint = at;
+    auto identity = evaluateLayoutConversionCost(var, encoding(), encoding(), edge, LayoutBoundaryFrequencyMode::StaticTripCount);
+    ASSERT_TRUE(succeeded(identity)); EXPECT_EQ(identity->cost.conversionBytesAndSync, 0u);
+    EXPECT_FALSE(identity->saturated); EXPECT_EQ(edge.frequencySaturated, !empty);
+    if (empty) {
+      var.shapedType = RankedTensorType::get({int64_t{1} << 62}, b.getF64Type());
+      auto cost = evaluateLayoutCloneCost(var, encoding(int64_t{1} << 57), at, LayoutBoundaryFrequencyMode::StaticTripCount);
+      ASSERT_TRUE(succeeded(cost)); EXPECT_EQ(cost->cost.conversionBytesAndSync, 0u);
+      EXPECT_TRUE(cost->saturated); EXPECT_EQ(cost->cost.codeSize, 1u);
+    }
+  }
 }
 } // namespace

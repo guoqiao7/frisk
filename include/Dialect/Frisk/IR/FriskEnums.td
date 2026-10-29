@@ -17,10 +17,11 @@ def MemorySpaceEnum : I32EnumAttr<"MemorySpace",
 def GemmWarpPolicy_Square : I32EnumAttrCase<"Square", 0>;
 def GemmWarpPolicy_FullRow : I32EnumAttrCase<"FullRow", 1>;
 def GemmWarpPolicy_FullCol : I32EnumAttrCase<"FullCol", 2>;
+def GemmWarpPolicy_Auto : I32EnumAttrCase<"Auto", 3>;
 
 def GemmWarpPolicyEnum : I32EnumAttr<"GemmWarpPolicy",
     "Policy for GEMM warp partitioning",
-    [GemmWarpPolicy_Square, GemmWarpPolicy_FullRow, GemmWarpPolicy_FullCol]> {
+    [GemmWarpPolicy_Square, GemmWarpPolicy_FullRow, GemmWarpPolicy_FullCol, GemmWarpPolicy_Auto]> {
   let cppNamespace = "::mlir::frisk::attr";
 }
 

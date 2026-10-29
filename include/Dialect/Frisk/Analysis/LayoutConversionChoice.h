@@ -17,7 +17,7 @@ bool isRematerializable(Operation *op);
 /// (possibly component-local) assignment. Never modifies IR or candidate domains.
 FailureOr<LayoutConversionChoices> chooseLayoutConversions(
     const LayoutConstraintGraph &graph, const CandidateAssignment &assignment,
-    LayoutTarget &target);
+    LayoutTarget &target, LayoutCostObserver *observer = nullptr);
 
 bool sameLayoutConversionPlan(const LayoutConversionEdge &a,
                               const LayoutConversionEdge &b);

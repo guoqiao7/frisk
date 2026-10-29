@@ -331,3 +331,33 @@ TEST_F(ReductionLayoutProofTest, LogicalBudgetOverflowIsUnknownBeforeEnumeration
             std::string::npos);
   EXPECT_TRUE(failed(projectReductionEncoding(src, type({512,256}), type({512}), 1)));
 }
+
+TEST_F(ReductionLayoutProofTest, UnitAxesProjectionAndCanonicalContributors) {
+  for (auto shape : {SmallVector<int64_t>{1,8}, {8,1}, {1,1}}) {
+    unsigned bits = shape[0]*shape[1] == 1 ? 0 : 3;
+    SmallVector<uint64_t> rows; for(unsigned b=0;b<bits;++b) rows.push_back(1u<<b);
+    auto src = encoding(shape,{0,5,0,0,0},{1,32,1,1,1},rows);
+    for (int64_t axis : {0,1}) {
+      auto dstType = type({shape[1-axis]});
+      auto dst = projectReductionEncoding(src,type(shape),dstType,axis);
+      ASSERT_TRUE(succeeded(dst));
+      auto p = buildReductionLayoutProof(src,*dst,type(shape),dstType,axis);
+      ASSERT_EQ(p.proof.status,ProofStatus::Proven);
+      EXPECT_EQ(p.fibers.size(),unsigned(shape[1-axis]));
+      for (auto &fiber:p.fibers) {
+        unsigned leaves=0;
+        for(auto &node:fiber.nodes) if(node.logicalInput>=0) {
+          ++leaves;
+          EXPECT_EQ(axis==1 ? node.logicalInput/shape[1] : node.logicalInput%shape[1],fiber.logicalOutput);
+        }
+        EXPECT_EQ(leaves,unsigned(shape[axis]));
+        EXPECT_EQ(fiber.broadcasts.size(),unsigned(32/shape[1-axis]));
+      }
+      EXPECT_EQ(verifyReductionLayoutProof(src,*dst,type(shape),dstType,axis,p).status,ProofStatus::Proven);
+      p.fibers[0].broadcasts.pop_back();
+      EXPECT_EQ(verifyReductionLayoutProof(src,*dst,type(shape),dstType,axis,p).status,ProofStatus::Disproven);
+    }
+  }
+  auto empty = encoding({1,1},{0,0,0,0,0},{1,1,1,1,1},{});
+  EXPECT_TRUE(succeeded(projectReductionEncoding(empty,type({1,1}),type({1}),1)));
+}

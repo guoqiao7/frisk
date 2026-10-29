@@ -39,7 +39,7 @@ bool supportedElementwise(Operation *op) {
 }
 
 FailureOr<CostEstimate> conversionCost(Value source, Attribute destination,
-                                       Operation *at, LayoutConversionEdge &edge) {
+                                       Operation *at, LayoutConversionEdge &edge, LayoutTarget &target) {
   auto type = dyn_cast<RankedTensorType>(source.getType());
   if (!type) return failure();
   LayoutVar var;
@@ -47,7 +47,7 @@ FailureOr<CostEstimate> conversionCost(Value source, Attribute destination,
   var.shapedType = type;
   var.value = source;
   edge.insertionPoint = at;
-  return evaluateLayoutConversionCost(var, type.getEncoding(), destination, edge);
+  return evaluateLayoutConversionCost(var, type.getEncoding(), destination, edge, target.boundaryFrequencyMode());
 }
 
 bool verifiedCandidate(ModuleOp module, LayoutTarget &target) {
@@ -83,8 +83,8 @@ bool commute(ConvertLayoutOp convert, ModuleOp module, LayoutTarget &target) {
   if (inputType.getShape() != resultType.getShape()) return false;
   LayoutConversionEdge beforeEdge, afterEdge;
   auto before = conversionCost(convert.getSource(), resultType.getEncoding(),
-                               convert, beforeEdge);
-  auto after = conversionCost(input, resultType.getEncoding(), producer, afterEdge);
+                               convert, beforeEdge, target);
+  auto after = conversionCost(input, resultType.getEncoding(), producer, afterEdge, target);
   if (failed(before) || failed(after) || before->saturated || after->saturated ||
       before->cost < after->cost) return false;
 
@@ -120,12 +120,15 @@ bool hoistLoop(ConvertLayoutOp convert, ModuleOp module, LayoutTarget &target) {
     if (!isa<ModuleOp, func::FuncOp, scf::ForOp>(parent)) return false;
   LayoutConversionEdge oldEdge, newEdge;
   auto before = conversionCost(convert.getSource(), convert.getResult().getType().getEncoding(),
-                               convert, oldEdge);
+                               convert, oldEdge, target);
   auto after = conversionCost(convert.getSource(), convert.getResult().getType().getEncoding(),
-                              loop, newEdge);
+                              loop, newEdge, target);
   // Pure is not permission to speculate a shuffle or a collective barrier.
   if (failed(before) || failed(after) || oldEdge.exchange != ConversionExchangeKind::Register ||
       before->saturated || after->saturated || before->cost < after->cost) return false;
+  if (target.boundaryFrequencyMode() == LayoutBoundaryFrequencyMode::StaticTripCount &&
+      !(after->cost.conversionBytesAndSync < before->cost.conversionBytesAndSync))
+    return false;
   for (Operation &op : *loop.getBody()) {
     if (&op == convert.getOperation() || isa<scf::YieldOp>(op)) continue;
     if (op.getNumRegions() || hasHardAttributes(&op)) return false;
@@ -143,9 +146,20 @@ bool hoistLoop(ConvertLayoutOp convert, ModuleOp module, LayoutTarget &target) {
 
 class OptimizeLayoutConversionsPass final
     : public impl::OptimizeLayoutConversionsBase<OptimizeLayoutConversionsPass> {
+public:
+  OptimizeLayoutConversionsPass() = default;
+  OptimizeLayoutConversionsPass(const OptimizeLayoutConversionsPass &other)
+      : impl::OptimizeLayoutConversionsBase<OptimizeLayoutConversionsPass>(other) {}
+  explicit OptimizeLayoutConversionsPass(LayoutBoundaryFrequencyMode mode) {
+    boundaryFrequency = mode == LayoutBoundaryFrequencyMode::Legacy ? "legacy" : "static-trip-count";
+  }
   void runOnOperation() override {
     ModuleOp original = getOperation();
-    auto target = createSM90LayoutTarget();
+    if (boundaryFrequency != "legacy" && boundaryFrequency != "static-trip-count") {
+      original.emitError("invalid boundary-frequency: expected legacy or static-trip-count");
+      signalPassFailure(); return;
+    }
+    auto target = createSM90LayoutTarget(boundaryFrequency == "legacy" ? LayoutBoundaryFrequencyMode::Legacy : LayoutBoundaryFrequencyMode::StaticTripCount);
     if (failed(verifyMaterializedLayouts(original, *target))) {
       signalPassFailure(); return;
     }
@@ -178,6 +192,9 @@ class OptimizeLayoutConversionsPass final
     original.getBodyRegion().takeBody(staged->getBodyRegion());
   }
 };
+}
+std::unique_ptr<Pass> createOptimizeLayoutConversionsPass(LayoutBoundaryFrequencyMode mode) {
+  return std::make_unique<OptimizeLayoutConversionsPass>(mode);
 }
 std::unique_ptr<Pass> createOptimizeLayoutConversionsPass() {
   return std::make_unique<OptimizeLayoutConversionsPass>();
