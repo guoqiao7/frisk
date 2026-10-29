@@ -1,3 +1,7 @@
+> 2026-10-29 P1.4b基础完整Attention GPU闭环已验收。Frisk实际SSA/布局/契约经受检导出和逐操作标量化，复用Triton低层编译生成cubin；135次完整数值、54次运输/cast逐次检查与最终cubin四工具通过；Release577、CTest10、lit73及独立复审通过。P1.4c尚未实施。见[报告](../inference_detail/p1_4b_implementation_report.md)。
+
+> 2026-10-29 按用户反馈，GPU执行闭环合并为两个独立任务：P1.4b基础完整Attention闭环（内部连续完成Triton接入、桥接、搬运、MMA、Softmax与整链），P1.4c异步搬运闭环（同一框架内分别验证cp.async/TMA）。旧9项停止独立立项；后端尚未实现。见[阶段任务清单](p1_4_gpu_execution_roadmap.md)。
+
 > 2026-10-29 P1.4a：最小形状支持已完整验收，功能回归、独立源码及最终证据/文档复审均通过。静态正二次幂单位轴、插入轴Broadcast、rank≥2到rank≥1 Reduce及静态expand/collapse/transpose闭环；575 Release主单测、20 selection，双配置最终15聚焦/5lit及辅助守门通过。GPU基础后端及后续路线未完成。见[实施报告](../inference_detail/p1_4a_implementation_report.md)。
 
 # Frisk 布局推断系统优化清单与推进建议

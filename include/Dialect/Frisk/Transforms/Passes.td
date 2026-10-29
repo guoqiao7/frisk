@@ -53,4 +53,10 @@ def TestLowerLayoutConversions : Pass<"frisk-test-lower-layout-conversions", "::
     "Lower verified rank-one global tile load/conversion/store kernels without tensor bridges">];
 }
 
+def ExportExecution : Pass<"frisk-export-execution", "::mlir::ModuleOp"> {
+ let summary = "Export bounded checked execution maps and reduction proofs";
+ let constructor = "mlir::frisk::createExportExecutionPass()";
+ let options = [Option<"output", "output", "std::string", "\"\"", "Atomic JSON output path">];
+}
+
 #endif // FRISK_PASSES

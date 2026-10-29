@@ -1,3 +1,5 @@
+> 2026-10-29 P1.4b固定ABI Attention GPU执行已验收：实际物化SSA/映射/契约驱动受检导出和逐操作低层发射，Triton 3.4.0完成后续编译；弱对齐、归约树、SS/RS及packing保持。135次完整数值、54次运输/cast和最终cubin四工具通过；范围为报告中的受限单CTA后端，P1.4c未实施。见[报告](inference_detail/p1_4b_implementation_report.md)。
+
 # Frisk SM90 MLIR-native 布局推断系统设计
 
 > 2026-10-29：P1.3c已完成验收，完整源码、驱动、数据与文档独立复审通过。默认legacy保留；显式`boundary-frequency=static-trip-count`统一转换/clone与受限外提的频率口径。Release主单测570、选择质量20，相关Debug/lit及辅助守门通过；18次语义核验与36次串行CPU调用通过，身份复验不变。下一独立任务为最小形状支持，GPU和跨框架比较尚未实施。见[阶段报告](inference_detail/p1_3c_implementation_report.md)。

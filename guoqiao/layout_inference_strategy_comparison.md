@@ -1,3 +1,5 @@
+> 2026-10-29 P1.4b已建立受限固定ABI Attention真实执行证据：Frisk保有布局/契约决策，通用逐操作标量发射复用Triton低层编译；并未证明所有Frisk映射可直接转为Triton原生Tensor编码。功能与安全通过，跨布局性能消融、成本校准和公平跨框架比较仍未完成。见[报告](inference_detail/p1_4b_implementation_report.md)。
+
 # Triton、TileLang 与 Frisk 布局推断对比及 Frisk 架构决策
 
 > 2026-10-29：P1.3c已完成验收，完整源码、驱动、数据与文档独立复审通过。默认legacy保留；显式`boundary-frequency=static-trip-count`统一转换/clone与受限外提的频率口径。Release主单测570、选择质量20，相关Debug/lit及辅助守门通过；18次语义核验与36次串行CPU调用通过，身份复验不变。下一独立任务为最小形状支持，GPU和跨框架比较尚未实施。见[阶段报告](inference_detail/p1_3c_implementation_report.md)。

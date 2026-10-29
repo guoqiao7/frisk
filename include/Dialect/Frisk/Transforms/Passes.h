@@ -27,6 +27,7 @@ std::unique_ptr<Pass> createNormalizeLayoutIRPass();
 std::unique_ptr<Pass> createOptimizeLayoutConversionsPass();
 std::unique_ptr<Pass> createOptimizeLayoutConversionsPass(LayoutBoundaryFrequencyMode mode);
 std::unique_ptr<Pass> createTestLowerLayoutConversionsPass();
+std::unique_ptr<Pass> createExportExecutionPass();
 
 #define GEN_PASS_REGISTRATION
 #include "Dialect/Frisk/Transforms/Passes.h.inc"

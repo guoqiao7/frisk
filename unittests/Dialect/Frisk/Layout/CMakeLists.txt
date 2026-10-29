@@ -5,6 +5,7 @@ add_unittest(FriskUnitTests FriskLayoutUnitTests PARTIAL_SOURCES_INTENDED
   LayoutProfileTest.cpp
   LayoutTraceTest.cpp
   LayoutStatisticsTest.cpp
+  ExecutionExportTest.cpp
   LayoutExecutableAdapterTest.cpp
   LayoutAffineEvaluationTest.cpp
   TileLangDifferentialTest.cpp
