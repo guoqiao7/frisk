@@ -1,3 +1,5 @@
+> 2026-10-29 P1.4b/P1.4c均已完整验收：弱对齐基础、强对齐cp.async/TMA均真实生成并执行完整Attention，descriptor/根契约/完成协议受检，单次无重叠。历史提案中的未实施状态已由当前报告取代；流水重叠、校准和公平比较仍未完成。见[P1.4c报告](../inference_detail/p1_4c_implementation_report.md)。
+
 > 2026-10-29 P1.4b已完整验收：最终采用受检操作/映射/契约导出与低层标量TTGIR/PTX发射，复用固定版本Triton的LLVM/PTX/cubin基础；并非让Triton重选Tensor布局。原有弱对齐/算法/精度边界兑现，数值门槛在实现前冻结。P1.4c尚未实施。见[报告](../inference_detail/p1_4b_implementation_report.md)。
 
 > 2026-10-29 GPU路线更新：优先复用固定版本Triton后端并经受检显式布局桥接接入；按用户反馈只保留P1.4b基础完整Attention、P1.4c异步搬运两个独立任务，切片验证收进内部步骤。原算法、ABI、弱对齐、数值和安全边界继续适用；数值门槛仍为实现前应冻结的提案。见[GPU执行闭环任务清单](p1_4_gpu_execution_roadmap.md)。

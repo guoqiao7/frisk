@@ -1,3 +1,5 @@
+> 2026-10-29 P1.4c补齐cp.async/TMA完整单CTA Attention执行证据：同一Frisk决策/受检发射和Triton低层编译框架，强对齐路径与弱对齐基础分别验收；保留算法/精度/外部地址约束。功能与安全通过，单次无重叠；未宣称性能优势，后续联合选择/转换消融、校准及公平对比尚未完成。见[报告](inference_detail/p1_4c_implementation_report.md)。
+
 > 2026-10-29 P1.4b已建立受限固定ABI Attention真实执行证据：Frisk保有布局/契约决策，通用逐操作标量发射复用Triton低层编译；并未证明所有Frisk映射可直接转为Triton原生Tensor编码。功能与安全通过，跨布局性能消融、成本校准和公平跨框架比较仍未完成。见[报告](inference_detail/p1_4b_implementation_report.md)。
 
 # Triton、TileLang 与 Frisk 布局推断对比及 Frisk 架构决策

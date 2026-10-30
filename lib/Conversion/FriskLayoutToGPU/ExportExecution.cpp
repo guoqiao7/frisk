@@ -3,6 +3,8 @@
 #include "Dialect/Frisk/IR/FriskOps.h"
 #include "Dialect/Frisk/Transforms/Passes.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/IR/Dominance.h"
+#include "Dialect/Frisk/Analysis/StorageRootContracts.h"
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
 #include "Dialect/Frisk/Target/SM90/SM90LayoutTarget.h"
 #include "llvm/ADT/DenseMap.h"
@@ -83,6 +85,9 @@ struct ExportExecutionPass: impl::ExportExecutionBase<ExportExecutionPass> {
    }
    operations.push_back(std::move(o));
   });
+  auto rootContracts=collectStorageRootContracts(module);
+  if(failed(rootContracts)){signalPassFailure();return;}
+  DominanceInfo dominance(module);
   llvm::json::Array serialized;
   for(Value v:values){
    llvm::json::Object o{{"id",ids.lookup(v)},{"type",text(v.getType())}};
@@ -99,6 +104,16 @@ struct ExportExecutionPass: impl::ExportExecutionBase<ExportExecutionPass> {
     if(enc){
      auto alias=analyzeStorageAlias(v);
      if(failed(alias)){reject(module,"storage alias is not supported");continue;}
+     // Only explicit validated root declarations may strengthen the ABI.
+     // A view must be dominated by that declaration; root serialization uses
+     // its own complete declaration as the external launch precondition.
+     for(const auto &contract:*rootContracts) {
+      if(contract.root.root!=alias->root)continue;
+      Operation *anchor=v.getDefiningOp();
+      if((v==alias->root && enc==contract.layout) ||
+         (anchor && storageContractDominates(contract.declaration,anchor,dominance)))
+       alias->rootAlignment=std::max(alias->rootAlignment,contract.root.rootAlignment);
+     }
      auto footprint=buildStorageAliasFootprint(*alias,enc);
      if(footprint.proof.status != ProofStatus::Proven){reject(module,"storage footprint is not Proven");continue;}
      llvm::json::Array addresses;

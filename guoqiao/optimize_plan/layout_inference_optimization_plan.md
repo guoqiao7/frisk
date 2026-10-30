@@ -1,3 +1,5 @@
+> 2026-10-29 P1.4c完整异步Attention已验收：cp.async/TMA和弱对齐基础共405次完整数值、54次运输、12次最终cubin安全检查及CPU578/20/10/75全部通过，双重独立复审和root核验批准。同一后端/runner，下一阶段联合选择及转换消融未开始。见[报告](../inference_detail/p1_4c_implementation_report.md)。
+
 > 2026-10-29 P1.4b基础完整Attention GPU闭环已验收。Frisk实际SSA/布局/契约经受检导出和逐操作标量化，复用Triton低层编译生成cubin；135次完整数值、54次运输/cast逐次检查与最终cubin四工具通过；Release577、CTest10、lit73及独立复审通过。P1.4c尚未实施。见[报告](../inference_detail/p1_4b_implementation_report.md)。
 
 > 2026-10-29 按用户反馈，GPU执行闭环合并为两个独立任务：P1.4b基础完整Attention闭环（内部连续完成Triton接入、桥接、搬运、MMA、Softmax与整链），P1.4c异步搬运闭环（同一框架内分别验证cp.async/TMA）。旧9项停止独立立项；后端尚未实现。见[阶段任务清单](p1_4_gpu_execution_roadmap.md)。

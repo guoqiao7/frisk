@@ -35,4 +35,22 @@ TEST_F(ExecutionExportTest, RejectsForgedTargetWithoutPublishingOrMutating){
  auto m=selected();ASSERT_TRUE(m);m->getOperation()->setAttr("frisk.target",StringAttr::get(&context,"sm_80"));auto before=print(*m);{std::error_code ec;llvm::raw_fd_ostream os(path,ec);ASSERT_FALSE(bool(ec));os<<"preserve";}
  ScopedDiagnosticHandler silence(&context,[](Diagnostic &){return success();});EXPECT_TRUE(failed(run(*m)));EXPECT_EQ(before,print(*m));auto bytes=llvm::MemoryBuffer::getFile(path);ASSERT_TRUE(bool(bytes));EXPECT_EQ((*bytes)->getBuffer(),"preserve");
 }
+TEST_F(ExecutionExportTest, StrongAsyncABIExportsActualRootAlignment){
+ for(auto suffix:{"cp-async","tma"}) {
+  std::string fixture=FRISK_ATTENTION_FIXED_ABI_FIXTURE;
+  fixture.replace(fixture.find("fixed"),5,suffix);
+  auto m=parseSourceFile<ModuleOp>(fixture,&context);ASSERT_TRUE(m);
+  PassManager pm(&context);pm.addPass(createFriskInferLayoutsPass());ASSERT_TRUE(succeeded(pm.run(*m)));
+  ASSERT_TRUE(succeeded(run(*m)));
+  auto bytes=llvm::MemoryBuffer::getFile(path);ASSERT_TRUE(bool(bytes));
+  auto parsed=llvm::json::parse((*bytes)->getBuffer());ASSERT_TRUE(bool(parsed));
+  unsigned strong=0;
+  for(auto &v:*parsed->getAsObject()->getArray("values")) {
+   auto *o=v.getAsObject();auto *storage=o->getObject("storage");
+   if(storage && storage->getInteger("alignment")==128)++strong;
+  }
+  EXPECT_GE(strong,6u);
+ }
+}
+
 }

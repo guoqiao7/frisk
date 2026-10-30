@@ -1,3 +1,5 @@
+> 2026-10-29 P1.4c已完成：cp.async、TMA及弱对齐基础各135/135，54次运输bit-exact、12次最终cubin安全检查；Release578/578、selection20/20、CTest10/10、lit75/75及双配置export3/3通过，独立任务/最强整体复审与root身份核验批准。下一阶段为联合选择及转换消融，尚未开始。见[报告](inference_detail/p1_4c_implementation_report.md)。
+
 > 2026-10-29 P1.4b基础完整Attention GPU闭环已完成：Release577/577、CTest10/10、lit73/73，新增C++双配置2/2，135次完整Attention/54次运输cast逐次验证及最终cubin四工具通过，独立任务与整体复审批准。实际资源64寄存器/线程、6144B静态Shared、0spill/local；未宣称性能优势。下一任务P1.4c尚未实施。见[报告](inference_detail/p1_4b_implementation_report.md)。
 
 > 2026-10-29 P1.4a：最小形状支持已完整验收，功能回归、独立源码及最终证据/文档复审均通过。静态正二次幂单位轴、插入轴Broadcast、rank≥2到rank≥1 Reduce及静态expand/collapse/transpose闭环；575 Release主单测、20 selection，双配置最终15聚焦/5lit及辅助守门通过。GPU基础后端及后续路线未完成。见[实施报告](inference_detail/p1_4a_implementation_report.md)。

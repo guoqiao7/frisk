@@ -1,3 +1,5 @@
+> 2026-10-29 P1.4c已完整验收：在同一受检Frisk→低层发射→Triton编译链实现cp.async与TMA完整Attention，强ABI QKV128/O1明确、弱对齐基础保留。三路径各135次数值、异步运输54次及最终cubin12次安全工具通过；单次无重叠，不代表多阶段流水支持。见[报告](inference_detail/p1_4c_implementation_report.md)。
+
 > 2026-10-29 P1.4b固定ABI Attention GPU执行已验收：实际物化SSA/映射/契约驱动受检导出和逐操作低层发射，Triton 3.4.0完成后续编译；弱对齐、归约树、SS/RS及packing保持。135次完整数值、54次运输/cast和最终cubin四工具通过；范围为报告中的受限单CTA后端，P1.4c未实施。见[报告](inference_detail/p1_4b_implementation_report.md)。
 
 # Frisk SM90 MLIR-native 布局推断系统设计
