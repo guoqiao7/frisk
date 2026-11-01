@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Analysis/ExecutionLayoutProof.h"
+#include "Conversion/FriskLayoutToGPU/LayoutConversionPlan.h"
 #include "Dialect/Frisk/Analysis/ReductionLayoutProof.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
 #include "Dialect/Frisk/Transforms/Passes.h"
@@ -61,6 +62,20 @@ struct ExportExecutionPass: impl::ExportExecutionBase<ExportExecutionPass> {
    llvm::json::Object attrs;
    for(NamedAttribute a:op->getAttrs())attrs[a.getName().strref()]=attributeJSON(a.getValue());
    llvm::json::Object o{{"name",op->getName().getStringRef().str()},{"operands",std::move(operands)},{"results",std::move(results)},{"attrs",std::move(attrs)}};
+   if(auto conversion=dyn_cast<ConvertLayoutOp>(op)) {
+    auto p=test::planRedistribution(cast<RankedTensorType>(op->getOperand(0).getType()),cast<RankedTensorType>(op->getResult(0).getType()),op->getLoc());
+    if(failed(p)){reject(op,"redistribution plan failed");return;}
+    auto owner=[](test::Owner x){return llvm::json::Object{{"reg",x.reg},{"lane",x.lane},{"warp",x.warp},{"warp_group",x.warpGroup}};};
+    llvm::json::Array destinations,writers,words;
+    for(auto d:p->destinations)destinations.push_back(llvm::json::Object{{"source",owner(d.source)},{"slot",int64_t(d.slot)}});
+    for(auto w:p->globalWriters)writers.push_back(owner(w));
+    for(auto w:p->payload.words)words.push_back(llvm::json::Object{{"bit_offset",w.bitOffset},{"live_bits",w.liveBits}});
+    o["redistribution"]=llvm::json::Object{{"mode",p->mode==test::ExchangeMode::Register?"Register":p->mode==test::ExchangeMode::Shuffle?"Shuffle":"Shared"},
+      {"threads",p->threads},{"warps",p->warps},{"source_registers",p->sourceRegisters},{"destination_registers",p->destinationRegisters},
+      {"volume",int64_t(p->volume)},{"scratch_bytes",int64_t(p->scratchBytes)},
+      {"payload",llvm::json::Object{{"bits",p->payload.bits},{"words",std::move(words)}}},
+      {"destinations",std::move(destinations)},{"source_slots",numbers(p->sourceSlots)},{"global_writers",std::move(writers)}};
+   }
    if(auto copy=dyn_cast<CopyOp>(op)) {
     auto enc=op->getAttrOfType<DistributedEncodingAttr>("frisk.execution_layout");
     auto ty=cast<MemRefType>(copy.getSrc().getType());

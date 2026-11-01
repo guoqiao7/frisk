@@ -30,9 +30,14 @@ class BackendTests(unittest.TestCase):
   with self.assertRaisesRegex(ValueError,'SS.*K-major'):backend.emit(data)
  def test_copy_non_f16_is_rejected(self):
   data=json.loads(Path(INPUT).read_text());op=next(o for o in data['operations'] if o['name']=='frisk.copy');values={v['id']:v for v in data['values']}
-  for identity in op['operands'][:2]:
-   values[identity]['type']=values[identity]['type'].replace('xf16','xf32')
-   for address in values[identity]['storage']['addresses']:address['begin_bit']*=2;address['end_bit']*=2
+  roots={values[identity]['storage']['root'] for identity in op['operands'][:2]}
+  # Widen each complete storage family, including the canonical root. An
+  # undersized root now correctly fails earlier in the allocation planner;
+  # this fixture must stay in bounds to exercise the copy's bit-width rule.
+  for value in values.values():
+   if value.get('storage',{}).get('root') in roots:
+    value['type']=value['type'].replace('xf16','xf32')
+    for address in value['storage']['addresses']:address['begin_bit']*=2;address['end_bit']*=2
   with self.assertRaisesRegex(ValueError,'Copy requires.*16-bit'):backend.emit(data)
  def test_nonlast_broadcast_axis_is_explicitly_rejected(self):
   # Legal rank1->rank2 broadcast across dimension0, with128 replicas.

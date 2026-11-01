@@ -1,5 +1,5 @@
 add_library(FriskLayoutSelectionSupport STATIC SelectionCase.cpp SelectionExperiment.cpp
-  SelectionControlled.cpp SelectionOracle.cpp)
+  SelectionControlled.cpp SelectionOracle.cpp JointAblation.cpp)
 target_include_directories(FriskLayoutSelectionSupport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(FriskLayoutSelectionSupport PUBLIC
   FriskTransforms FriskLayoutAnalysis FriskSM90LayoutTarget FriskIR
@@ -15,6 +15,7 @@ file(GLOB_RECURSE FRISK_SELECTION_SOURCES CONFIGURE_DEPENDS
   "${PROJECT_SOURCE_DIR}/lib/*CMakeLists.txt"
   "${PROJECT_SOURCE_DIR}/benchmark/layout/selection/*.cpp"
   "${PROJECT_SOURCE_DIR}/benchmark/layout/selection/*.h"
+  "${PROJECT_SOURCE_DIR}/benchmark/layout/execution/*.py"
   "${PROJECT_SOURCE_DIR}/cmake/*.cmake")
 list(APPEND FRISK_SELECTION_SOURCES
   "${PROJECT_SOURCE_DIR}/CMakeLists.txt"
@@ -22,7 +23,11 @@ list(APPEND FRISK_SELECTION_SOURCES
   "${PROJECT_SOURCE_DIR}/benchmark/layout/CMakeLists.txt"
   "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
   "${PROJECT_SOURCE_DIR}/unittests/Dialect/Frisk/Layout/CMakeLists.txt"
-  "${PROJECT_SOURCE_DIR}/unittests/Dialect/Frisk/Layout/LayoutSelectionQualityTest.cpp")
+  "${PROJECT_SOURCE_DIR}/unittests/Dialect/Frisk/Layout/LayoutSelectionQualityTest.cpp"
+  "${PROJECT_SOURCE_DIR}/unittests/Dialect/Frisk/Layout/JointAblationTest.cpp"
+  "${PROJECT_SOURCE_DIR}/unittests/Dialect/Frisk/Layout/LayoutCandidateSolverTest.cpp"
+  "${PROJECT_SOURCE_DIR}/unittests/Dialect/Frisk/Layout/LayoutConversionChoiceTest.cpp"
+  "${PROJECT_SOURCE_DIR}/unittests/Dialect/Frisk/Layout/MmaAutoIntegrationTest.cpp")
 list(SORT FRISK_SELECTION_SOURCES)
 set(FRISK_SELECTION_MANIFEST "")
 foreach(source IN LISTS FRISK_SELECTION_SOURCES)
@@ -40,3 +45,6 @@ target_compile_definitions(FriskLayoutSelectionSupport PRIVATE
   FRISK_SELECTION_CONFIG_DIGEST="${FRISK_SELECTION_CONFIG_DIGEST}"
   FRISK_SELECTION_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   FRISK_SELECTION_SOURCE_MANIFEST="${CMAKE_CURRENT_BINARY_DIR}/source-manifest.txt")
+
+add_llvm_executable(frisk_joint_ablation_bench PARTIAL_SOURCES_INTENDED joint_ablation_bench.cpp)
+target_link_libraries(frisk_joint_ablation_bench PRIVATE FriskLayoutSelectionSupport FriskLayoutToGPU)

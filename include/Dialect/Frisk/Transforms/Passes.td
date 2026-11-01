@@ -15,6 +15,7 @@ def FriskInferLayouts : Pass<"frisk-infer-layouts", "::mlir::ModuleOp"> {
   let constructor = "mlir::frisk::createFriskInferLayoutsPass()";
   let dependentDialects = ["::mlir::frisk::FriskDialect"];
   let options = [
+    Option<"costProfileFile", "cost-profile", "std::string", "\"\"", "Read an explicit SM90 calibrated cost profile JSON">,
     Option<"boundaryFrequency", "boundary-frequency", "std::string", "\"legacy\"", "Boundary frequency: legacy or static-trip-count">,
     Option<"profileFile", "profile-file", "std::string", "\"\"", "Atomically write invocation-local inclusive layout profile JSON">,
     Option<"traceFile", "trace-file", "std::string", "\"\"", "Atomically write layout decision trace JSON">,
@@ -40,7 +41,8 @@ def FriskInferLayouts : Pass<"frisk-infer-layouts", "::mlir::ModuleOp"> {
 
 def OptimizeLayoutConversions : Pass<"frisk-optimize-layout-conversions", "::mlir::ModuleOp"> {
   let summary = "Fold and compose type-safe distributed layout conversions";
-  let options = [Option<"boundaryFrequency", "boundary-frequency", "std::string", "\"legacy\"", "Boundary frequency: legacy or static-trip-count">];
+  let options = [Option<"costProfileFile", "cost-profile", "std::string", "\"\"", "Read an explicit SM90 calibrated cost profile JSON">,
+    Option<"boundaryFrequency", "boundary-frequency", "std::string", "\"legacy\"", "Boundary frequency: legacy or static-trip-count">];
   let constructor = "mlir::frisk::createOptimizeLayoutConversionsPass()";
 }
 

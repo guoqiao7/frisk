@@ -7,6 +7,7 @@
 
 namespace mlir::frisk {
 struct SolverOptions;
+struct SM90CostProfile;
 struct LayoutStatisticsReport;
 class LayoutTrace;
 class LayoutProfile;
@@ -22,10 +23,12 @@ std::unique_ptr<Pass> createFriskInferLayoutsPass(const SolverOptions &options,
                                               LayoutStatisticsScope scope = LayoutStatisticsScope::Standalone,
                                               LayoutTrace *trace = nullptr,
                                               LayoutProfile *profile = nullptr,
-                                              LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy);
+                                              LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy,
+                                              const SM90CostProfile *calibratedProfile = nullptr);
 std::unique_ptr<Pass> createNormalizeLayoutIRPass();
 std::unique_ptr<Pass> createOptimizeLayoutConversionsPass();
-std::unique_ptr<Pass> createOptimizeLayoutConversionsPass(LayoutBoundaryFrequencyMode mode);
+std::unique_ptr<Pass> createOptimizeLayoutConversionsPass(LayoutBoundaryFrequencyMode mode,
+    const SM90CostProfile *calibratedProfile = nullptr);
 std::unique_ptr<Pass> createTestLowerLayoutConversionsPass();
 std::unique_ptr<Pass> createExportExecutionPass();
 

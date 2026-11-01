@@ -62,6 +62,18 @@ public:
   lowerBound(const LayoutConstraintGraph &, const CandidateAssignment &) const {
     return CostEstimate{};
   }
+  /// Re-score raw boundary proxies in the target's own objective before any
+  /// conversion/rematerialization choice. Defaults preserve legacy targets.
+  virtual FailureOr<CostEstimate> adjustConversionCost(
+      const CostEstimate &proxy, const LayoutConversionEdge &) const {
+    return proxy;
+  }
+  virtual FailureOr<CostEstimate> adjustCloneCost(
+      const CostEstimate &proxy, const LayoutVar &, Attribute,
+      Operation *clonedOperation, Operation *insertionPoint) const {
+    return proxy;
+  }
+  virtual bool requiresRematerializationTrafficReduction() const { return true; }
   virtual StringRef costCoverage() const { return "target-defined"; }
   /// Complete model identity, independent of the JSON schema version.
   virtual StringRef costModelID() const { return "unversioned-target"; }

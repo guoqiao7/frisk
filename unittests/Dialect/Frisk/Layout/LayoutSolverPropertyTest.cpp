@@ -163,7 +163,7 @@ TEST(LayoutSolverPropertyTest, DefaultBudgetsAndNonRetryableFailures) {
     for(bool costFailure:{false,true}) {
       g=graphFor(f,b,*host,rng);target.failCost=costFailure;
       auto opts=options;if(!costFailure)opts.maxExpandedStates=1;
-      SmallVector<RelaxationRecord> records;LayoutSolveFailure why;
+      SmallVector<RelaxationRecord, 0> records;LayoutSolveFailure why;
       EXPECT_TRUE(failed(attemptControlledRelaxation(g,target,opts,records,&why)));
       EXPECT_EQ(why.kind,costFailure?LayoutSolveFailureKind::CostFailure:LayoutSolveFailureKind::SearchBudget);
       EXPECT_TRUE(records.empty());EXPECT_EQ(target.retries,0u);
@@ -232,7 +232,7 @@ TEST(LayoutSolverPropertyTest, EmptyUnknownIncompleteAndDefaultExpansionCeiling)
   f.relations={{0,1,uint16_t((1<<0)|(1<<5)),false},
                {1,2,uint16_t((1<<0)|(1<<5)),false},
                {0,2,uint16_t((1<<1)|(1<<4)|(1<<5)),false}};
-  FiniteCostTarget target(f);SmallVector<RelaxationRecord> records;LayoutSolveFailure why;
+  FiniteCostTarget target(f);SmallVector<RelaxationRecord, 0> records;LayoutSolveFailure why;
   auto g=graphFor(f,b,*host,rng);SolverOptions opts;opts.exactCombinationLimit=1;opts.beamWidth=1;
   EXPECT_TRUE(failed(attemptControlledRelaxation(g,target,opts,records,&why)));
   EXPECT_EQ(why.kind,LayoutSolveFailureKind::SearchIncomplete);EXPECT_TRUE(records.empty());EXPECT_EQ(target.retries,0u);

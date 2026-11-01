@@ -75,6 +75,7 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
   LayoutSolveFailure localFailure;
   if (!why) why = &localFailure;
   LayoutSolution solution;
+  solution.policy = options.policy;
   if (trace) trace->recordEvent([&] { return llvm::json::Object{
       {"event", "solver-options"}, {"diagnostic", diagnostic},
       {"exactCombinationLimit", options.exactCombinationLimit},
@@ -123,6 +124,20 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
     emitError(loc) << "invalid layout solver options: budgets must be positive";
     return failure();
   }
+  const bool experimental = options.sharedBudget || !options.policy.scope.fullGraph ||
+      options.policy.conversion != ConversionPolicy::Full ||
+      !options.policy.scope.producers.empty() || !options.policy.scope.producerInstructions.empty();
+  if (experimental && !graph.isFinalized()) {
+    emitError(loc) << "experimental layout scope requires a finalized frozen graph";
+    return failure();
+  }
+  for(auto id:options.policy.scope.producers)if(id>=graph.getVariables().size())return failure();
+  for(auto id:options.policy.scope.producerInstructions)if(id>=graph.getConstraints().size())return failure();
+  auto unsupportedPolicy=experimentPolicyUnsupportedReason(graph,options.policy);
+  if(!unsupportedPolicy.empty()) {
+    *why={LayoutSolveFailureKind::Unsupported,UINT32_MAX,UINT32_MAX,unsupportedPolicy};
+    return failure();
+  }
   // Public callers may supply a valid but not yet canonical graph. Avoid
   // re-finalizing production graphs: that would erase propagation statistics.
   if (!graph.isFinalized() && failed(graph.finalize(loc))) return failure();
@@ -146,15 +161,30 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
     }
     return value * factor;
   };
+  bool refinementEvaluation = false;
+  bool sharedBudgetExhausted = false;
+  auto debit = [&](bool refinement, bool completeScore) {
+    if (!options.sharedBudget) return true;
+    auto &budget = *options.sharedBudget;
+    if (!budget.consume(refinement)) { sharedBudgetExhausted=true; return false; }
+    if (refinement) ++budget.refinementProbes;
+    else if (completeScore) ++budget.completeScores;
+    else ++budget.relationshipProbes;
+    return true;
+  };
   auto evaluateComplete = [&](const CandidateAssignment &assignment,
       SmallVectorImpl<LayoutConversionEdge> *edges = nullptr) -> FailureOr<CostEstimate> {
+    // Winner certificate rebuilding is diagnostic, not a new search probe.
+    if (!edges && !refinementEvaluation && !debit(false,true)) return failure();
     auto *observer = edges && !diagnostic ? trace : nullptr;
-    auto cost = target.evaluate(graph, assignment, observer);
+    auto cost = scoreExperimentAssignment(graph, assignment, target, options.policy, observer);
     if (failed(cost)) return failure();
-    auto choices = chooseLayoutConversions(graph, assignment, target, observer);
-    if (failed(choices)) return failure();
-    if (edges) llvm::append_range(*edges, choices->edges);
-    return addLayoutCosts(*cost, choices->cost);
+    if (edges) {
+      auto choices=chooseLayoutConversions(graph,assignment,target,nullptr,options.policy.conversion);
+      if(failed(choices))return failure();
+      llvm::append_range(*edges,choices->edges);
+    }
+    return *cost;
   };
   struct PendingComponent {
     CandidateAssignment original, refined;
@@ -330,7 +360,7 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
           bool supported = false, unknown = false;
           for (const auto &x : a) {
             for (const auto &y : b) {
-              if (stats.expanded == options.maxExpandedStates) {
+              if (stats.expanded == options.maxExpandedStates || !debit(false,false)) {
                 *why = {LayoutSolveFailureKind::SearchBudget, stats.root, cid,
                         "search-budget-exceeded in residual domain audit"};
                 emitError(loc) << why->reason;
@@ -442,16 +472,34 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
     auto evaluate = [&](State &s, bool complete,
                         SmallVectorImpl<LayoutConversionEdge> *edges = nullptr) {
       auto cost = complete ? evaluateComplete(s.assignment, edges)
-                           : target.lowerBound(graph, s.assignment);
+                           : options.policy.scope.fullGraph ? target.lowerBound(graph, s.assignment)
+                               : FailureOr<CostEstimate>(CostEstimate{});
       if (failed(cost)) return failure();
       // Boundary choices may later share a conversion or replace it with a
       // cheap clone. Zero is a safe partial bound; per-use charges are not.
       s.bound = *cost;
       return success();
     };
-    auto less = [](const State &a, const State &b) {
+    auto less = [&](const State &a, const State &b) {
       if (a.bound.cost < b.bound.cost) return true;
       if (b.bound.cost < a.bound.cost) return false;
+      if (!options.policy.scope.fullGraph) {
+        SmallVector<LayoutVarID> producers(options.policy.scope.producers);
+        llvm::sort(producers, [&](auto x,auto y) {
+          return graph.getVariable(x).stableName < graph.getVariable(y).stableName;
+        });
+        for (auto id:producers) {
+          if (!llvm::is_contained(component,id)) continue;
+          auto ordinal = [&](const State &state) {
+            auto value=state.assignment.values.lookup(id);
+            for (auto &c:graph.getVariable(id).candidates)
+              if(c.value==value)return c.stableOrdinal;
+            return UINT64_MAX;
+          };
+          auto x=ordinal(a),y=ordinal(b);if(x!=y)return x<y;
+        }
+        return false; // Consumer completion never ranks a producer tuple.
+      }
       return std::lexicographical_compare(a.key.begin(), a.key.end(),
                                           b.key.begin(), b.key.end());
     };
@@ -494,7 +542,7 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
           SmallVector<State> probes;
           const auto &domain = graph.getVariable(id).candidates;
           for (unsigned ci = 0; ci < domain.size(); ++ci) {
-            if (stats.expanded == options.maxExpandedStates) {
+            if (stats.expanded == options.maxExpandedStates || !debit(false,false)) {
               *why = {LayoutSolveFailureKind::SearchBudget, stats.root,
                       UINT32_MAX, "search-budget-exceeded"};
               emitError(getVariableLoc(graph.getVariable(stats.root)))
@@ -524,8 +572,8 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
           ++stats.expandedNodes;
           if (failed(evaluate(child, !emptyComponent &&
                                      depth + 1 == component.size()))) {
-            *why = {LayoutSolveFailureKind::CostFailure, stats.root,
-                    UINT32_MAX, "layout cost evaluation failed"};
+            *why = {sharedBudgetExhausted ? LayoutSolveFailureKind::SearchBudget : LayoutSolveFailureKind::CostFailure, stats.root,
+                    UINT32_MAX, sharedBudgetExhausted ? "search-budget-exceeded in complete score" : "layout cost evaluation failed"};
             emitError(loc) << "layout cost evaluation failed; not a free solution";
             return failure();
           }
@@ -610,8 +658,13 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
           {"event", "refinement-start"}, {"diagnostic", diagnostic},
           {"component", stats.root}, {"cost", layoutCostJSON(best.bound)}}; });
       auto budgetExhausted = [&] {
-        if (stats.expanded == options.maxExpandedStates)
+        if (stats.expanded == options.maxExpandedStates ||
+            (options.sharedBudget && (options.sharedBudget->used >= options.sharedBudget->stageLimit ||
+                                     options.sharedBudget->used >= options.sharedBudget->limit)))
           stats.refinementStopReason = "total-budget";
+        else if (options.sharedBudget && (options.sharedBudget->refinementUsed >= options.sharedBudget->stageRefinementLimit ||
+                                         options.sharedBudget->refinementUsed >= options.sharedBudget->refinementLimit))
+          stats.refinementStopReason = "refinement-budget";
         else if (stats.refinementProbes == options.maxRefinementProbes)
           stats.refinementStopReason = "refinement-budget";
         return !stats.refinementStopReason.empty();
@@ -626,6 +679,7 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
           for (unsigned ci = 0; ci < domain.size(); ++ci) {
             if (ci == best.key[index]) continue;
             if (budgetExhausted()) break;
+            if (!debit(true,false)) {stats.refinementStopReason="shared-budget";break;}
             ++stats.expanded;
             ++stats.refinementProbes;
             State neighbor = best;
@@ -634,8 +688,11 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
             StringRef status = "Proven";
             LayoutConstraintID rejected = UINT32_MAX;
             bool legal = viable(neighbor, &status, &rejected);
+            refinementEvaluation=true;
             bool priced = legal && succeeded(evaluate(neighbor, true));
-            bool improves = priced && neighbor.bound.cost < best.bound.cost;
+            refinementEvaluation=false;
+            bool improves = priced && (options.policy.scope.fullGraph
+                ? neighbor.bound.cost < best.bound.cost : less(neighbor,best));
             if (trace) trace->recordEvent([&] { return llvm::json::Object{
                 {"event", "refinement-probe"}, {"diagnostic", diagnostic},
                 {"component", stats.root}, {"sweep", stats.refinementSweeps},
@@ -713,6 +770,22 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
       refinedCost = addLayoutCosts(refinedCost, p.refinedCost);
     }
     bool fallback = originalCost.cost < refinedCost.cost;
+    if (!options.policy.scope.fullGraph && !(refinedCost.cost < originalCost.cost) &&
+        !(originalCost.cost < refinedCost.cost)) {
+      CandidateAssignment original, refined;
+      original.values=refined.values=solution.assignments;
+      for(const auto &p:pending) {
+        for(auto [id,value]:p.original.values)original.values[id]=value;
+        for(auto [id,value]:p.refined.values)refined.values[id]=value;
+      }
+      auto producers=options.policy.scope.producers;
+      llvm::sort(producers,[&](auto x,auto y){return graph.getVariable(x).stableName<graph.getVariable(y).stableName;});
+      for(auto id:producers) {
+        auto ordinal=[&](Attribute value){for(const auto &c:graph.getVariable(id).candidates)if(c.value==value)return c.stableOrdinal;return UINT64_MAX;};
+        auto a=ordinal(original.values.lookup(id)),b=ordinal(refined.values.lookup(id));
+        if(a!=b){fallback=a<b;break;}
+      }
+    }
     if (trace) trace->recordEvent([&] { return llvm::json::Object{
         {"event", "refinement-global-selection"}, {"diagnostic", diagnostic},
         {"fallback", fallback}, {"originalCost", layoutCostJSON(originalCost)},

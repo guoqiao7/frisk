@@ -23,6 +23,7 @@ LogicalResult materializeDistributedLayouts(
     Operation *root, const LayoutConstraintGraph &graph,
     const LayoutSolution &solution, ArrayRef<LayoutConversionEdge> conversions,
     bool authorizeInternalOptimization = false,
-    LayoutTarget *target = nullptr);
+    LayoutTarget *target = nullptr,
+    ConversionPolicy expectedPolicy = ConversionPolicy::Full);
 } // namespace mlir::frisk
 #endif

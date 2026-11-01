@@ -614,3 +614,15 @@ TEST_F(MmaAutoIntegrationTest, ReduceBothAxesFixedConsumerConversionAndExactOrac
   }
 }
 } // namespace
+
+TEST_F(MmaAutoIntegrationTest, ProducerScopeGeometryWorkHasNoStorageDependency) {
+ auto module=make(false,64,64,128);ASSERT_TRUE(module);
+ auto graph=collectLayoutConstraints(*module,*target);ASSERT_TRUE(succeeded(graph));ASSERT_TRUE(succeeded(propagateCommonToFixedPoint(*graph)));
+ auto solved=solveLayoutGraph(*graph,*target);ASSERT_TRUE(succeeded(solved));auto &c=instruction(*graph);
+ ASSERT_EQ(graph->getVariable(c.vars[0]).kind,LayoutKind::Storage);
+ ExperimentPolicy policy;policy.scope.fullGraph=false;policy.scope.producers={c.vars[3],c.vars[4]};policy.scope.producerInstructions={c.id};
+ CandidateAssignment a{solved->assignments};auto local=scoreExperimentAssignment(*graph,a,*target,policy);ASSERT_TRUE(succeeded(local));EXPECT_GT(local->cost.instructionPathAndWork,0u);
+ auto missing=policy;missing.scope.producers={c.vars[3]};EXPECT_TRUE(failed(scoreExperimentAssignment(*graph,a,*target,missing)));
+ auto storage=policy;storage.scope.producers.push_back(c.vars[0]);EXPECT_TRUE(failed(scoreExperimentAssignment(*graph,a,*target,storage)));
+ auto future=policy;future.scope.producers.push_back(c.vars[2]);EXPECT_TRUE(failed(scoreExperimentAssignment(*graph,a,*target,future)));
+}

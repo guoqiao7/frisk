@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Analysis/LayoutStatistics.h"
+#include "Dialect/Frisk/Target/SM90/SM90CostModel.h"
 #include "Dialect/Frisk/Analysis/LayoutTrace.h"
 #include "Dialect/Frisk/Analysis/LayoutSolver.h"
 #include "Dialect/Frisk/Analysis/LayoutRelaxation.h"
@@ -86,7 +87,7 @@ TEST(LayoutStatisticsTest, CustomTargetIdentitySurvivesPublicSolverBoundaries) {
           LayoutTrace trace(limits);
           LayoutStatisticsReport report;
           report.costModelID = "stale-model";
-          SmallVector<RelaxationRecord> records;
+          SmallVector<RelaxationRecord, 0> records;
           auto result = coordinator
               ? attemptControlledRelaxation(graph, target, {}, records, nullptr, &report, &trace)
               : solveLayoutGraph(graph, target, {}, nullptr, nullptr, &trace);
@@ -324,7 +325,7 @@ TEST(LayoutStatisticsTest, ActualCoordinatorConflictHasStableFinalIdentity) {
       {variable}, nullptr, "mandatory", "required", builder.getStringAttr("a"));
   LayoutStatisticsReport report;
   StatisticsTarget target;
-  SmallVector<RelaxationRecord> records;
+  SmallVector<RelaxationRecord, 0> records;
   ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
   EXPECT_TRUE(failed(attemptControlledRelaxation(graph, target, {}, records, nullptr, &report)));
   ASSERT_EQ(report.attempts.size(), 1u);
@@ -372,7 +373,7 @@ TEST(LayoutStatisticsTest, FinalFailureUsesFinalizedIdentitiesWithoutMutatingCal
   graph.getConstraints()[1].stableUseKey = "a-use";
   StatisticsTarget target;
   LayoutStatisticsReport report;
-  SmallVector<RelaxationRecord> records;
+  SmallVector<RelaxationRecord, 0> records;
   ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
   EXPECT_TRUE(failed(attemptControlledRelaxation(graph, target, {}, records, nullptr, &report)));
   ASSERT_EQ(report.attempts.size(), 1u);
@@ -434,7 +435,7 @@ TEST(LayoutStatisticsTest, RetryProposalsAndAttemptsRemainSeparate) {
   graph.addVariable(LayoutKind::Distributed, RankedTensorType::get({4}, builder.getF32Type()), "z-retry");
   LayoutStatisticsReport report;
   LayoutTrace trace({"unused.json"});
-  SmallVector<RelaxationRecord> records;
+  SmallVector<RelaxationRecord, 0> records;
   auto retryGraph = graph;
   auto solution = attemptControlledRelaxation(graph, target, {}, records, nullptr, &report, &trace);
   ASSERT_TRUE(succeeded(solution));
@@ -486,7 +487,7 @@ TEST(LayoutTraceIntegrationTest, BudgetFailureRecordsInterruptedSearchDepth) {
   graph.getVariable(id).candidates = {{builder.getStringAttr("a")}, {builder.getStringAttr("b")}};
   LayoutTrace trace({"unused.json"});
   StatisticsTarget target;
-  SmallVector<RelaxationRecord> records;
+  SmallVector<RelaxationRecord, 0> records;
   LayoutSolveFailure why;
   ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
   EXPECT_TRUE(failed(attemptControlledRelaxation(graph, target, {256, 32, 1}, records, &why, nullptr, &trace)));
@@ -613,7 +614,7 @@ TEST(LayoutTraceIntegrationTest, MandatorySolverOptionsSurviveTruncationAndEarly
         RankedTensorType::get({4}, builder.getF32Type()), "invalid-id");
     graph.getVariable(id).id = 42;
     LayoutTrace trace({path, 1, 4096});
-    SmallVector<RelaxationRecord> records;
+    SmallVector<RelaxationRecord, 0> records;
     auto result = coordinator ? attemptControlledRelaxation(graph, target, options, records, nullptr, nullptr, &trace)
                               : solveLayoutGraph(graph, target, options, nullptr, nullptr, &trace);
     EXPECT_TRUE(failed(result));
@@ -756,4 +757,93 @@ TEST(LayoutTraceIntegrationTest, StaticEarlyFailurePreservesModelAndOriginalIR) 
     }
   }
 }
+TEST(LayoutTraceIntegrationTest, CalibratedProfileNormalEntryAndFullDigest) {
+  MLIRContext context;
+  context.loadDialect<FriskDialect, arith::ArithDialect, func::FuncDialect>();
+  llvm::SmallString<128> directory;
+  ASSERT_FALSE(bool(llvm::sys::fs::createUniqueDirectory("frisk-cost-profile", directory)));
+  std::string path = (directory + "/profile.json").str();
+  std::string tracePath = (directory + "/trace.json").str();
+  SM90CostProfile calibration;
+  calibration.coefficients.fill(1);
+  calibration.provenance = "normal-pass-integration-test-only";
+  {
+    std::error_code ec;
+    llvm::raw_fd_ostream file(path, ec);
+    ASSERT_FALSE(bool(ec));
+    file << serializeSM90CostProfile(calibration);
+  }
+  for (bool pipeline : {false, true}) {
+    auto module = parseSourceString<ModuleOp>(R"mlir(
+      func.func @f(%x:tensor<32xf32>, %y:tensor<32xf32>) -> tensor<32xf32> {
+        %z=arith.mulf %x,%y : tensor<32xf32>
+        return %z : tensor<32xf32>
+      })mlir", &context);
+    ASSERT_TRUE(module);
+    LayoutStatisticsReport report;
+    PassManager pm(&context);
+    if (pipeline)
+      buildFriskLayoutPipeline(pm, {}, {}, &report, {tracePath}, {}, false,
+                               LayoutBoundaryFrequencyMode::Legacy, path);
+    else {
+      auto pass = createFriskInferLayoutsPass({}, false, &report);
+      ASSERT_TRUE(succeeded(pass->initializeOptions("cost-profile=" + path + " trace-file=" + tracePath, [](const Twine &) { return failure(); })));
+      pm.addPass(std::move(pass));
+    }
+    ASSERT_TRUE(succeeded(pm.run(*module)));
+    EXPECT_EQ(report.costModelID, getSM90CalibratedCostModelID(calibration));
+    auto file = llvm::MemoryBuffer::getFile(tracePath);
+    ASSERT_TRUE(bool(file));
+    auto json = llvm::json::parse((*file)->getBuffer());
+    ASSERT_TRUE(bool(json));
+    EXPECT_EQ(json->getAsObject()->getString("cost_profile_sha256"), getSM90CostProfileSHA256(calibration));
+    auto *cost = json->getAsObject()->getObject("finalCost");
+    ASSERT_TRUE(cost);
+    EXPECT_FALSE(cost->getObject("features"));
+    bool sawArithmetic = false;
+    for (const auto &entry : *json->getAsObject()->getArray("events")) {
+      auto *event = entry.getAsObject();
+      if (event->getString("event") != "cost-contribution") continue;
+      auto *features = event->getObject("estimate")->getObject("features");
+      if (features && features->getInteger("alu_warp_issues").value_or(0) > 0)
+        sawArithmetic = true;
+    }
+    EXPECT_TRUE(sawArithmetic);
+  }
+  EXPECT_FALSE(bool(llvm::sys::fs::remove(tracePath)));
+  EXPECT_FALSE(bool(llvm::sys::fs::remove(path)));
+  EXPECT_FALSE(bool(llvm::sys::fs::remove(directory)));
+}
+TEST(LayoutTraceIntegrationTest, InvalidCalibrationIsAtomicallyRejected) {
+  MLIRContext context;
+  context.loadDialect<FriskDialect, arith::ArithDialect, func::FuncDialect>();
+  llvm::SmallString<128> directory;
+  ASSERT_FALSE(bool(llvm::sys::fs::createUniqueDirectory("frisk-invalid-cost-profile", directory)));
+  std::string path = (directory + "/profile.json").str();
+  {
+    std::error_code ec;
+    llvm::raw_fd_ostream file(path, ec);
+    ASSERT_FALSE(bool(ec)); file << "{}";
+  }
+  ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
+  for (unsigned entry : {0u,1u,2u}) {
+    auto module = parseSourceString<ModuleOp>("func.func @f() { return }", &context);
+    ASSERT_TRUE(module);
+    auto print = [&] { std::string out; llvm::raw_string_ostream(out) << *module; return out; };
+    auto before = print();
+    PassManager pm(&context);
+    if (entry == 2) buildFriskLayoutPipeline(pm, {}, {}, nullptr, {}, {}, false,
+                                            LayoutBoundaryFrequencyMode::Legacy, path);
+    else {
+      auto pass = entry == 0 ? createFriskInferLayoutsPass() : createOptimizeLayoutConversionsPass();
+      ASSERT_TRUE(succeeded(pass->initializeOptions("cost-profile=" + path, [](const Twine &) { return failure(); })));
+      pm.addPass(std::move(pass));
+    }
+    EXPECT_TRUE(failed(pm.run(*module)));
+    EXPECT_EQ(print(), before);
+  }
+  EXPECT_FALSE(bool(llvm::sys::fs::remove(path)));
+  EXPECT_FALSE(bool(llvm::sys::fs::remove(directory)));
+}
+
 }

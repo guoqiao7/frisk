@@ -221,7 +221,7 @@ ExperimentResult runExperiment(MLIRContext &context,const ExperimentOptions &o) 
       auto classified=classifyFailure("local-collection","",diagnostics);
       fail(classified.kind,classified.reason,classified.fatal);return finish();
     }
-    SmallVector<RelaxationRecord> relaxations;
+    SmallVector<RelaxationRecord, 0> relaxations;
     auto solution=attemptControlledRelaxation(*graph,*target,{},relaxations,nullptr,&stats,&trace);
     if(failed(solution)) {
       auto classified=classifyFailure(stats.failureKind,stats.failureReason,diagnostics);

@@ -60,7 +60,7 @@ add_unittest(FriskUnitTests FriskLayoutUnitTests PARTIAL_SOURCES_INTENDED
   ProductLayoutTest.cpp
 )
 
-add_unittest(FriskUnitTests FriskLayoutSelectionTests PARTIAL_SOURCES_INTENDED LayoutSelectionQualityTest.cpp)
+add_unittest(FriskUnitTests FriskLayoutSelectionTests PARTIAL_SOURCES_INTENDED LayoutSelectionQualityTest.cpp JointAblationTest.cpp)
 target_link_libraries(FriskLayoutSelectionTests PRIVATE FriskLayoutSelectionSupport)
 
 set_target_properties(FriskLayoutUnitTests PROPERTIES

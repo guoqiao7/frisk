@@ -1,6 +1,7 @@
 #include "Dialect/Frisk/Analysis/LayoutTrace.h"
 #include "Dialect/Frisk/Analysis/LayoutCostModel.h"
 #include "Dialect/Frisk/Analysis/LayoutSolver.h"
+#include "Dialect/Frisk/Target/SM90/SM90CostModel.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "gtest/gtest.h"
@@ -142,8 +143,13 @@ TEST(LayoutTraceTest, ByteCapCountsEnvelopeEscapingAndWholeLargeEvents) {
                            UINT64_MAX, UINT64_MAX, UINT64_MAX,
                            UINT64_MAX, UINT64_MAX, UINT64_MAX};
   summary.finalCost.saturated = true;
+  summary.costProfileSHA256 = std::string(64, 'a');
+  for (StringRef name : getSM90CostFeatureNames())
+    summary.finalCost.features.emplace_back(name.str(), UINT64_MAX);
+  summary.finalCost.features.emplace_back(std::string(1000000, 'x'), UINT64_MAX);
   summary.hasFinalCost = true;
   trace.setSummary(summary);
+  EXPECT_TRUE(trace.getSummary().finalCost.features.empty());
   auto serialized = trace.serialize();
   EXPECT_LE(serialized.size(), 5000u);
   EXPECT_EQ(serialized, trace.serialize());
@@ -163,10 +169,14 @@ TEST(LayoutTraceTest, ByteCapCountsEnvelopeEscapingAndWholeLargeEvents) {
   EXPECT_LE(minimum.serialize().size() + 4 * 19, 4096u);
   EXPECT_TRUE(bool(llvm::json::parse(minimum.serialize())));
   EXPECT_EQ(minimum.omittedCost().cost, summary.finalCost.cost);
+  EXPECT_TRUE(minimum.omittedCost().features.empty());
   auto minJSON = llvm::json::parse(minimum.serialize());
   ASSERT_TRUE(bool(minJSON));
   auto *solver = minJSON->getAsObject()->getObject("solver_options");
   EXPECT_EQ(minJSON->getAsObject()->getString("cost_model_id"), summary.costModelID);
+  EXPECT_EQ(minJSON->getAsObject()->getString("cost_profile_sha256"), summary.costProfileSHA256);
+  EXPECT_FALSE(minJSON->getAsObject()->getObject("finalCost")->getObject("features"));
+  EXPECT_FALSE(minJSON->getAsObject()->getObject("omittedCost")->getObject("features"));
   ASSERT_TRUE(solver);
   EXPECT_EQ(solver->get("exactCombinationLimit")->getAsUINT64(), UINT64_MAX);
   EXPECT_EQ(solver->get("beamWidth")->getAsUINT64(), UINT_MAX);

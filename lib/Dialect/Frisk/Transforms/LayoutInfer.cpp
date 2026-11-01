@@ -11,6 +11,7 @@
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
 #include "Dialect/Frisk/Target/SM90/SM90LayoutTarget.h"
+#include "Dialect/Frisk/Target/SM90/SM90CostModel.h"
 #include "Dialect/Frisk/Target/SM90/SM90TargetInfo.h"
 
 namespace mlir::frisk {
@@ -33,16 +34,20 @@ public:
   FriskInferLayoutsPass(const FriskInferLayoutsPass &other)
       : impl::FriskInferLayoutsBase<FriskInferLayoutsPass>(other),
         authorizeInternalOptimization(other.authorizeInternalOptimization),
-        statistics(other.statistics), scope(other.scope), trace(other.trace), profile(other.profile) {}
+        statistics(other.statistics), scope(other.scope), trace(other.trace), profile(other.profile),
+        calibratedProfile(other.calibratedProfile) {}
   bool authorizeInternalOptimization = false;
   LayoutStatisticsReport *statistics = nullptr;
   LayoutStatisticsScope scope = LayoutStatisticsScope::Standalone;
   LayoutTrace *trace = nullptr;
   LayoutProfile *profile = nullptr;
+  std::optional<SM90CostProfile> calibratedProfile;
   explicit FriskInferLayoutsPass(const SolverOptions &options, bool authorize,
                                  LayoutStatisticsReport *statistics, LayoutStatisticsScope scope, LayoutTrace *trace,
-                                 LayoutProfile *profile, LayoutBoundaryFrequencyMode mode)
+                                 LayoutProfile *profile, LayoutBoundaryFrequencyMode mode,
+                                 const SM90CostProfile *costProfile)
       : authorizeInternalOptimization(authorize), statistics(statistics), scope(scope), trace(trace), profile(profile) {
+    if (costProfile) calibratedProfile = *costProfile;
     boundaryFrequency = mode == LayoutBoundaryFrequencyMode::Legacy ? "legacy" : "static-trip-count";
     exactCombinationLimit = options.exactCombinationLimit;
     beamWidth = options.beamWidth;
@@ -65,7 +70,22 @@ public:
       signalPassFailure(); return;
     }
     auto mode = boundaryFrequency == "legacy" ? LayoutBoundaryFrequencyMode::Legacy : LayoutBoundaryFrequencyMode::StaticTripCount;
-    auto target = createSM90LayoutTarget(mode);
+    auto activeCalibration = calibratedProfile;
+    if (!costProfileFile.empty()) {
+      if (activeCalibration || costProfileFile == statsFile || costProfileFile == traceFile || costProfileFile == profileFile) {
+        getOperation().emitError("cost-profile conflicts with supplied profile or output file");
+        signalPassFailure(); return;
+      }
+      auto loaded = loadSM90CostProfileFile(costProfileFile);
+      if (!loaded) {
+        getOperation().emitError("invalid cost-profile: ") << llvm::toString(loaded.takeError());
+        report.status = "failed"; report.failureKind = "cost-profile";
+        signalPassFailure(); return;
+      }
+      activeCalibration = std::move(*loaded);
+    }
+    auto target = activeCalibration ? createSM90LayoutTarget(mode, *activeCalibration)
+                                    : createSM90LayoutTarget(mode);
     report.costModelID = normalizeLayoutCostModelID(target->costModelID()).str();
     report.staticTripCountFrequency = mode == LayoutBoundaryFrequencyMode::StaticTripCount;
     auto initializeTrace = [&](LayoutTrace *recorder) {
@@ -76,6 +96,7 @@ public:
       summary.target = "SM90";
       summary.costCoverage = target->costCoverage().str();
       summary.costModelID = report.costModelID;
+      summary.costProfileSHA256 = activeCalibration ? getSM90CostProfileSHA256(*activeCalibration) : "";
       summary.staticTripCountFrequency = report.staticTripCountFrequency;
       recorder->setSummary(summary);
     };
@@ -169,7 +190,7 @@ public:
       report.failureKind = "collection";
       return failure();
     }
-    SmallVector<RelaxationRecord> relaxations;
+    SmallVector<RelaxationRecord, 0> relaxations;
     LayoutSolveFailure why;
     auto solveStart = LayoutClock::now();
     FailureOr<LayoutSolution> solution =
@@ -256,8 +277,9 @@ std::unique_ptr<Pass> createFriskInferLayoutsPass() {
 std::unique_ptr<Pass> createFriskInferLayoutsPass(const SolverOptions &options,
                                               bool authorizeInternalOptimization,
                                               LayoutStatisticsReport *statistics,
-                                              LayoutStatisticsScope scope, LayoutTrace *trace, LayoutProfile *profile, LayoutBoundaryFrequencyMode mode) {
-  return std::make_unique<FriskInferLayoutsPass>(options, authorizeInternalOptimization, statistics, scope, trace, profile, mode);
+                                              LayoutStatisticsScope scope, LayoutTrace *trace, LayoutProfile *profile, LayoutBoundaryFrequencyMode mode,
+                                 const SM90CostProfile *costProfile) {
+  return std::make_unique<FriskInferLayoutsPass>(options, authorizeInternalOptimization, statistics, scope, trace, profile, mode, costProfile);
 }
 
 } // namespace mlir::frisk

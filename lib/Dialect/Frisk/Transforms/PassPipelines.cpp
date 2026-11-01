@@ -6,6 +6,7 @@
 #include "Dialect/Frisk/Analysis/LayoutProfile.h"
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
 #include "Dialect/Frisk/Target/SM90/SM90LayoutTarget.h"
+#include "Dialect/Frisk/Target/SM90/SM90CostModel.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "PreserveStorageContracts.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -55,14 +56,16 @@ public:
   explicit LayoutPipelineTransactionPass(SolverOptions options, StringRef statsFile = {},
                                          LayoutStatisticsReport *statistics = nullptr,
                                          LayoutTraceOptions traceOptions = {}, StringRef profileFile = {},
-                                         bool irDiagnostics = false, LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy)
-      : options(options), statsFile(statsFile.str()), statistics(statistics), traceOptions(std::move(traceOptions)), profileFile(profileFile.str()), irDiagnostics(irDiagnostics), mode(mode) {}
+                                         bool irDiagnostics = false, LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy,
+                                         StringRef costProfileFile = {})
+      : options(options), statsFile(statsFile.str()), statistics(statistics), traceOptions(std::move(traceOptions)), profileFile(profileFile.str()), irDiagnostics(irDiagnostics), mode(mode), costProfileFile(costProfileFile.str()) {}
   LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy;
   SolverOptions options;
   std::string statsFile;
   LayoutStatisticsReport *statistics = nullptr;
   LayoutTraceOptions traceOptions;
   std::string profileFile;
+  std::string costProfileFile;
   bool irDiagnostics = false;
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<FriskDialect, arith::ArithDialect, func::FuncDialect,
@@ -75,7 +78,21 @@ public:
     LayoutStatisticsReport local;
     auto &report = statistics ? *statistics : local;
     report = {};
-    auto target = createSM90LayoutTarget(mode);
+    std::optional<SM90CostProfile> calibration;
+    if (!costProfileFile.empty()) {
+      if (costProfileFile == statsFile || costProfileFile == traceOptions.file || costProfileFile == profileFile) {
+        getOperation().emitError("cost-profile conflicts with output file"); signalPassFailure(); return;
+      }
+      auto loaded = loadSM90CostProfileFile(costProfileFile);
+      if (!loaded) {
+        getOperation().emitError("invalid cost-profile: ") << llvm::toString(loaded.takeError());
+        report.status = "failed"; report.failureKind = "cost-profile";
+        signalPassFailure(); return;
+      }
+      calibration = std::move(*loaded);
+    }
+    // Load once: all pipeline stages use this same immutable profile value.
+    auto target = calibration ? createSM90LayoutTarget(mode, *calibration) : createSM90LayoutTarget(mode);
     report.costModelID = normalizeLayoutCostModelID(target->costModelID()).str();
     report.staticTripCountFrequency = mode == LayoutBoundaryFrequencyMode::StaticTripCount;
     ModuleOp original = getOperation();
@@ -104,6 +121,7 @@ public:
       summary.target = "SM90";
       summary.costCoverage = target->costCoverage().str();
       summary.costModelID = report.costModelID;
+      summary.costProfileSHA256 = calibration ? getSM90CostProfileSHA256(*calibration) : "";
       summary.staticTripCountFrequency = report.staticTripCountFrequency;
       trace->setSummary(summary);
     }
@@ -112,9 +130,9 @@ public:
     pipeline.addInstrumentation(std::make_unique<LayoutTimingInstrumentation>(report));
     pipeline.addPass(createNormalizeLayoutIRPass());
     pipeline.addPass(createFriskInferLayoutsPass(options, true, &report, LayoutStatisticsScope::Pipeline,
-                                               trace ? &*trace : nullptr, &profile, mode));
+                                               trace ? &*trace : nullptr, &profile, mode, calibration ? &*calibration : nullptr));
     pipeline.addPass(std::make_unique<PreserveRootContractsPass>());
-    pipeline.addPass(createOptimizeLayoutConversionsPass(mode));
+    pipeline.addPass(createOptimizeLayoutConversionsPass(mode, calibration ? &*calibration : nullptr));
     bool failedPipeline = failed(pipeline.run(*staged));
     auto verificationStart = LayoutClock::now();
     bool failedFinalVerification = false;
@@ -197,12 +215,13 @@ void buildFriskLayoutPipeline(OpPassManager &pm) {
 void buildFriskLayoutPipeline(OpPassManager &pm, const SolverOptions &options,
                              StringRef statsFile, LayoutStatisticsReport *statistics,
                              LayoutTraceOptions traceOptions, StringRef profileFile,
-                             bool irDiagnostics, LayoutBoundaryFrequencyMode mode) {
-  pm.addPass(std::make_unique<LayoutPipelineTransactionPass>(options, statsFile, statistics, std::move(traceOptions), profileFile, irDiagnostics, mode));
+                             bool irDiagnostics, LayoutBoundaryFrequencyMode mode, StringRef costProfileFile) {
+  pm.addPass(std::make_unique<LayoutPipelineTransactionPass>(options, statsFile, statistics, std::move(traceOptions), profileFile, irDiagnostics, mode, costProfileFile));
 }
 
 void registerFriskLayoutPipelines() {
   struct Options : PassPipelineOptions<Options> {
+    Option<std::string> costProfileFile{*this, "cost-profile", llvm::cl::desc("Explicit SM90 calibrated cost profile JSON"), llvm::cl::init("")};
     Option<std::string> boundaryFrequency{*this, "boundary-frequency", llvm::cl::desc("Boundary frequency: legacy or static-trip-count"), llvm::cl::init("legacy")};
     Option<bool> irDiagnostics{*this, "ir-diagnostics", llvm::cl::desc("Collect post-optimization static logical arithmetic and resource diagnostics"), llvm::cl::init(false)};
     Option<std::string> profileFile{*this, "profile-file", llvm::cl::desc("Invocation-local inclusive layout profile JSON"), llvm::cl::init("")};
@@ -234,7 +253,7 @@ void registerFriskLayoutPipelines() {
         buildFriskLayoutPipeline(pm, {options.exactCombinationLimit,
                                     options.beamWidth, options.maxExpandedStates,
                                     options.refineBeamSolution, options.maxRefinementProbes}, options.statsFile, nullptr,
-                                 {options.traceFile, options.traceMaxEvents, options.traceMaxBytes}, options.profileFile, options.irDiagnostics, options.boundaryFrequency == "legacy" ? LayoutBoundaryFrequencyMode::Legacy : LayoutBoundaryFrequencyMode::StaticTripCount);
+                                 {options.traceFile, options.traceMaxEvents, options.traceMaxBytes}, options.profileFile, options.irDiagnostics, options.boundaryFrequency == "legacy" ? LayoutBoundaryFrequencyMode::Legacy : LayoutBoundaryFrequencyMode::StaticTripCount, options.costProfileFile);
       });
   (void)registration;
 }

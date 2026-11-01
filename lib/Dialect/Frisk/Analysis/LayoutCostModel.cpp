@@ -230,6 +230,14 @@ CostEstimate mlir::frisk::addLayoutCosts(const CostEstimate &lhs,
   result.saturated = lhs.saturated || rhs.saturated;
   for (auto field : fields)
     result.cost.*field = add(lhs.cost.*field, rhs.cost.*field, result.saturated);
+  for (const auto *estimate : {&lhs, &rhs})
+    for (const auto &[name, value] : estimate->features) {
+      auto existing = llvm::find_if(result.features, [&](const auto &feature) {
+        return feature.first == name;
+      });
+      if (existing == result.features.end()) result.features.emplace_back(name, value);
+      else existing->second = add(existing->second, value, result.saturated);
+    }
   return result;
 }
 

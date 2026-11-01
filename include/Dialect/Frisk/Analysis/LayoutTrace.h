@@ -27,6 +27,9 @@ struct LayoutTraceOptions {
 struct LayoutTraceSummary {
   std::string target, costCoverage;
   std::string costModelID = "unversioned-target";
+  std::string costProfileSHA256;
+  // Mandatory summary costs retain only nine score fields and saturation.
+  // Raw feature ledgers are retained exclusively in byte-bounded events.
   bool staticTripCountFrequency = false;
   std::string analysisStatus = "not-started";
   std::string verificationStatus = "not-started";

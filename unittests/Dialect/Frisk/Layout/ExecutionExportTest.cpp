@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/IR/FriskDialect.h"
+#include "Conversion/FriskLayoutToGPU/LayoutConversionPlan.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
 #include "Dialect/Frisk/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -51,6 +52,32 @@ TEST_F(ExecutionExportTest, StrongAsyncABIExportsActualRootAlignment){
   }
   EXPECT_GE(strong,6u);
  }
+}
+
+TEST_F(ExecutionExportTest, EveryConversionExportsCheckedPlanFields) {
+ auto m=selected();ASSERT_TRUE(m);
+ Value first; m->walk([&](Operation *op){for(Value value:op->getResults())if(!first && isa<RankedTensorType>(value.getType()))first=value;});ASSERT_TRUE(first);
+ OpBuilder builder(first.getDefiningOp());builder.setInsertionPointAfter(first.getDefiningOp());
+ OperationState state(first.getLoc(),"frisk.convert_layout");state.addOperands(first);state.addTypes(first.getType());
+ auto *conversion=builder.create(state);first.replaceAllUsesExcept(conversion->getResult(0),conversion);
+ ASSERT_TRUE(succeeded(run(*m)));
+ auto bytes=llvm::MemoryBuffer::getFile(path);ASSERT_TRUE(bool(bytes));auto parsed=llvm::json::parse((*bytes)->getBuffer());ASSERT_TRUE(bool(parsed));
+ unsigned count=0;
+ for(auto &entry:*parsed->getAsObject()->getArray("operations")) {
+  auto *o=entry.getAsObject();if(o->getString("name")!="frisk.convert_layout")continue;++count;
+  auto *p=o->getObject("redistribution");ASSERT_NE(p,nullptr);
+  auto expected=test::planRedistribution(cast<RankedTensorType>(first.getType()),cast<RankedTensorType>(conversion->getResult(0).getType()),first.getLoc());ASSERT_TRUE(succeeded(expected));
+  EXPECT_EQ(p->getString("mode"),"Register");EXPECT_EQ(p->getInteger("threads"),expected->threads);EXPECT_EQ(p->getInteger("warps"),expected->warps);
+  EXPECT_EQ(p->getInteger("source_registers"),expected->sourceRegisters);EXPECT_EQ(p->getInteger("destination_registers"),expected->destinationRegisters);EXPECT_EQ(p->getInteger("volume"),expected->volume);EXPECT_EQ(p->getInteger("scratch_bytes"),expected->scratchBytes);
+  auto *payload=p->getObject("payload");ASSERT_NE(payload,nullptr);EXPECT_EQ(payload->getInteger("bits"),expected->payload.bits);ASSERT_EQ(payload->getArray("words")->size(),expected->payload.words.size());
+  for(auto [i,w]:llvm::enumerate(expected->payload.words)){auto *word=(*payload->getArray("words"))[i].getAsObject();EXPECT_EQ(word->getInteger("bit_offset"),w.bitOffset);EXPECT_EQ(word->getInteger("live_bits"),w.liveBits);}
+  auto checkOwner=[](llvm::json::Object *o,test::Owner w){ASSERT_NE(o,nullptr);EXPECT_EQ(o->getInteger("reg"),w.reg);EXPECT_EQ(o->getInteger("lane"),w.lane);EXPECT_EQ(o->getInteger("warp"),w.warp);EXPECT_EQ(o->getInteger("warp_group"),w.warpGroup);};
+  ASSERT_EQ(p->getArray("destinations")->size(),expected->destinations.size());
+  for(auto [i,d]:llvm::enumerate(expected->destinations)){auto *entry=(*p->getArray("destinations"))[i].getAsObject();EXPECT_EQ(entry->getInteger("slot"),d.slot);checkOwner(entry->getObject("source"),d.source);}
+  ASSERT_EQ(p->getArray("source_slots")->size(),expected->sourceSlots.size());for(auto [i,slot]:llvm::enumerate(expected->sourceSlots))EXPECT_EQ((*p->getArray("source_slots"))[i].getAsInteger(),slot);
+  ASSERT_EQ(p->getArray("global_writers")->size(),expected->globalWriters.size());for(auto [i,w]:llvm::enumerate(expected->globalWriters))checkOwner((*p->getArray("global_writers"))[i].getAsObject(),w);
+ }
+ EXPECT_GT(count,0u);
 }
 
 }

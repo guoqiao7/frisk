@@ -2,6 +2,7 @@ add_frisk_library(FriskSM90LayoutTarget
   SM90LayoutTarget.cpp
   SM90CopyConstraints.cpp
   SM90CostModel.cpp
+  SM90CalibratedCostModel.cpp
   SM90TargetInfo.cpp
   SM90InstructionTable.cpp
   SM90DistributedCandidates.cpp

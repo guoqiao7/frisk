@@ -5,7 +5,11 @@
 #include "Dialect/Frisk/Analysis/LayoutAliasAnalysis.h"
 #include "Dialect/Frisk/Analysis/LayoutTrace.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "Dialect/Frisk/Analysis/LayoutCostModel.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Parser/Parser.h"
@@ -199,6 +203,21 @@ TEST(SM90CostModelTest, CopyHasNonzeroPathAndTransactionWork) {
   ASSERT_TRUE(succeeded(solution));
   EXPECT_GT(solution->cost.cost.instructionPathAndWork, 0u);
   EXPECT_GT(solution->cost.cost.memoryTransactions, 0u);
+  SM90CostProfile calibration;
+  calibration.coefficients.fill(1);
+  calibration.provenance = "copy-publication-barrier-test-only";
+  auto calibratedTarget = createSM90LayoutTarget(LayoutBoundaryFrequencyMode::Legacy, calibration);
+  CandidateAssignment complete;
+  complete.values = solution->assignments;
+  TestCostObserver calibratedObserver;
+  auto calibrated = calibratedTarget->evaluate(*graph, complete, &calibratedObserver);
+  ASSERT_TRUE(succeeded(calibrated));
+  calibratedObserver.expectSum(*calibrated);
+  uint64_t barriers = 0;
+  for (const auto &[name, value] : calibrated->features)
+    if (name == "synchronization_barriers") barriers += value;
+  EXPECT_GE(barriers, 1u);
+  EXPECT_LE(barriers, 2u);
   // Same static operation, different physical ownership/address groupings.
   // Exercise the graph target scorer rather than a disconnected arithmetic API.
   uint64_t bestSectors = UINT64_MAX, worstSectors = 0;
@@ -236,3 +255,145 @@ TEST(SM90CostModelTest, CopyHasNonzeroPathAndTransactionWork) {
   EXPECT_LT(bestSectors, worstSectors);
   EXPECT_LT(bestBanks, worstBanks);
 }
+
+namespace {
+SM90CostProfile unitProfile() {
+  SM90CostProfile profile;
+  profile.coefficients.fill(1);
+  profile.provenance = "unit-test-only-not-calibration";
+  return profile;
+}
+TEST(SM90CalibratedCostTest, StrictProfileRoundtripAndParameterIdentity) {
+  auto profile = unitProfile();
+  auto text = serializeSM90CostProfile(profile);
+  auto parsed = parseSM90CostProfile(text);
+  ASSERT_TRUE(bool(parsed));
+  EXPECT_EQ(serializeSM90CostProfile(*parsed), text);
+  EXPECT_EQ(getSM90CostProfileSHA256(*parsed).size(), 64u);
+  auto id = getSM90CalibratedCostModelID(profile);
+  EXPECT_EQ(normalizeLayoutCostModelID(id), id);
+  auto staticID = getSM90CalibratedCostModelID(profile, LayoutBoundaryFrequencyMode::StaticTripCount);
+  EXPECT_NE(id, staticID);
+  EXPECT_EQ(normalizeLayoutCostModelID(staticID), staticID);
+  profile.coefficients[0]++;
+  EXPECT_NE(getSM90CalibratedCostModelID(profile), id);
+  for (auto bad : {"{}", "[]", "{\"schema_version\":1}", "[[[[[0]]]]]"}) {
+    auto invalid = parseSM90CostProfile(bad);
+    EXPECT_FALSE(bool(invalid));
+    if (!invalid) llvm::consumeError(invalid.takeError());
+  }
+  auto duplicate = parseSM90CostProfile("{\"schema_version\":1," + text.substr(1));
+  EXPECT_FALSE(bool(duplicate));
+  if (!duplicate) llvm::consumeError(duplicate.takeError());
+  auto escaped = parseSM90CostProfile("{\"schema_\\u0076ersion\":1," + text.substr(1));
+  EXPECT_FALSE(bool(escaped));
+  if (!escaped) llvm::consumeError(escaped.takeError());
+  auto object = llvm::json::parse(text);
+  ASSERT_TRUE(bool(object));
+  object->getAsObject()->getObject("coefficients")->operator[]("alu_warp_issues") = -1;
+  auto invalid = parseSM90CostProfile(llvm::formatv("{0}", *object).str());
+  EXPECT_FALSE(bool(invalid));
+  if (!invalid) llvm::consumeError(invalid.takeError());
+  auto floatingText = text;
+  auto keyPosition = floatingText.find("\"alu_warp_issues\"");
+  ASSERT_NE(keyPosition, std::string::npos);
+  auto numberPosition = floatingText.find_first_of("0123456789", keyPosition);
+  ASSERT_NE(numberPosition, std::string::npos);
+  auto numberEnd = floatingText.find_first_not_of("0123456789", numberPosition);
+  floatingText.replace(numberPosition, numberEnd - numberPosition, "1.0");
+  auto floating = parseSM90CostProfile(floatingText);
+  EXPECT_FALSE(bool(floating));
+  if (!floating) llvm::consumeError(floating.takeError());
+}
+TEST(SM90CalibratedCostTest, RouteAndBarrierCostsUseSameObjectiveAndFrequency) {
+  auto profile = unitProfile();
+  profile.coefficients[10] = 2;
+  profile.coefficients[11] = 3;
+  profile.coefficients[12] = 5;
+  profile.coefficients[14] = 7;
+  auto target = createSM90LayoutTarget(LayoutBoundaryFrequencyMode::StaticTripCount, profile);
+  CostEstimate raw;
+  raw.cost.conversionBytesAndSync = 1088;
+  LayoutConversionEdge edge;
+  edge.bytes = 128;
+  edge.frequencyFactor = 3;
+  for (auto [route, expected] : {
+      std::pair{ConversionExchangeKind::Register, uint64_t{768}},
+      std::pair{ConversionExchangeKind::Shuffle, uint64_t{1152}},
+      std::pair{ConversionExchangeKind::Shared, uint64_t{1962}}}) {
+    edge.exchange = route;
+    edge.synchronizationCost = route == ConversionExchangeKind::Shared ? 2 : 0;
+    auto cost = target->adjustConversionCost(raw, edge);
+    ASSERT_TRUE(succeeded(cost));
+    EXPECT_EQ(cost->cost.instructionPathAndWork, expected);
+    EXPECT_EQ(cost->cost.conversionBytesAndSync, raw.cost.conversionBytesAndSync);
+    EXPECT_FALSE(cost->features.empty());
+  }
+  EXPECT_FALSE(target->requiresRematerializationTrafficReduction());
+  EXPECT_TRUE(createSM90LayoutTarget()->requiresRematerializationTrafficReduction());
+}
+TEST(SM90CalibratedCostTest, RawFeatureLedgerIsMergedAndSaturates) {
+  CostEstimate a, b;
+  a.features = {{"x", UINT64_MAX}, {"y", 1}};
+  b.features = {{"x", 1}, {"z", 2}};
+  auto sum = addLayoutCosts(a,b);
+  EXPECT_TRUE(sum.saturated);
+  EXPECT_EQ(sum.features.size(), 3u);
+  EXPECT_EQ(sum.features[0].second, UINT64_MAX);
+  EXPECT_EQ(sum.cost.instructionPathAndWork, 0u);
+}
+TEST(SM90CalibratedCostTest, ArithmeticDefinitionIsChargedOnceWithVariableOwner) {
+  MLIRContext context;
+  context.loadDialect<FriskDialect, func::FuncDialect, arith::ArithDialect, math::MathDialect>();
+  auto module = parseSourceString<ModuleOp>(R"mlir(
+    func.func @f(%x:tensor<32xf32>,%y:tensor<32xf32>) -> tensor<32xf32> {
+      %a=arith.mulf %x,%y : tensor<32xf32>
+      return %a : tensor<32xf32>
+    })mlir", &context);
+  ASSERT_TRUE(module);
+  arith::MulFOp mul;
+  module->walk([&](arith::MulFOp op){ mul=op; });
+  ASSERT_TRUE(mul);
+  Builder b(&context);
+  SmallVector<APInt> matrix;
+  for (unsigned row=0;row<5;++row)
+    for (unsigned col=0;col<5;++col) matrix.push_back(APInt(1,row==col));
+  auto map=BitLinearLayoutMapAttr::get(&context,b.getStrArrayAttr({"lane"}),
+      b.getDenseI64ArrayAttr({5}),b.getStrArrayAttr({"x"}),b.getDenseI64ArrayAttr({5}),
+      DenseIntElementsAttr::get(RankedTensorType::get({5,5},b.getI1Type()),matrix));
+  auto encoding=DistributedEncodingAttr::get(&context,map,b.getDenseI64ArrayAttr({1,32,1,1,1}),b.getI64IntegerAttr(1));
+  LayoutConstraintGraph graph;
+  auto id=graph.addVariable(LayoutKind::Distributed,mul.getType(),"mul",mul);
+  graph.getVariable(id).value=mul.getResult();
+  CandidateAssignment assignment;
+  assignment.values[id]=encoding;
+  auto profile=unitProfile();profile.coefficients[6]=17;
+  auto target=createSM90LayoutTarget(LayoutBoundaryFrequencyMode::Legacy,profile);
+  TestCostObserver observer;
+  auto cost=target->evaluate(graph,assignment,&observer);
+  ASSERT_TRUE(succeeded(cost));
+  EXPECT_EQ(cost->cost.instructionPathAndWork,17u);
+  observer.expectSum(*cost);
+  ASSERT_EQ(cost->features.size(),1u);
+  EXPECT_EQ(cost->features[0].first,"alu_warp_issues");
+  EXPECT_EQ(cost->features[0].second,1u);
+  CandidateAssignment partial;
+  auto bound=target->lowerBound(graph,partial);
+  ASSERT_TRUE(succeeded(bound));
+  EXPECT_FALSE(cost->cost < bound->cost);
+  auto legacy=createSM90LayoutTarget()->evaluate(graph,assignment);
+  ASSERT_TRUE(succeeded(legacy));
+  EXPECT_EQ(legacy->cost.instructionPathAndWork,0u);
+  auto unsupported = parseSourceString<ModuleOp>(R"mlir(
+    func.func @unsupported(%x:tensor<32xf32>) -> tensor<32xf32> {
+      %z=math.log %x : tensor<32xf32>
+      return %z : tensor<32xf32>
+    })mlir", &context);
+  ASSERT_TRUE(unsupported);
+  math::LogOp logarithm;
+  unsupported->walk([&](math::LogOp op) { logarithm = op; });
+  ASSERT_TRUE(logarithm);
+  graph.getVariable(id).value = logarithm.getResult();
+  EXPECT_TRUE(failed(target->evaluate(graph, assignment)));
+}
+} // namespace

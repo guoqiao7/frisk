@@ -10,14 +10,16 @@ namespace mlir::frisk {
 
 LogicalResult verifySolvedLayoutGraph(const LayoutConstraintGraph &graph,
                                       const LayoutSolution &solution,
-                                      LayoutTarget &target, Location loc);
+                                      LayoutTarget &target, Location loc,
+                                      ConversionPolicy expectedPolicy = ConversionPolicy::Full);
 
 /// target is borrowed for this call; null preserves the legacy SM90 default.
 LogicalResult materializeLayouts(Operation *root,
                                  const LayoutConstraintGraph &graph,
                                  const LayoutSolution &solution,
                                  bool authorizeInternalOptimization = false,
-    LayoutTarget *target = nullptr);
+    LayoutTarget *target = nullptr,
+    ConversionPolicy expectedPolicy = ConversionPolicy::Full);
 
 LogicalResult verifyMaterializedLayouts(Operation *root,
                                         LayoutTarget &target);

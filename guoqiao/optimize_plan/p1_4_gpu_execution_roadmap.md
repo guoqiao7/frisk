@@ -1,3 +1,21 @@
+> 2026-10-31 资源预测修复更新：GPU闭环状态：66精确配置的资源、数值和安全验证完成；首次native编译成本仍存在，缓存不会消除首次编译。
+> Shared按实际root、对齐、串行max scratch和TMA barrier作编译前结构预测：known42+prospective24全部0B误差；寄存器撤下未验证SSA点模型，PTX仅typed虚拟压力，精确数量由编译器与loaded driver交叉确认66/66。纯静态物理寄存器点预测coverage0/24、MAE=None、not-qualified，不能称预测0误差。136项兼容Python回归、额外backend6/export3、CTest10/10通过；216次sanitizer实跑与12配置精确复用。
+> [详细报告](../inference_detail/resource_prediction_repair_report.md)；证据为`guoqiao/optimize_plan/resource_prediction_repair_artifacts/evidence-index.json`。下方保留更新前原文，历史结论不回写。
+
+> 2026-10-31 成本与资源校准、充分知情局部基线已完成实现及有限域实验：v2显式profile接入正常推断，计入算术、route与Copy/转换CTA同步；LI-C纳入producer自身访存和必要输入修复，保留旧L，LI-O对无法局部归属的输入修复整域明确Unsupported。见[实施报告](../inference_detail/cost_resource_calibration_report.md)、[证据索引](cost_resource_calibration_artifacts/evidence-index.json)、[独立复审](cost_resource_calibration_artifacts/whole-review.md)。
+>
+> 当前源码603主单测、45选择测试、CTest10/10及Python等检查通过；新run共13251条数值记录、200次实际sanitizer进程，训练90pairs、最终120pairs，全部有效。测量后仅静态SASS谓词parser诊断修复，以AST/原始文件完整性桥区分测量版与最终版，不修改原样本或profile。
+>
+> 研究结论与准入边界：有限候选排序的7训练/3留出可区分对均正确，但LI/J与新旧模型主比较未显示额外kernel收益。3个留出spec的时间预测MAE4.562µs、最大相对误差36.28%；资源预测MAE27.03个寄存器/3906B Shared，不能宣称通用外推可靠或替代后端分配。默认仍legacy，新profile显式可选。此前旧L收益须按基线信息范围解释。
+>
+> 后续主线为搜索开销优化，再冻结公平比较；冻结之前仍须补强跨形状时延/资源泛化及自然工作负载证据。以下历史内容完整保留，由本条更新当前状态，不将本次有限域实施等同于O05/O06全部长期目标完成。
+
+> 2026-10-30 联合选择及转换消融已验收：同一受检后端、共同候选域的 L-C/J-C/L-O/J-O 四臂完成7行各10个有效配对批次（共70 pairs），完整数值/安全/回归及 fresh whole 独立复审 Approved。见[统一报告](../inference_detail/joint_selection_conversion_ablation_report.md)、[完整证据索引](joint_conversion_ablation_artifacts/evidence-index.json)及[独立复审](joint_conversion_ablation_artifacts/whole-review.md)。
+>
+> 观察与限制：conflict/diamond 的 C/O 组合比值约1.34；remat 的 L/J 差异属于局部平局消除，弱ABI Attention 的差异含 producer 自身 access 被局部scope排除的效应；强cp.async/TMA同SASS控制未显示可靠布局收益。不宣称严格反转、跨ABI收益或胜过Triton/TileLang，不从2×2单独归因共享/remat/post-opt。精确配对CI、机器身份与开销口径以统一报告为准。
+>
+> next = 成本/资源校准 → 搜索开销优化 → 冻结公平比较。以下旧内容（含既有roadmap修改）原样保留为阶段历史；其中“联合消融未开始”等旧状态由本条验收更新取代。
+
 > 2026-10-29 P1.4c已验收：同一backend/runner的cp.async与TMA完整Attention各135次通过，基础弱对齐135次回归通过；54次bitexact运输、12组最终cubin四种Sanitizer及CPU回归通过。两层独立复审Approved，root身份/参考核验通过。详见[报告](../inference_detail/p1_4c_implementation_report.md)。
 
 > 2026-10-29 P1.4b已验收：实际Frisk操作/映射/契约受检导出，逐操作生成低层标量TTGIR及PTX发射，复用Triton 3.4.0编译与运行基础；不由Triton重新选择原生Tensor布局。完整Attention135次、运输/cast54次逐次检查、最终cubin四种Sanitizer及CPU回归通过。详见[报告](../inference_detail/p1_4b_implementation_report.md)。
@@ -81,3 +99,6 @@ Frisk布局推断/选择/证明/物化 → 受检显式布局TTGIR桥接 → 固
 - [x] P1.4c 异步搬运完整闭环
 
 原P1.4b.0–b.6及P1.4c.1/c.2编号停止作为独立任务使用。其必要验证已合并到以上内部步骤。P1.4b和P1.4c均已完整验收；后续联合选择/转换消融等按新任务推进，不因本次验收自动实施。
+
+
+> 2026-10-30：P1.4c已提交dd577f6。下一阶段仍作为一个完整任务；[联合选择及转换消融方案](joint_selection_conversion_ablation_proposal.md)已整理，尚未实施。

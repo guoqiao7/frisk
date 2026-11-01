@@ -16,11 +16,15 @@ struct RelationProofEntry {
   Attribute a, b;
   LayoutProof proof;
 };
+struct CandidateProofEntry { LayoutVarID variable; Attribute candidate; bool valid, capacity; };
 struct FrozenProofs {
+  std::string commonDigest, domainDigest, coverageDigest;
+  std::vector<CandidateProofEntry> candidates;
   std::vector<RelationProofEntry> entries;
   llvm::json::Array toJSON() const;
 };
-FrozenProofs freezeRelationProofs(const LayoutConstraintGraph &);
+FrozenProofs freezeRelationProofs(const LayoutConstraintGraph &, LayoutTarget * = nullptr);
+FailureOr<FrozenProofs> projectFrozenProofs(const LayoutConstraintGraph &common, const LayoutConstraintGraph &restricted, const FrozenProofs &);
 llvm::json::Object domainJSON(const LayoutConstraintGraph &, const FrozenProofs &);
 std::optional<std::pair<int64_t,int64_t>> geometryGrid(Attribute);
 std::set<std::string> assignmentGeometries(const LayoutConstraintGraph &,
@@ -34,7 +38,7 @@ struct ScoredAssignment {
   llvm::json::Array contributions;
 };
 FailureOr<ScoredAssignment> scoreAssignment(const LayoutConstraintGraph &,
-    const CandidateAssignment &, LayoutTarget &);
+    const CandidateAssignment &, LayoutTarget &, const ExperimentPolicy & = {});
 struct OracleResult {
   std::string status, reason;
   bool exhausted = false, fatal = false;
@@ -47,7 +51,7 @@ struct OracleResult {
   llvm::json::Object toJSON() const;
 };
 OracleResult enumerateOracle(const LayoutConstraintGraph &, const FrozenProofs &,
-                             LayoutTarget &, OracleLimits = {});
+                             LayoutTarget &, OracleLimits = {}, const ExperimentPolicy & = {});
 llvm::json::Array assignmentJSON(const LayoutConstraintGraph &,
                                 const DenseMap<LayoutVarID,Attribute> &);
 llvm::json::Array conversionsJSON(const LayoutConstraintGraph &,

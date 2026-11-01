@@ -325,7 +325,7 @@ private:
 LogicalResult materializeDistributedLayouts(
     Operation *root, const LayoutConstraintGraph &graph,
     const LayoutSolution &solution, ArrayRef<LayoutConversionEdge> conversions,
-    bool authorizeInternalOptimization, LayoutTarget *target) {
+    bool authorizeInternalOptimization, LayoutTarget *target, ConversionPolicy expectedPolicy) {
   auto module = dyn_cast<ModuleOp>(root);
   if (!module) return root->emitError("layout materialization requires a module root");
   if (conversions.size() != solution.conversions.size() ||
@@ -333,7 +333,7 @@ LogicalResult materializeDistributedLayouts(
     return root->emitError("conversion argument differs from selected layout solution");
   auto ownedTarget = target ? nullptr : createSM90LayoutTarget();
   if (!target) target = ownedTarget.get();
-  if (failed(verifySolvedLayoutGraph(graph, solution, *target, root->getLoc())))
+  if (failed(verifySolvedLayoutGraph(graph, solution, *target, root->getLoc(), expectedPolicy)))
     return failure();
   LayoutRebuild rebuild(graph, solution, authorizeInternalOptimization);
   if (failed(rebuild.prepare(root, conversions))) return failure();
@@ -350,9 +350,9 @@ LogicalResult materializeDistributedLayouts(
 LogicalResult materializeLayouts(Operation *root,
                                  const LayoutConstraintGraph &graph,
                                  const LayoutSolution &solution,
-                                 bool authorizeInternalOptimization, LayoutTarget *target) {
+                                 bool authorizeInternalOptimization, LayoutTarget *target, ConversionPolicy expectedPolicy) {
   return materializeDistributedLayouts(root, graph, solution, solution.conversions,
-                                      authorizeInternalOptimization, target);
+                                      authorizeInternalOptimization, target, expectedPolicy);
 }
 
 LogicalResult verifyMaterializedLayouts(Operation *root,

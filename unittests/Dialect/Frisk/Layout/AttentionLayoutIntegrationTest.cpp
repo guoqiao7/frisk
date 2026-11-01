@@ -455,7 +455,7 @@ TEST_F(AttentionLayoutIntegrationTest, FreeLayoutRefinementImprovesFullCostAndVe
         LayoutCollectionMode::InitializeForRelaxation);
     ASSERT_TRUE(succeeded(graph));
     SolverOptions options; options.refineBeamSolution = refine;
-    SmallVector<RelaxationRecord> records;
+    SmallVector<RelaxationRecord, 0> records;
     LayoutSolveFailure why;
     auto solution = attemptControlledRelaxation(*graph, *target, options, records, &why);
     ASSERT_TRUE(succeeded(solution)) << why.reason;

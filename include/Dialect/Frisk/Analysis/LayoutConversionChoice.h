@@ -17,11 +17,13 @@ bool isRematerializable(Operation *op);
 /// (possibly component-local) assignment. Never modifies IR or candidate domains.
 FailureOr<LayoutConversionChoices> chooseLayoutConversions(
     const LayoutConstraintGraph &graph, const CandidateAssignment &assignment,
-    LayoutTarget &target, LayoutCostObserver *observer = nullptr);
+    LayoutTarget &target, LayoutCostObserver *observer = nullptr,
+    ConversionPolicy policy = ConversionPolicy::Full);
 
 bool sameLayoutConversionPlan(const LayoutConversionEdge &a,
                               const LayoutConversionEdge &b);
 LogicalResult verifyLayoutConversionChoices(const LayoutConstraintGraph &graph,
-    const LayoutSolution &solution, LayoutTarget &target, Location loc);
+    const LayoutSolution &solution, LayoutTarget &target, Location loc,
+    ConversionPolicy expectedPolicy = ConversionPolicy::Full);
 } // namespace mlir::frisk
 #endif

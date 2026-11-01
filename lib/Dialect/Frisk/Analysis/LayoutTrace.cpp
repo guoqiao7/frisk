@@ -90,10 +90,15 @@ bool LayoutTrace::recordEvent(llvm::function_ref<llvm::json::Object()> build) {
 }
 llvm::json::Object mlir::frisk::layoutCostJSON(const CostEstimate &cost) {
   const auto &c = cost.cost;
-  return llvm::json::Object{{"cost", llvm::json::Array{c.instructionPathAndWork,
+  llvm::json::Object result{{"cost", llvm::json::Array{c.instructionPathAndWork,
       c.memoryTransactions, c.bankConflictDegree, c.conversionBytesAndSync,
       c.spillRiskAndRegisters, c.sharedBytesAndOccupancy, c.replication,
       c.codeSize, c.deterministicTieBreak}}, {"saturated", cost.saturated}};
+  if(!cost.features.empty()) {
+    llvm::json::Object features;for(const auto &[name,count]:cost.features)features[name]=count;
+    result["features"]=std::move(features);
+  }
+  return result;
 }
 void LayoutTrace::recordCost(StringRef kind, uint64_t stableOwner,
                              const CostEstimate &cost) {
@@ -105,7 +110,9 @@ void LayoutTrace::recordCost(StringRef kind, uint64_t stableOwner,
             {"estimate", layoutCostJSON(cost)}};
       })) {
     increment(contributionsOmitted);
-    omitted = addLayoutCosts(omitted, cost);
+    // The mandatory envelope has a fixed reserve. Raw feature ledgers belong
+    // only to bounded events, never to an unbounded omission accumulator.
+    omitted = addLayoutCosts(omitted, CostEstimate{cost.cost, cost.saturated});
   }
 }
 void LayoutTrace::beginCostScope(uint64_t attemptID) {
@@ -136,7 +143,7 @@ void LayoutTrace::finishAttempt(const LayoutSolveFailure &failure,
   completed.analysisStatus = solution ? "solved" : "failed";
   completed.failureKind = solution ? "" : stringifyLayoutSolveFailureKind(failure.kind).str();
   completed.failureReason = solution ? "" : failure.reason;
-  if (solution) completed.finalCost = solution->cost;
+  if (solution) completed.finalCost = {solution->cost.cost, solution->cost.saturated};
   setSummary(completed);
   recordEvent([&] { return llvm::json::Object{{"event", "attempt-end"},
       {"success", solution != nullptr}, {"failureKind", stringifyLayoutSolveFailureKind(failure.kind)},
@@ -244,6 +251,10 @@ void LayoutTrace::setSummary(const LayoutTraceSummary &value) {
   summary.target = bounded(value.target, 64);
   summary.costCoverage = bounded(value.costCoverage, 128);
   summary.costModelID = normalizeLayoutCostModelID(value.costModelID).str();
+  summary.costProfileSHA256 = value.costProfileSHA256.size() == 64 &&
+      llvm::all_of(value.costProfileSHA256, [](unsigned char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+      }) ? value.costProfileSHA256 : "";
   summary.staticTripCountFrequency = value.staticTripCountFrequency;
   summary.analysisStatus = bounded(value.analysisStatus, 32);
   summary.verificationStatus = bounded(value.verificationStatus, 32);
@@ -256,7 +267,7 @@ void LayoutTrace::setSummary(const LayoutTraceSummary &value) {
   summary.refineBeamSolution = value.refineBeamSolution;
   summary.maxRefinementProbes = value.maxRefinementProbes;
   summary.hasFinalCost = value.hasFinalCost;
-  summary.finalCost = value.finalCost;
+  summary.finalCost = {value.finalCost.cost, value.finalCost.saturated};
 }
 void LayoutTrace::setSolverOptions(const SolverOptions &value) {
   if (!enabled()) return;
@@ -292,6 +303,7 @@ std::string LayoutTrace::serialize() const {
       {"finalCost", summary.hasFinalCost ? llvm::json::Value(layoutCostJSON(summary.finalCost))
                                          : llvm::json::Value(nullptr)},
       {"omittedCost", layoutCostJSON(omitted)}};
+  if (!summary.costProfileSHA256.empty()) envelope["cost_profile_sha256"] = summary.costProfileSHA256;
   std::string result;
   llvm::raw_string_ostream stream(result);
   stream << llvm::json::Value(std::move(envelope));

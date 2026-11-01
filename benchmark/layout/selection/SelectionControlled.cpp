@@ -110,7 +110,9 @@ void runControlledExperiment(ModuleOp module,const ExperimentOptions &o,
   // solver's pruned domains. Both graphs borrow the still-unmodified module.
   std::optional<OracleResult> oracle;
   if(o.oracle) {
-    oracle=enumerateOracle(*branch,proofs,*target);
+    auto projected=projectFrozenProofs(*prepared,*branch,proofs);
+    if(failed(projected)){fail("invalid-restriction","proof projection failed");return;}
+    oracle=enumerateOracle(*branch,*projected,*target);
     auto record=oracle->toJSON();record["frozen_domain_sha256"]=frozenHash;
     record["restricted_domain_sha256"]=sha256(branchText);
     if(oracle->best) {

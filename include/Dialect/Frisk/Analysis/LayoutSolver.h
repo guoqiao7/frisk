@@ -3,6 +3,7 @@
 
 #include "Dialect/Frisk/Analysis/LayoutConstraint.h"
 #include "Dialect/Frisk/Analysis/LayoutTarget.h"
+#include "Dialect/Frisk/Analysis/LayoutExperimentPolicy.h"
 
 #include "llvm/ADT/DenseMap.h"
 
@@ -14,6 +15,7 @@ struct LayoutStatisticsReport;
 class LayoutTrace;
 
 struct LayoutSolution {
+  ExperimentPolicy policy;
   DenseMap<LayoutVarID, Attribute> assignments;
   SmallVector<LayoutConversionEdge> conversions;
   DenseMap<LayoutConstraintID, Attribute> instructionBindings;
@@ -52,6 +54,8 @@ struct SolverOptions {
   uint64_t maxExpandedStates = 65536;
   bool refineBeamSolution = true;
   uint64_t maxRefinementProbes = 256;
+  ExperimentPolicy policy;
+  SharedSearchBudget *sharedBudget = nullptr;
 };
 
 enum class LayoutSolveFailureKind {

@@ -4,6 +4,7 @@
 #include "Dialect/Frisk/Analysis/LayoutCostModel.h"
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
 #include "Dialect/Frisk/Target/SM90/SM90LayoutTarget.h"
+#include "Dialect/Frisk/Target/SM90/SM90CostModel.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Diagnostics.h"
@@ -47,7 +48,8 @@ FailureOr<CostEstimate> conversionCost(Value source, Attribute destination,
   var.shapedType = type;
   var.value = source;
   edge.insertionPoint = at;
-  return evaluateLayoutConversionCost(var, type.getEncoding(), destination, edge, target.boundaryFrequencyMode());
+  auto proxy = evaluateLayoutConversionCost(var, type.getEncoding(), destination, edge, target.boundaryFrequencyMode());
+  return failed(proxy) ? FailureOr<CostEstimate>(failure()) : target.adjustConversionCost(*proxy, edge);
 }
 
 bool verifiedCandidate(ModuleOp module, LayoutTarget &target) {
@@ -149,8 +151,12 @@ class OptimizeLayoutConversionsPass final
 public:
   OptimizeLayoutConversionsPass() = default;
   OptimizeLayoutConversionsPass(const OptimizeLayoutConversionsPass &other)
-      : impl::OptimizeLayoutConversionsBase<OptimizeLayoutConversionsPass>(other) {}
-  explicit OptimizeLayoutConversionsPass(LayoutBoundaryFrequencyMode mode) {
+      : impl::OptimizeLayoutConversionsBase<OptimizeLayoutConversionsPass>(other),
+        calibratedProfile(other.calibratedProfile) {}
+  std::optional<SM90CostProfile> calibratedProfile;
+  explicit OptimizeLayoutConversionsPass(LayoutBoundaryFrequencyMode mode,
+                                         const SM90CostProfile *profile) {
+    if (profile) calibratedProfile = *profile;
     boundaryFrequency = mode == LayoutBoundaryFrequencyMode::Legacy ? "legacy" : "static-trip-count";
   }
   void runOnOperation() override {
@@ -159,7 +165,15 @@ public:
       original.emitError("invalid boundary-frequency: expected legacy or static-trip-count");
       signalPassFailure(); return;
     }
-    auto target = createSM90LayoutTarget(boundaryFrequency == "legacy" ? LayoutBoundaryFrequencyMode::Legacy : LayoutBoundaryFrequencyMode::StaticTripCount);
+    auto activeCalibration = calibratedProfile;
+    if (!costProfileFile.empty()) {
+      if (activeCalibration) { original.emitError("duplicate supplied cost-profile"); signalPassFailure(); return; }
+      auto loaded = loadSM90CostProfileFile(costProfileFile);
+      if (!loaded) { original.emitError("invalid cost-profile: ") << llvm::toString(loaded.takeError()); signalPassFailure(); return; }
+      activeCalibration = std::move(*loaded);
+    }
+    auto mode = boundaryFrequency == "legacy" ? LayoutBoundaryFrequencyMode::Legacy : LayoutBoundaryFrequencyMode::StaticTripCount;
+    auto target = activeCalibration ? createSM90LayoutTarget(mode, *activeCalibration) : createSM90LayoutTarget(mode);
     if (failed(verifyMaterializedLayouts(original, *target))) {
       signalPassFailure(); return;
     }
@@ -175,7 +189,11 @@ public:
       changed = false;
       SmallVector<ConvertLayoutOp> conversions;
       staged->walk([&](ConvertLayoutOp op) { conversions.push_back(op); });
+      // Existing commute/hoist comparisons omit the changed producer work.
+      // Until they have a complete calibrated objective check, v2 retains
+      // semantic canonicalization only; do not silently optimize with v1.
       for (ConvertLayoutOp convert : conversions) {
+        if (activeCalibration) break;
         if (commute(convert, *staged, *target) || hoistLoop(convert, *staged, *target)) {
           changed = true;
           break; // Rebuild handles and dominance after every accepted edit.
@@ -193,8 +211,9 @@ public:
   }
 };
 }
-std::unique_ptr<Pass> createOptimizeLayoutConversionsPass(LayoutBoundaryFrequencyMode mode) {
-  return std::make_unique<OptimizeLayoutConversionsPass>(mode);
+std::unique_ptr<Pass> createOptimizeLayoutConversionsPass(LayoutBoundaryFrequencyMode mode,
+                                                             const SM90CostProfile *profile) {
+  return std::make_unique<OptimizeLayoutConversionsPass>(mode, profile);
 }
 std::unique_ptr<Pass> createOptimizeLayoutConversionsPass() {
   return std::make_unique<OptimizeLayoutConversionsPass>();

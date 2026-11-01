@@ -45,6 +45,9 @@ bool operator<(const CostVector &lhs, const CostVector &rhs);
 struct CostEstimate {
   CostVector cost;
   bool saturated = false;
+  /// Raw nonnegative model features, for calibration/audit only. They never
+  /// participate in CostVector's ordering; addLayoutCosts merges them by name.
+  llvm::SmallVector<std::pair<std::string, uint64_t>, 0> features;
 };
 
 struct LayoutDimension {

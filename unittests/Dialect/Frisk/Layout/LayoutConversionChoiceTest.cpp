@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
+#include "Dialect/Frisk/Analysis/LayoutExperimentPolicy.h"
 #include "Dialect/Frisk/Analysis/LayoutConversionChoice.h"
 #include "Dialect/Frisk/Analysis/LayoutCostModel.h"
 #include "Dialect/Frisk/Analysis/LayoutIRDiagnostics.h"
@@ -860,4 +861,173 @@ TEST_F(LayoutConversionChoiceTest, BothModesFiniteOracleBoundsRefinementAndPlanI
     EXPECT_TRUE(failed(verifyLayoutConversionChoices(graph, forged, *model, b.getUnknownLoc())));
   }
 }
+// Deliberately give cloning more legacy byte work but less target score. This
+// catches mixed objectives, including a missed hook on a remat leaf conversion.
+class BoundaryObjectiveTarget final : public LayoutTarget {
+  LayoutTarget &base;
+  bool trafficGuard;
+public:
+  BoundaryObjectiveTarget(LayoutTarget &base, bool guard) : base(base), trafficGuard(guard) {}
+  void enumerateCandidates(const LayoutVar &var, SmallVectorImpl<LayoutCandidate> &out) const override {
+    base.enumerateCandidates(var, out);
+  }
+  LogicalResult verifyCandidate(const LayoutVar &var, Attribute attr, Location loc) const override {
+    return base.verifyCandidate(var, attr, loc);
+  }
+  FailureOr<CostVector> evaluate(const CandidateAssignment &assignment) const override {
+    return base.evaluate(assignment);
+  }
+  FailureOr<CostEstimate> adjustConversionCost(const CostEstimate &raw,
+                                              const LayoutConversionEdge &edge) const override {
+    auto result = raw;
+    result.cost.instructionPathAndWork = edge.use ? 100 : 1;
+    result.features.emplace_back(edge.use ? "output-conversion" : "leaf-conversion", 1);
+    return result;
+  }
+  FailureOr<CostEstimate> adjustCloneCost(const CostEstimate &raw, const LayoutVar &,
+      Attribute, Operation *, Operation *) const override {
+    auto result = raw;
+    result.cost.instructionPathAndWork = 1;
+    result.features.emplace_back("cloned-op", 1);
+    return result;
+  }
+  bool requiresRematerializationTrafficReduction() const override { return trafficGuard; }
+};
+
+TEST_F(LayoutConversionChoiceTest, CalibratedBoundaryObjectiveChargesSelectedCloneOnly) {
+  auto module = parseSourceString<ModuleOp>(R"mlir(
+    func.func @slice() -> tensor<64xf32> {
+      %c = arith.constant dense<1.0> : tensor<64xf32>
+      %a = arith.addf %c, %c : tensor<64xf32>
+      %b = arith.addf %a, %a : tensor<64xf32>
+      return %b : tensor<64xf32>
+    })mlir", &context);
+  ASSERT_TRUE(module);
+  auto graph = collectLayoutConstraints(*module, *target);
+  ASSERT_TRUE(succeeded(graph));
+  CandidateAssignment assignment;
+  for (auto &var : graph->getVariables())
+    assignment.values[var.id] = encoding(bool(var.functionResult));
+  BoundaryObjectiveTarget oldGuard(*target, true), calibrated(*target, false);
+  auto guarded = chooseLayoutConversions(*graph, assignment, oldGuard);
+  ASSERT_TRUE(succeeded(guarded));
+  ASSERT_EQ(guarded->edges.size(), 1u);
+  EXPECT_EQ(guarded->edges[0].resolution, EdgeResolutionKind::Convert);
+  TestCostObserver observer;
+  auto chosen = chooseLayoutConversions(*graph, assignment, calibrated, &observer);
+  ASSERT_TRUE(succeeded(chosen));
+  ASSERT_EQ(chosen->edges.size(), 1u);
+  EXPECT_EQ(chosen->edges[0].resolution, EdgeResolutionKind::Rematerialize);
+  EXPECT_EQ(chosen->cost.cost.instructionPathAndWork, 3u);
+  EXPECT_GT(chosen->cost.cost.conversionBytesAndSync, guarded->cost.cost.conversionBytesAndSync);
+  ASSERT_EQ(chosen->cost.features.size(), 1u);
+  EXPECT_EQ(chosen->cost.features[0].first, "cloned-op");
+  EXPECT_EQ(chosen->cost.features[0].second, 3u);
+  ASSERT_EQ(observer.parts.size(), 1u);
+  EXPECT_EQ(observer.parts[0].kind, "rematerialization");
+  observer.expectSum(chosen->cost);
+}
+
+TEST_F(LayoutConversionChoiceTest, CalibratedBoundaryObjectiveIncludesLeafConversion) {
+  auto module = parseSourceString<ModuleOp>(R"mlir(
+    func.func @leaf(%x: tensor<64xf32>) -> tensor<64xf32> {
+      %p = arith.mulf %x, %x : tensor<64xf32>
+      return %p : tensor<64xf32>
+    })mlir", &context);
+  ASSERT_TRUE(module);
+  auto graph = collectLayoutConstraints(*module, *target);
+  ASSERT_TRUE(succeeded(graph));
+  CandidateAssignment assignment;
+  for (auto &var : graph->getVariables())
+    assignment.values[var.id] = encoding(bool(var.functionResult));
+  BoundaryObjectiveTarget calibrated(*target, false);
+  auto chosen = chooseLayoutConversions(*graph, assignment, calibrated);
+  ASSERT_TRUE(succeeded(chosen));
+  ASSERT_EQ(chosen->edges.size(), 1u);
+  EXPECT_EQ(chosen->edges[0].resolution, EdgeResolutionKind::Rematerialize);
+  EXPECT_EQ(chosen->cost.cost.instructionPathAndWork, 2u);
+  ASSERT_EQ(chosen->cost.features.size(), 2u);
+  uint64_t leaves = 0, clones = 0;
+  for (const auto &[name, value] : chosen->cost.features) {
+    EXPECT_NE(name, "output-conversion");
+    if (name == "leaf-conversion") leaves += value;
+    if (name == "cloned-op") clones += value;
+  }
+  EXPECT_EQ(leaves, 1u);
+  EXPECT_EQ(clones, 1u);
+}
+
 } // namespace
+
+namespace {
+using JointAblationPolicy = LayoutConversionChoiceTest;
+TEST_F(JointAblationPolicy, IndependentDoesNotShareOrRematerialize) {
+  for (bool constant : {false, true}) {
+    auto module = parseSourceString<ModuleOp>(constant ? R"mlir(
+      func.func @f() -> tensor<64xf32> {
+        %x = arith.constant dense<3.0> : tensor<64xf32>
+        %y = arith.mulf %x, %x : tensor<64xf32>
+        return %y : tensor<64xf32>
+      })mlir" : R"mlir(
+      func.func @f(%x: tensor<64xf32>) -> tensor<64xf32> {
+        %y = arith.mulf %x, %x : tensor<64xf32>
+        return %y : tensor<64xf32>
+      })mlir", &context);
+    ASSERT_TRUE(module);
+    auto graph = collectLayoutConstraints(*module, *target); ASSERT_TRUE(succeeded(graph));
+    fix(*graph, [](const LayoutVar &v) {return v.value && (isa<BlockArgument>(v.value) || v.value.getDefiningOp<arith::ConstantOp>());});
+    SolverOptions options; options.policy.conversion = ConversionPolicy::Independent;
+    auto result = solveLayoutGraph(*graph,*target,options); ASSERT_TRUE(succeeded(result));
+    ASSERT_EQ(result->conversions.size(),2u);
+    EXPECT_NE(result->conversions[0].sharedLeader,result->conversions[1].sharedLeader);
+    for (const auto &e:result->conversions) EXPECT_EQ(e.resolution,EdgeResolutionKind::Convert);
+    ASSERT_TRUE(succeeded(materializeLayouts(*module,*graph,*result,false,nullptr,ConversionPolicy::Independent)));
+    unsigned count=0;module->walk([&](ConvertLayoutOp){++count;});EXPECT_EQ(count,2u);
+  }
+}
+TEST_F(JointAblationPolicy, SharedOnlyDoesNotRematerialize) {
+  auto module=parseSourceString<ModuleOp>(R"mlir(func.func @f() -> tensor<64xf32> {
+    %x=arith.constant dense<3.0> : tensor<64xf32>
+    %y=arith.mulf %x,%x : tensor<64xf32>
+    return %y : tensor<64xf32> })mlir",&context);
+  ASSERT_TRUE(module);auto graph=collectLayoutConstraints(*module,*target);ASSERT_TRUE(succeeded(graph));
+  fix(*graph,[](const LayoutVar &v){return v.value && v.value.getDefiningOp<arith::ConstantOp>();});
+  SolverOptions options;options.policy.conversion=ConversionPolicy::SharedOnly;
+  auto result=solveLayoutGraph(*graph,*target,options);ASSERT_TRUE(succeeded(result));ASSERT_EQ(result->conversions.size(),2u);
+  EXPECT_EQ(result->conversions[0].sharedLeader,result->conversions[1].sharedLeader);
+  for(const auto &e:result->conversions)EXPECT_EQ(e.resolution,EdgeResolutionKind::Convert);
+}
+TEST_F(JointAblationPolicy, CrossPolicyVerificationRejects) {
+  auto module=parseSourceString<ModuleOp>(R"mlir(func.func @f(%x:tensor<64xf32>) -> tensor<64xf32> {
+    %y=arith.mulf %x,%x : tensor<64xf32>
+    return %y : tensor<64xf32> })mlir",&context);
+  ASSERT_TRUE(module);auto graph=collectLayoutConstraints(*module,*target);ASSERT_TRUE(succeeded(graph));
+  fix(*graph,[](const LayoutVar &v){return v.value && isa<BlockArgument>(v.value);});
+  ScopedDiagnosticHandler quiet(&context,[](Diagnostic &){return success();});
+  for(auto policy:{ConversionPolicy::Independent,ConversionPolicy::Full}) {
+    auto copy=*graph;SolverOptions options;options.policy.conversion=policy;
+    auto result=solveLayoutGraph(copy,*target,options);ASSERT_TRUE(succeeded(result));
+    EXPECT_TRUE(succeeded(verifyLayoutConversionChoices(copy,*result,*target,module->getLoc(),policy)));
+    auto opposite=policy==ConversionPolicy::Independent?ConversionPolicy::Full:ConversionPolicy::Independent;
+    EXPECT_TRUE(failed(materializeLayouts(*module,copy,*result,false,nullptr,opposite)));
+    EXPECT_TRUE(failed(verifyLayoutConversionChoices(copy,*result,*target,module->getLoc(),opposite)));
+    result->policy.conversion=opposite;
+    EXPECT_TRUE(failed(verifyLayoutConversionChoices(copy,*result,*target,module->getLoc(),opposite)));
+  }
+}
+TEST_F(JointAblationPolicy, IdentityDoesNotCreateWork) {
+  auto module=parseSourceString<ModuleOp>(R"mlir(func.func @f(%x:tensor<64xf32>) -> tensor<64xf32> {return %x : tensor<64xf32>})mlir",&context);
+  auto graph=collectLayoutConstraints(*module,*target);ASSERT_TRUE(succeeded(graph));fix(*graph,[](const LayoutVar &){return true;});
+  SolverOptions options;options.policy.conversion=ConversionPolicy::Independent;
+  auto result=solveLayoutGraph(*graph,*target,options);ASSERT_TRUE(succeeded(result));EXPECT_TRUE(result->conversions.empty());
+}
+TEST_F(JointAblationPolicy, DefaultFullUnchanged) {
+  auto module=parseSourceString<ModuleOp>(R"mlir(func.func @f() -> tensor<64xf32> {
+    %x=arith.constant dense<3.0> : tensor<64xf32>
+    return %x : tensor<64xf32> })mlir",&context);
+  auto graph=collectLayoutConstraints(*module,*target);ASSERT_TRUE(succeeded(graph));fix(*graph,[](const LayoutVar &v){return v.value && v.value.getDefiningOp<arith::ConstantOp>();});
+  auto result=solveLayoutGraph(*graph,*target);ASSERT_TRUE(succeeded(result));
+  EXPECT_EQ(result->policy.conversion,ConversionPolicy::Full);ASSERT_EQ(result->conversions.size(),1u);
+  EXPECT_EQ(result->conversions[0].resolution,EdgeResolutionKind::Rematerialize);
+}
+}

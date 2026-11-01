@@ -168,8 +168,12 @@ StorageLayoutAttr buildXor(MemRefType type, unsigned swizzleBytes) {
 
 class SM90LayoutTarget final : public LayoutTarget {
   LayoutBoundaryFrequencyMode mode;
+  std::optional<SM90CostProfile> profile;
+  std::string calibratedID;
 public:
   explicit SM90LayoutTarget(LayoutBoundaryFrequencyMode mode) : mode(mode) {}
+  SM90LayoutTarget(LayoutBoundaryFrequencyMode mode, const SM90CostProfile &p)
+      : mode(mode), profile(p), calibratedID(getSM90CalibratedCostModelID(p, mode)) {}
   LayoutBoundaryFrequencyMode boundaryFrequencyMode() const override { return mode; }
   void enumerateRelaxedCandidates(const LayoutConstraintGraph &,
       const LayoutVar &var, RelaxationKind kind,
@@ -289,18 +293,40 @@ public:
   evaluate(const CandidateAssignment &) const override { return CostVector{}; }
   FailureOr<CostEstimate> evaluate(const LayoutConstraintGraph &graph,
       const CandidateAssignment &assignment) const override {
-    return evaluateSM90LayoutCost(graph, assignment, nullptr, mode);
+    return profile ? evaluateSM90CalibratedLayoutCost(graph, assignment, *profile, nullptr, mode)
+                   : evaluateSM90LayoutCost(graph, assignment, nullptr, mode);
   }
   FailureOr<CostEstimate> evaluate(const LayoutConstraintGraph &graph,
       const CandidateAssignment &assignment, LayoutCostObserver *observer) const override {
-    return evaluateSM90LayoutCost(graph, assignment, observer, mode);
+    return profile ? evaluateSM90CalibratedLayoutCost(graph, assignment, *profile, observer, mode)
+                   : evaluateSM90LayoutCost(graph, assignment, observer, mode);
   }
   FailureOr<CostEstimate> lowerBound(const LayoutConstraintGraph &graph,
       const CandidateAssignment &assignment) const override {
-    return evaluateStaticLayoutCost(graph, assignment);
+    // Zero is a safe bound for nonnegative calibrated feature scores. Peak
+    // SSA liveness and physical occupancy are deliberately not additive costs.
+    return profile ? FailureOr<CostEstimate>(CostEstimate{})
+                   : evaluateStaticLayoutCost(graph, assignment);
   }
-  StringRef costModelID() const override { return mode == LayoutBoundaryFrequencyMode::Legacy ? getSM90LegacyCostModelID() : "sm90-layout-lex9-static-trip-count-v1"; }
+  FailureOr<CostEstimate> adjustConversionCost(const CostEstimate &proxy,
+      const LayoutConversionEdge &edge) const override {
+    return profile ? adjustSM90CalibratedConversionCost(proxy, edge, *profile) : proxy;
+  }
+  FailureOr<CostEstimate> adjustCloneCost(const CostEstimate &proxy,
+      const LayoutVar &result, Attribute encoding, Operation *op,
+      Operation *at) const override {
+    return profile ? adjustSM90CalibratedCloneCost(proxy, result, encoding, op, at, *profile, mode) : proxy;
+  }
+  bool requiresRematerializationTrafficReduction() const override { return !profile; }
+  StringRef costModelID() const override { if (profile) return calibratedID; return mode == LayoutBoundaryFrequencyMode::Legacy ? getSM90LegacyCostModelID() : "sm90-layout-lex9-static-trip-count-v1"; }
   StringRef costCoverage() const override {
+    if (profile)
+      return "sm90-calibrated-features-v2; nonnegative-integer-score-ticks-not-cycles; "
+             "tensor-arithmetic-warp-issues-f16-f32-i1-i32; route-specific-conversion-bytes; "
+             "CTA-barriers=conversion-and-global-to-shared-Copy-only; explicit-copy-setup-MMA-and-reduction-proxies; "
+             "alignment-aware-32B-sectors-and-shared-bank-excess; frequency-weighted; "
+             "physical-registers-occupancy-and-SSA-peaks=post-materialization-diagnostics; "
+             "unmodeled=cache,overlap,dependency-latency,MMA-shared-read-bank-behavior,scalar-control";
     if (mode == LayoutBoundaryFrequencyMode::StaticTripCount)
       return "bounded-owner-proof-v1 with cta-staging-upper-bound-v1 fallback; "
              "pure-slice-byte-work-v1; static signed trip counts with unknown-loop factor-2 proxy; "
@@ -327,6 +353,11 @@ void SM90LayoutTarget::enumerateRelaxedCandidates(const LayoutConstraintGraph &,
 
 std::unique_ptr<LayoutTarget> createSM90LayoutTarget(LayoutBoundaryFrequencyMode mode) {
   return std::make_unique<SM90LayoutTarget>(mode);
+}
+
+std::unique_ptr<LayoutTarget> createSM90LayoutTarget(
+    LayoutBoundaryFrequencyMode mode, const SM90CostProfile &profile) {
+  return std::make_unique<SM90LayoutTarget>(mode, profile);
 }
 
 } // namespace mlir::frisk

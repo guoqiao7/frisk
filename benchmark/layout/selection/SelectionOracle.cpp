@@ -9,6 +9,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include <chrono>
 #include <functional>
+#include "llvm/Support/FormatVariadic.h"
 
 namespace mlir::frisk::selection {
 namespace {
@@ -33,7 +34,7 @@ public:
   llvm::json::Array entries;
   void recordCost(StringRef kind,uint64_t owner,const CostEstimate &cost) override {
     sum=addLayoutCosts(sum,cost);
-    entries.push_back(llvm::json::Object{{"kind",kind},{"owner",owner},{"cost",layoutCostJSON(cost)}});
+    entries.push_back(llvm::json::Object{{"kind",kind.str()},{"owner",owner},{"cost",layoutCostJSON(cost)}});
   }
 };
 bool sameCost(const CostEstimate &a,const CostEstimate &b) {
@@ -77,7 +78,17 @@ FailureOr<LayoutConstraintGraph> restrictGeometry(const LayoutConstraintGraph &g
   return branch;
 }
 
-FrozenProofs freezeRelationProofs(const LayoutConstraintGraph &g) {
+namespace {
+std::string domainDigest(const LayoutConstraintGraph &g) {
+  return sha256(llvm::formatv("{0}",llvm::json::Value(domainJSON(g,FrozenProofs{}))).str());
+}
+std::string coverageDigest(const FrozenProofs &proofs) {
+  llvm::json::Array candidates;
+  for(const auto &e:proofs.candidates)candidates.push_back(llvm::json::Object{{"variable",e.variable},{"candidate",attributeText(e.candidate)},{"valid",e.valid},{"capacity",e.capacity}});
+  return sha256(llvm::formatv("{0}",llvm::json::Value(llvm::json::Object{{"relations",proofs.toJSON()},{"candidates",std::move(candidates)}})).str());
+}
+}
+FrozenProofs freezeRelationProofs(const LayoutConstraintGraph &g, LayoutTarget *target) {
   FrozenProofs result;
   for(const auto &c:g.getConstraints()) {
     if(c.strength!=ConstraintStrength::Hard || c.instruction || c.reduction) continue;
@@ -99,7 +110,30 @@ FrozenProofs freezeRelationProofs(const LayoutConstraintGraph &g) {
     } else for(const auto &a:g.getVariable(lhs).candidates)
       result.entries.push_back({c.id,lhs,lhs,a.value,{}, {ProofStatus::Unknown,{},"unsupported hard relation"}});
   }
+  if(target)for(const auto &v:g.getVariables())for(const auto &c:v.candidates) {
+    auto loc=v.anchor?v.anchor->getLoc():UnknownLoc::get(v.shapedType.getContext());
+    ScopedDiagnosticHandler quiet(loc.getContext(),[](Diagnostic &){return success();});
+    result.candidates.push_back({v.id,c.value,succeeded(target->verifyCandidate(v,c.value,loc)),succeeded(verifyLayoutStorageCapacity(g,v,c.value))});
+  }
+  result.commonDigest=result.domainDigest=domainDigest(g);result.coverageDigest=coverageDigest(result);
   return result;
+}
+FailureOr<FrozenProofs> projectFrozenProofs(const LayoutConstraintGraph &common,const LayoutConstraintGraph &restricted,const FrozenProofs &proofs) {
+ if(domainDigest(common)!=proofs.domainDigest || coverageDigest(proofs)!=proofs.coverageDigest || common.getVariables().size()!=restricted.getVariables().size() || common.getConstraints().size()!=restricted.getConstraints().size())return failure();
+ auto restored=restricted;
+ for(auto &v:restored.getVariables()) {
+  const auto &original=common.getVariable(v.id);
+  for(const auto &c:v.candidates)if(!llvm::any_of(original.candidates,[&](const auto &x){return x.value==c.value && x.stableOrdinal==c.stableOrdinal && x.provenance==c.provenance;}))return failure();
+  v.candidates=original.candidates;
+ }
+ for(auto &c:restored.getConstraints())if(c.instruction) {
+  const auto &original=common.getConstraint(c.id);
+  if(!original.instruction || c.instruction->binding!=original.instruction->binding)return failure();
+  for(const auto &t:c.instruction->tuples)if(!llvm::any_of(original.instruction->tuples,[&](const auto &x){return x.encodings==t.encodings && x.binding==t.binding;}))return failure();
+  c.instruction=original.instruction;
+ }
+ if(domainDigest(restored)!=proofs.domainDigest)return failure();
+ auto result=proofs;result.domainDigest=domainDigest(restricted);return result;
 }
 llvm::json::Array FrozenProofs::toJSON() const {
   llvm::json::Array result;
@@ -178,21 +212,37 @@ llvm::json::Object domainJSON(const LayoutConstraintGraph &g,const FrozenProofs 
 }
 
 FailureOr<ScoredAssignment> scoreAssignment(const LayoutConstraintGraph &g,
-    const CandidateAssignment &a,LayoutTarget &target) {
+    const CandidateAssignment &a,LayoutTarget &target,const ExperimentPolicy &policy) {
   Contributions observer;
-  // Exactly one invocation of each real scoring API for this assignment.
-  auto targetCost=target.evaluate(g,a,&observer);if(failed(targetCost)) return failure();
-  auto choices=chooseLayoutConversions(g,a,target,&observer);if(failed(choices)) return failure();
-  auto cost=addLayoutCosts(*targetCost,choices->cost);
-  if(!sameCost(cost,observer.sum)) return failure();
-  return ScoredAssignment{cost,std::move(choices->edges),std::move(observer.entries)};
+  // Shared objective evaluation; the subsequent plan-only regeneration
+  // obtains its certificate without adding observed charges or search probes.
+  auto cost=scoreExperimentAssignment(g,a,target,policy,&observer);if(failed(cost))return failure();
+  auto choices=chooseLayoutConversions(g,a,target,nullptr,policy.conversion);if(failed(choices))return failure();
+  if(!sameCost(*cost,observer.sum))return failure();
+  return ScoredAssignment{*cost,std::move(choices->edges),std::move(observer.entries)};
 }
 
 OracleResult enumerateOracle(const LayoutConstraintGraph &g,const FrozenProofs &proofs,
-                             LayoutTarget &target,OracleLimits limits) {
+                             LayoutTarget &target,OracleLimits limits,const ExperimentPolicy &policy) {
   OracleResult r;r.limits=limits;
+  if(domainDigest(g)!=proofs.domainDigest || coverageDigest(proofs)!=proofs.coverageDigest) {
+    r.status="invalid-domain";r.reason="frozen domain identity or proof coverage mismatch";r.fatal=true;return r;
+  }
+  for(const auto &v:g.getVariables())for(const auto &candidate:v.candidates)if(!proofs.candidates.empty()) {
+    auto frozen=llvm::find_if(proofs.candidates,[&](const auto &e){return e.variable==v.id && e.candidate==candidate.value;});
+    auto loc=v.anchor?v.anchor->getLoc():UnknownLoc::get(v.shapedType.getContext());ScopedDiagnosticHandler quiet(loc.getContext(),[](Diagnostic &){return success();});
+    bool valid=succeeded(target.verifyCandidate(v,candidate.value,loc)),capacity=succeeded(verifyLayoutStorageCapacity(g,v,candidate.value));
+    if(frozen==proofs.candidates.end() || frozen->valid!=valid || frozen->capacity!=capacity){r.status="invalid-domain";r.reason="frozen candidate validity/capacity drift";r.fatal=true;return r;}
+  }
+  if(!policy.scope.fullGraph && !g.isFinalized()) {
+    r.status="invalid-domain";r.reason="scoped oracle requires finalized frozen graph";r.fatal=true;return r;
+  }
   if(limits.nodes>65536 || limits.evaluations>4096 || limits.milliseconds>120000) {
     r.status="invalid-limits";r.reason="oracle limits may only be reduced";r.fatal=true;return r;
+  }
+  auto unsupportedPolicy=experimentPolicyUnsupportedReason(g,policy);
+  if(!unsupportedPolicy.empty()) {
+    r.status="unsupported";r.reason=unsupportedPolicy;return r;
   }
   auto start=std::chrono::steady_clock::now();CandidateAssignment current;
   bool stopped=false;
@@ -222,16 +272,26 @@ OracleResult enumerateOracle(const LayoutConstraintGraph &g,const FrozenProofs &
       if(unknown) {++r.unknownAssignments;return;}
       if(r.evaluatedAssignments==limits.evaluations) {stop("evaluation-limit");return;}
       ++r.evaluatedAssignments;
-      auto scored=scoreAssignment(g,current,target);
+      auto scored=scoreAssignment(g,current,target,policy);
       if(failed(scored)) {r.fatal=true;stop("cost-failure-or-contribution-mismatch");return;}
       bool better=!r.best || scored->cost.cost<r.best->cost.cost;
+      bool strictCostImprovement=better;
+      if(r.best && !policy.scope.fullGraph && !(r.best->cost.cost<scored->cost.cost) && !(scored->cost.cost<r.best->cost.cost)) {
+        SmallVector<LayoutVarID> ids(policy.scope.producers);
+        llvm::sort(ids,[&](auto x,auto y){return g.getVariable(x).stableName<g.getVariable(y).stableName;});
+        for(auto id:ids) {
+          auto ordinal=[&](Attribute attr) {for(const auto &c:g.getVariable(id).candidates)if(c.value==attr)return c.stableOrdinal;return UINT64_MAX;};
+          auto x=ordinal(current.values.lookup(id)),y=ordinal(r.best->assignments.lookup(id));
+          if(x!=y){better=x<y;break;}
+        }
+      }
       if(better) {
-        LayoutSolution best;best.assignments=current.values;best.cost=scored->cost;best.conversions=scored->conversions;
+        LayoutSolution best;best.policy=policy;best.assignments=current.values;best.cost=scored->cost;best.conversions=scored->conversions;
         for(const auto &c:g.getConstraints()) {
           if(c.instruction) best.instructionBindings[c.id]=findInstructionSupport(g,c,current.values)->binding;
           if(c.reduction) best.reductionBindings[c.id]=findReductionSupport(g,c,current.values)->binding;
         }
-        r.best=std::move(best);r.contributions=std::move(scored->contributions);r.optimalGeometries.clear();
+        r.best=std::move(best);r.contributions=std::move(scored->contributions);if(strictCostImprovement)r.optimalGeometries.clear();
       }
       if(!(r.best->cost.cost<scored->cost.cost)) {
         auto geometries=assignmentGeometries(g,current);r.optimalGeometries.insert(geometries.begin(),geometries.end());
@@ -243,6 +303,17 @@ OracleResult enumerateOracle(const LayoutConstraintGraph &g,const FrozenProofs &
     }
     const auto &v=g.getVariable(depth);
     for(const auto &candidate:v.candidates) {
+      auto frozen=llvm::find_if(proofs.candidates,[&](const auto &e){return e.variable==v.id && e.candidate==candidate.value;});
+      if(!proofs.candidates.empty()) {
+        if(frozen==proofs.candidates.end()){r.fatal=true;stop("missing-candidate-proof");return;}
+        if(!frozen->valid || !frozen->capacity){++r.rejected;continue;}
+      }
+      auto loc=v.anchor?v.anchor->getLoc():UnknownLoc::get(v.shapedType.getContext());
+      bool valid;
+      if(!proofs.candidates.empty())valid=true;
+      else {ScopedDiagnosticHandler quiet(loc.getContext(),[](Diagnostic &){return success();});
+       valid=succeeded(target.verifyCandidate(v,candidate.value,loc)) && succeeded(verifyLayoutStorageCapacity(g,v,candidate.value));}
+      if(!valid){++r.rejected;continue;}
       current.values[v.id]=candidate.value;visit(depth+1);if(stopped) break;
     }
     current.values.erase(v.id);
@@ -288,7 +359,7 @@ llvm::json::Object OracleResult::toJSON() const {
     {"unknown_assignments",unknownAssignments},{"limits",llvm::json::Object{{"nodes",limits.nodes},
       {"evaluations",limits.evaluations},{"milliseconds",limits.milliseconds}}},
     {"tie_definition","all nine CostVector fields lexicographically equal; saturation separately recorded"},
-    {"geometry_set_kind",status=="complete" ? "all-optimal" : "incumbent-only"},
+    {"geometry_set_kind",status=="complete" ? "all-minimum-cost-geometries-independent-of-stable-producer-winner" : "incumbent-cost-only"},
     {"optimal_geometries",std::move(geometries)},{"cost_contributions",llvm::json::Array(contributions)}};
   if(best) result["best_cost"]=layoutCostJSON(best->cost);else result["best_cost"]=nullptr;
   return result;

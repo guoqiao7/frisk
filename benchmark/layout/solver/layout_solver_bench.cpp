@@ -71,7 +71,7 @@ int main(int argc, char **argv) {
           LayoutCollectionMode::InitializeForRelaxation, &report);
       if (failed(graph)) return 1;
       auto solveStart = LayoutClock::now();
-      SmallVector<RelaxationRecord> relaxations;
+      SmallVector<RelaxationRecord, 0> relaxations;
       auto solution = attemptControlledRelaxation(*graph, *target, {}, relaxations, nullptr, &report);
       uint64_t solveNS = layoutElapsedNS(solveStart);
       if (failed(solution) || failed(verifySolvedLayoutGraph(*graph, *solution, *target, original->getLoc()))) return 1;

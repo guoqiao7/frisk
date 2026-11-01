@@ -230,7 +230,7 @@ TEST_F(LayoutCandidateSolverTest, RefinementCostFailureDoesNotRetryOrPublishPart
   auto before = graph.getVariable(0).candidates;
   NeighborhoodTarget costs; costs.failingAssignment = 2;
   LayoutStatisticsReport report; LayoutSolveFailure why;
-  SmallVector<RelaxationRecord> records;
+  SmallVector<RelaxationRecord, 0> records;
   LayoutTrace trace({"unused.json"});
   std::string original; llvm::raw_string_ostream(original) << *source;
   ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
@@ -437,7 +437,7 @@ TEST_F(LayoutCandidateSolverTest, BeamLosingOnlySolutionReportsIncomplete) {
   ScopedDiagnosticHandler capture(&context, [&](Diagnostic &d) {
     llvm::raw_string_ostream(errors) << d; return success();
   });
-  SmallVector<RelaxationRecord> records;
+  SmallVector<RelaxationRecord, 0> records;
   LayoutSolveFailure why;
   EXPECT_TRUE(failed(attemptControlledRelaxation(graph,target,options,records,&why)));
   EXPECT_EQ(why.kind, LayoutSolveFailureKind::SearchIncomplete);
@@ -752,3 +752,131 @@ TEST_F(PhysicalSolverTest, ExistingConversionChargedOnceWithoutReinsertion) {
   EXPECT_EQ(s->cost.cost.codeSize,1u);
 }
 } // namespace
+
+namespace {
+using JointAblationSolver=LayoutCandidateSolverTest;
+class ScopedTarget : public RankedTarget {
+public:
+  mutable unsigned bounds=0;
+  uint64_t future=100;
+  FailureOr<CostEstimate> evaluate(const LayoutConstraintGraph &g,const CandidateAssignment &a,LayoutCostObserver *o) const override {
+    CostEstimate result;
+    for(auto [id,value]:a.values) {
+      CostEstimate part;part.cost.instructionPathAndWork=g.getVariable(id).stableName=="producer"?0:(cast<StringAttr>(value).getValue()=="a"?future:0);
+      result=addLayoutCosts(result,part);if(o)o->recordCost("registers",id,part);
+    }
+    return result;
+  }
+  FailureOr<CostEstimate> lowerBound(const LayoutConstraintGraph &,const CandidateAssignment &) const override {++bounds;return CostEstimate{};}
+};
+TEST_F(JointAblationSolver, ProducerTieIgnoresConsumerOrder) {
+  variable("producer");variable("consumer");pair(0,1,15,true);ScopedTarget scoped;
+  ASSERT_TRUE(succeeded(graph.finalize(loc)));
+  auto producer=llvm::find_if(graph.getVariables(),[](const auto &v){return v.stableName=="producer";})->id;
+  SolverOptions options;options.policy.scope.fullGraph=false;options.policy.scope.producers={producer};
+  auto first=solveLayoutGraph(graph,scoped,options);ASSERT_TRUE(succeeded(first));
+  EXPECT_EQ(first->assignments.lookup(producer),builder.getStringAttr("b")); // lower stableOrdinal (98 < 99)
+  scoped.future=999;std::reverse(graph.getVariable(1-producer).candidates.begin(),graph.getVariable(1-producer).candidates.end());
+  auto second=solveLayoutGraph(graph,scoped,options);ASSERT_TRUE(succeeded(second));
+  EXPECT_EQ(second->assignments.lookup(producer),first->assignments.lookup(producer));EXPECT_EQ(second->cost.cost.instructionPathAndWork,0u);
+}
+TEST_F(JointAblationSolver, LocalBoundNeverUsesGlobalBound) {
+  variable("producer");variable("consumer");pair(0,1,15,true);ScopedTarget scoped;
+  ASSERT_TRUE(succeeded(graph.finalize(loc)));
+  auto producer=llvm::find_if(graph.getVariables(),[](const auto &v){return v.stableName=="producer";})->id;
+  SolverOptions options;options.policy.scope.fullGraph=false;options.policy.scope.producers={producer};
+  auto result=solveLayoutGraph(graph,scoped,options);ASSERT_TRUE(succeeded(result));EXPECT_EQ(scoped.bounds,0u);
+}
+TEST_F(JointAblationSolver, ProducerChoiceKeepsFullHardLegality) {
+  variable("producer");variable("consumer");pair(0,1,1,true);ScopedTarget scoped;
+  ASSERT_TRUE(succeeded(graph.finalize(loc)));
+  auto producer=llvm::find_if(graph.getVariables(),[](const auto &v){return v.stableName=="producer";})->id;
+  SolverOptions options;options.policy.scope.fullGraph=false;options.policy.scope.producers={producer};
+  auto result=solveLayoutGraph(graph,scoped,options);ASSERT_TRUE(succeeded(result));
+  EXPECT_EQ(result->assignments.lookup(producer),builder.getStringAttr("a"));EXPECT_EQ(result->assignments.lookup(1-producer),builder.getStringAttr("a"));
+}
+TEST_F(JointAblationSolver, SharedBudgetAcrossComponentsAndStages) {
+  variable("first");variable("second");ASSERT_TRUE(succeeded(graph.finalize(loc)));SharedSearchBudget budget;budget.limit=3;budget.stageLimit=3;
+  SolverOptions options;options.sharedBudget=&budget;LayoutSolveFailure why;
+  ScopedDiagnosticHandler quiet(&context,[](Diagnostic &){return success();});
+  auto result=solveLayoutGraph(graph,target,options,&why);EXPECT_TRUE(failed(result));EXPECT_EQ(why.kind,LayoutSolveFailureKind::SearchBudget);
+  EXPECT_EQ(budget.used,3u);EXPECT_EQ(budget.used,budget.relationshipProbes+budget.completeScores+budget.refinementProbes);
+  auto copy=graph;auto next=solveLayoutGraph(copy,target,options,&why);EXPECT_TRUE(failed(next));EXPECT_EQ(budget.used,3u);
+}
+TEST_F(JointAblationSolver, DefaultBudgetUnchanged) {
+  variable("first");variable("second");SolverOptions options;options.maxExpandedStates=2;
+  auto result=solveLayoutGraph(graph,target,options);ASSERT_TRUE(succeeded(result));EXPECT_EQ(result->components.size(),2u);
+  for(auto &c:result->components)EXPECT_EQ(c.expanded,2u);
+}
+}
+
+namespace {
+TEST_F(JointAblationSolver, UnknownOrMissingContributionsFailClosed) {
+ variable("producer");ASSERT_TRUE(succeeded(graph.finalize(loc)));
+ class Unexplained:public ScopedTarget {
+ public:int mode=0;
+ FailureOr<CostEstimate> evaluate(const LayoutConstraintGraph &,const CandidateAssignment &,LayoutCostObserver *o)const override {
+  CostEstimate c;c.cost.instructionPathAndWork=1;
+  if(o && mode==0)o->recordCost("future-unknown-kind",0,c);
+  return c;
+ }
+ } unexplained;
+ SolverOptions options;options.policy.scope.fullGraph=false;options.policy.scope.producers={0};
+ ScopedDiagnosticHandler quiet(&context,[](Diagnostic &){return success();});
+ EXPECT_TRUE(failed(solveLayoutGraph(graph,unexplained,options)));
+ unexplained.mode=1;EXPECT_TRUE(failed(solveLayoutGraph(graph,unexplained,options)));
+}
+TEST_F(JointAblationSolver, LocalScopeRejectsStorageProducers) {
+ variable("producer");graph.getVariable(0).kind=LayoutKind::Storage;ASSERT_TRUE(succeeded(graph.finalize(loc)));
+ ScopedTarget scoped;SolverOptions options;options.policy.scope.fullGraph=false;options.policy.scope.producers={0};
+ ScopedDiagnosticHandler quiet(&context,[](Diagnostic &){return success();});
+ EXPECT_TRUE(failed(solveLayoutGraph(graph,scoped,options)));
+}
+}
+
+namespace {
+TEST_F(JointAblationSolver, RefinementAcceptsStableProducerTieAfterStrictDescent) {
+ for(auto name:{"p0","p1","p2","p3"})variable(name);
+ auto cid=graph.addConstraint(ConstraintKind::InstructionContract,ConstraintStrength::Hard,{0,1,2,3},*source,"finite","full finite domain");
+ auto &contract=graph.getConstraints()[cid];contract.instruction=InstructionLayoutContract{*source,{}, {}};
+ for(unsigned bits=0;bits<16;++bits){SmallVector<Attribute> attrs;for(unsigned i=0;i<4;++i)attrs.push_back(builder.getStringAttr(bits&(1<<i)?"b":"a"));contract.instruction->tuples.push_back({attrs,builder.getStringAttr("plan")});}
+ class Plateau:public RankedTarget {public:
+ FailureOr<CostEstimate> evaluate(const LayoutConstraintGraph &,const CandidateAssignment &a,LayoutCostObserver *o)const override {
+  unsigned index=0;for(unsigned i=0;i<4;++i)if(cast<StringAttr>(a.values.lookup(i)).getValue()=="b")index|=1<<i;
+  CostEstimate c;c.cost.instructionPathAndWork=index==15?10:index==14?5:index==12?3:(index==8 || index==9)?0:20;
+  if(o)o->recordCost("mma",0,c);return c;
+ }
+ } plateau;
+ ASSERT_TRUE(succeeded(graph.finalize(loc)));
+ SolverOptions options;options.exactCombinationLimit=1;options.beamWidth=1;options.policy.scope.fullGraph=false;options.policy.scope.producers={0,1,2,3};options.policy.scope.producerInstructions={0};
+ auto result=solveLayoutGraph(graph,plateau,options);ASSERT_TRUE(succeeded(result));
+ EXPECT_EQ(result->assignments.lookup(0),builder.getStringAttr("b"));EXPECT_EQ(result->cost.cost.instructionPathAndWork,0u);
+}
+}
+
+namespace {
+TEST_F(JointAblationSolver, ExperimentalScopeRejectsUnfinalizedReordering) {
+ auto producer=variable("zproducer");auto consumer=variable("aconsumer");pair(producer,consumer,15,true);
+ graph.addConstraint(ConstraintKind::SameLayout,ConstraintStrength::Hard,{producer,consumer},nullptr,"earlier-kind","forces actual constraint reorder");
+ auto canonical=graph;ASSERT_TRUE(succeeded(canonical.finalize(loc)));
+ EXPECT_NE(canonical.getVariable(producer).stableName,"zproducer");
+ EXPECT_NE(canonical.getConstraint(0).kind,ConstraintKind::InstructionContract);
+ SolverOptions options;options.policy.scope.fullGraph=false;options.policy.scope.producers={producer};options.policy.scope.producerInstructions={0};
+ ScopedTarget scoped;LayoutSolveFailure why;ScopedDiagnosticHandler quiet(&context,[](Diagnostic &){return success();});
+ EXPECT_TRUE(failed(solveLayoutGraph(graph,scoped,options,&why)));EXPECT_EQ(why.kind,LayoutSolveFailureKind::InvalidInput);EXPECT_FALSE(graph.isFinalized());
+}
+TEST_F(JointAblationSolver, SaturatedGlobalTieKeepsStableProducerTuple) {
+ variable("p0");variable("p1");pair(0,1,15,true);variable("saturator",1);
+ class Saturated:public ScopedTarget {
+ public:FailureOr<CostEstimate> evaluate(const LayoutConstraintGraph &,const CandidateAssignment &a,LayoutCostObserver *o)const override {
+  CostEstimate c;
+  if(a.values.count(2)){c.cost.instructionPathAndWork=UINT64_MAX;if(o)o->recordCost("registers",2,c);}
+  else {bool first=cast<StringAttr>(a.values.lookup(0)).getValue()=="b";c.cost.instructionPathAndWork=first?10:0;if(o)o->recordCost("mma",0,c);}
+  return c;
+ }
+ } saturated;
+ ASSERT_TRUE(succeeded(graph.finalize(loc)));SolverOptions options;options.exactCombinationLimit=1;options.beamWidth=1;options.policy.scope.fullGraph=false;options.policy.scope.producers={0,1,2};options.policy.scope.producerInstructions={0};
+ auto result=solveLayoutGraph(graph,saturated,options);ASSERT_TRUE(succeeded(result));
+ EXPECT_EQ(result->assignments.lookup(0),builder.getStringAttr("b"));EXPECT_TRUE(result->components[0].refinementGlobalFallback);
+}
+}

@@ -25,6 +25,7 @@ add_frisk_library(FriskLayoutAnalysis
   LayoutProfile.cpp
   LayoutStatistics.cpp
   LayoutTrace.cpp
+  LayoutExperimentPolicy.cpp
   LayoutCostModel.cpp
   LayoutConversionChoice.cpp
   LayoutCandidateSolver.cpp

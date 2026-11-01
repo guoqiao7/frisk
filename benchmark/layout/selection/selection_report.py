@@ -23,7 +23,7 @@ def complete(record):
     o = record.get("oracle") or {}
     return (record.get("status", "success") in ("success", "local-analysis-only")
             and o.get("status") == "complete" and o.get("exhausted") is True
-            and not o.get("fatal") and o.get("geometry_set_kind") == "all-optimal"
+            and not o.get("fatal") and o.get("geometry_set_kind") in ("all-optimal", "all-minimum-cost-geometries-independent-of-stable-producer-winner")
             and bool(o.get("optimal_geometries")) and o.get("best_cost") is not None)
 
 

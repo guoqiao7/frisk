@@ -79,7 +79,7 @@ protected:
   Builder b{&context};
   LayoutConstraintGraph graph;
   FiniteRelaxationTarget target;
-  SmallVector<RelaxationRecord> records;
+  SmallVector<RelaxationRecord, 0> records;
   LayoutSolveFailure why;
   LayoutVarID add(StringRef name, bool seeded = false) {
     auto id = graph.addVariable(LayoutKind::Distributed,

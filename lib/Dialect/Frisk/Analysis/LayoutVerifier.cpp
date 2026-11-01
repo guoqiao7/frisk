@@ -22,7 +22,7 @@ Location getVariableLoc(const LayoutVar &var) {
 
 LogicalResult verifySolvedLayoutGraph(const LayoutConstraintGraph &graph,
                                       const LayoutSolution &solution,
-                                      LayoutTarget &target, Location loc) {
+                                      LayoutTarget &target, Location loc, ConversionPolicy expectedPolicy) {
   if (failed(graph.verifyInvariants(loc))) return failure();
   for (const auto &entry : solution.reductionBindings)
     if (entry.first >= graph.getConstraints().size() ||
@@ -125,7 +125,7 @@ LogicalResult verifySolvedLayoutGraph(const LayoutConstraintGraph &graph,
   }
   // Preserve specific missing-edge/hard-constraint diagnostics before checking
   // the richer placement, cost and clone certificate.
-  return verifyLayoutConversionChoices(graph, solution, target, loc);
+  return verifyLayoutConversionChoices(graph, solution, target, loc, expectedPolicy);
 }
 
 } // namespace mlir::frisk

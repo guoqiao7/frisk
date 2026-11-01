@@ -117,6 +117,8 @@ FailureOr<CostEstimate> rematerialize(
     boundary.insertionPoint = at;
     auto cost = evaluateLayoutConversionCost(*var, from, encoding, boundary, target.boundaryFrequencyMode());
     if (failed(cost)) return failure();
+    cost = target.adjustConversionCost(*cost, boundary);
+    if (failed(cost)) return failure();
     total = addLayoutCosts(total, *cost);
     // Saturating addition for diagnostic traffic metadata as well as scores.
     edge.bytes = edge.bytes > UINT64_MAX - boundary.bytes ? UINT64_MAX
@@ -129,6 +131,8 @@ FailureOr<CostEstimate> rematerialize(
     synthetic.kind = LayoutKind::Distributed;
     synthetic.shapedType = op->getResult(0).getType();
     auto clone = evaluateLayoutCloneCost(synthetic, encoding, at, target.boundaryFrequencyMode());
+    if (failed(clone)) return failure();
+    clone = target.adjustCloneCost(*clone, synthetic, encoding, op, at);
     if (failed(clone)) return failure();
     total = addLayoutCosts(total, *clone);
   }
@@ -150,7 +154,7 @@ FailureOr<CostEstimate> rematerialize(
 
 FailureOr<LayoutConversionChoices> chooseLayoutConversions(
     const LayoutConstraintGraph &graph, const CandidateAssignment &assignment,
-    LayoutTarget &target, LayoutCostObserver *observer) {
+    LayoutTarget &target, LayoutCostObserver *observer, ConversionPolicy policy) {
   LayoutProfile::Scope profile(LayoutProfileKind::ConversionChoice);
   LayoutConversionChoices result;
   struct Group { SmallVector<LayoutConversionEdge> edges; SmallVector<CostEstimate> costs; };
@@ -172,9 +176,17 @@ FailureOr<LayoutConversionChoices> chooseLayoutConversions(
     edge.resolution = EdgeResolutionKind::Convert;
     auto cost = evaluateLayoutConversionCost(var, from, to, edge, target.boundaryFrequencyMode());
     if (failed(cost)) return failure();
+    cost = target.adjustConversionCost(*cost, edge);
+    if (failed(cost)) return failure();
     if (c.existingConversion) {
       result.cost = addLayoutCosts(result.cost, *cost);
       if (observer) observer->recordCost("conversion", c.id, *cost);
+      continue;
+    }
+    if (policy == ConversionPolicy::Independent) {
+      result.cost = addLayoutCosts(result.cost, *cost);
+      if (observer) observer->recordCost("conversion", c.id, *cost);
+      result.edges.push_back(std::move(edge));
       continue;
     }
     auto found = llvm::find_if(groups, [&](const Group &g) {
@@ -208,9 +220,11 @@ FailureOr<LayoutConversionChoices> chooseLayoutConversions(
       auto edge = group.edges[i];
       auto cost = group.costs[i];
       auto clone = edge;
-      auto cloneCost = rematerialize(graph, assignment, target, clone);
+      auto cloneCost = policy == ConversionPolicy::Full
+          ? rematerialize(graph, assignment, target, clone) : FailureOr<CostEstimate>(failure());
       if (succeeded(cloneCost) &&
-          cloneCost->cost.conversionBytesAndSync < cost.cost.conversionBytesAndSync &&
+          (!target.requiresRematerializationTrafficReduction() ||
+           cloneCost->cost.conversionBytesAndSync < cost.cost.conversionBytesAndSync) &&
           cloneCost->cost < cost.cost) {
         edge = std::move(clone);
         cost = *cloneCost;
@@ -222,10 +236,12 @@ FailureOr<LayoutConversionChoices> chooseLayoutConversions(
     auto shared = group.edges[leader];
     auto sharedCost = group.costs[leader];
     auto sharedClone = shared;
-    auto sharedCloneCost = rematerialize(graph, assignment, target, sharedClone);
+    auto sharedCloneCost = policy == ConversionPolicy::Full
+        ? rematerialize(graph, assignment, target, sharedClone) : FailureOr<CostEstimate>(failure());
     if (succeeded(sharedCloneCost) &&
-        sharedCloneCost->cost.conversionBytesAndSync <
-            sharedCost.cost.conversionBytesAndSync &&
+        (!target.requiresRematerializationTrafficReduction() ||
+         sharedCloneCost->cost.conversionBytesAndSync <
+             sharedCost.cost.conversionBytesAndSync) &&
         sharedCloneCost->cost < sharedCost.cost) {
       shared = std::move(sharedClone);
       sharedCost = *sharedCloneCost;
@@ -277,10 +293,12 @@ bool sameLayoutConversionPlan(const LayoutConversionEdge &a,
 }
 
 LogicalResult verifyLayoutConversionChoices(const LayoutConstraintGraph &graph,
-    const LayoutSolution &solution, LayoutTarget &target, Location loc) {
+    const LayoutSolution &solution, LayoutTarget &target, Location loc, ConversionPolicy expectedPolicy) {
+  if (solution.policy.conversion != expectedPolicy)
+    return emitError(loc) << "layout conversion policy identity mismatch";
   CandidateAssignment assignment;
   assignment.values = solution.assignments;
-  auto expected = chooseLayoutConversions(graph, assignment, target);
+  auto expected = chooseLayoutConversions(graph, assignment, target, nullptr, expectedPolicy);
   if (failed(expected) || expected->edges.size() != solution.conversions.size() ||
       !llvm::equal(expected->edges, solution.conversions, sameLayoutConversionPlan))
     return emitError(loc) << "invalid layout boundary placement, sharing, cost or rematerialization plan";
