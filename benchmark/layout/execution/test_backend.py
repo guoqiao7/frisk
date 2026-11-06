@@ -121,15 +121,24 @@ class BackendTests(unittest.TestCase):
     value['type']=value['type'].replace('xf16','xf32')
     for address in value['storage']['addresses']:address['begin_bit']*=2;address['end_bit']*=2
   with self.assertRaisesRegex(ValueError,'Copy requires.*16-bit'):backend.emit(data)
- def test_nonlast_broadcast_axis_is_explicitly_rejected(self):
-  # Legal rank1->rank2 broadcast across dimension0, with128 replicas.
-  # Correct output registers are r0,r1,r0,r1; the old implementation
-  # silently selected r0,r0,r1,r1 by dividing flattened coords by2.
-  source={'id':0,'type':'tensor<2xf32>','distributed':{'shape':[2],'topology':[2,32,4,1,1],'logical':[0,1]*128,'replication':128}}
-  target={'id':1,'type':'tensor<2x2xf32>','distributed':{'shape':[2,2],'topology':[4,32,4,1,1],'logical':[0,1,2,3]*128,'replication':128}}
-  emitter=backend.Emitter({'values':[source,target],'operations':[]});emitter.reg[0]=['r0','r1']
-  with self.assertRaisesRegex(ValueError,'broadcast requires rank1.*dimensions=\[1\]'):
-   emitter.broadcast({'operands':[0],'results':[1],'attrs':{'dimensions':[0]}})
+ def test_checked_broadcast_projects_a_nonlast_axis(self):
+  for shape, src_shape, axis, expected in (
+      ([2,2],[2],0,['r0','r1','r0','r1']),
+      ([2,2,2],[2,2],1,['r0','r1','r0','r1','r2','r3','r2','r3'])):
+   with self.subTest(shape=shape):
+    count=len(expected);inputs=count//2
+    source={'id':0,'type':'tensor<2xf32>','distributed':{'shape':src_shape,'topology':[inputs,32,4,1,1],
+             'logical':list(range(inputs))*128,'replication':128}}
+    target={'id':1,'type':'tensor<2x2xf32>','distributed':{'shape':shape,'topology':[count,32,4,1,1],
+             'logical':list(range(count))*128,'replication':128}}
+    emitter=backend.Emitter({'values':[source,target],'operations':[]})
+    emitter.reg[0]=['r'+str(i) for i in range(inputs)]
+    op={'operands':[0],'results':[1],'attrs':{'dimensions':[axis]}}
+    emitter.broadcast(op)
+    self.assertEqual(emitter.reg[1],expected)
+    target['distributed']['logical'][:count]=list(reversed(range(count)))
+    with self.assertRaisesRegex(ValueError,'outside checked GF\\(2\\) subset'):
+     emitter.broadcast(op)
  def test_checked_attention_reductions_keep_an_eager_control(self):
   data=json.loads(Path(INPUT).read_text())
   old,eager=backend.emit(data,reduction_policy='eager')
