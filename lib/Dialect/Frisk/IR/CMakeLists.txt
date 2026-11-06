@@ -1,0 +1,19 @@
+add_frisk_library(FriskIR
+  FriskAttributes.cpp
+  FriskEnums.cpp
+  FriskLayoutAttrs.cpp
+  FriskLayoutInterfaces.cpp
+  FriskLayoutOps.cpp
+  LegacyImportSemantics.cpp
+  FriskOps.cpp
+
+  DEPENDS
+  FriskTableGen
+
+  LINK_LIBS PUBLIC
+  MLIRIR
+  FriskAnalysis
+  MLIRArithDialect
+  MLIRMathDialect
+  MLIRSCFDialect
+)

@@ -1,0 +1,7 @@
+add_library(FriskLayoutFailureSupport STATIC LayoutFailureCase.cpp)
+llvm_update_compile_flags(FriskLayoutFailureSupport)
+target_include_directories(FriskLayoutFailureSupport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(FriskLayoutFailureSupport PUBLIC FriskLayoutAnalysis FriskAnalysis FriskIR MLIRFuncDialect MLIRArithDialect MLIRLinalgDialect MLIRTensorDialect MLIRSCFDialect MLIRMemRefDialect MLIRParser MLIRIR)
+add_llvm_executable(layout-reduce layout-reduce.cpp PARTIAL_SOURCES_INTENDED)
+target_link_libraries(layout-reduce PRIVATE FriskLayoutFailureSupport)
+set_target_properties(layout-reduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)

@@ -1,0 +1,6 @@
+add_subdirectory(solver)
+add_subdirectory(proof)
+add_subdirectory(selection)
+if(FRISK_ENABLE_CUDA_BENCHMARKS)
+  add_subdirectory(conversion)
+endif()

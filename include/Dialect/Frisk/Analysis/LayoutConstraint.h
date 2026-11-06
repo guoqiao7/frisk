@@ -1,0 +1,351 @@
+#ifndef FRISK_ANALYSIS_LAYOUTCONSTRAINT_H
+#define FRISK_ANALYSIS_LAYOUTCONSTRAINT_H
+
+#include "Dialect/Frisk/Analysis/LayoutCommon.h"
+#include "Dialect/Frisk/Analysis/LayoutAliasAnalysis.h"
+
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <string>
+#include <tuple>
+
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include "mlir/IR/Attributes.h"
+#include "mlir/IR/Location.h"
+#include "mlir/IR/Operation.h"
+#include "mlir/IR/Types.h"
+#include "mlir/IR/Value.h"
+#include "mlir/Support/LogicalResult.h"
+
+namespace mlir::frisk {
+
+using LayoutVarID = uint32_t;
+using LayoutConstraintID = uint32_t;
+using ProvenanceID = uint32_t;
+inline constexpr ProvenanceID kInvalidProvenanceID =
+    std::numeric_limits<ProvenanceID>::max();
+
+enum class LayoutState { Uninitialized, CandidateSet, Resolved, Conflict };
+enum class ConstraintStrength { Hard, Soft };
+enum class ConstraintKind {
+  SameLayout,
+  Convertible,
+  TransformLayout,
+  BroadcastLayout,
+  ReductionLayout,
+  RequireEncoding,
+  InstructionContract,
+  StorageAccess,
+  CopyAccess,
+  AliasLayout,
+  RootStorageContract,
+  Ownership,
+  ResourceLimit,
+  Preference
+};
+
+/// A real operation-attribute binding, not an unmaterialized Tensor SSA value.
+struct OperationExecutionBinding {
+  int64_t threads = 32;
+  unsigned vectorBytes = 1;
+  std::string writerPolicy = "first_owner";
+};
+
+struct LayoutCandidate {
+  Attribute value;
+  ProvenanceID provenance = kInvalidProvenanceID;
+  uint64_t stableOrdinal = 0;
+};
+
+struct LayoutVar {
+  LayoutVarID id = 0;
+  LayoutKind kind = LayoutKind::Storage;
+  Type shapedType;
+  SmallVector<LayoutCandidate> candidates;
+  LayoutState state = LayoutState::Uninitialized;
+  std::string stableName;
+  Operation *anchor = nullptr;
+  Value value;
+  OpOperand *use = nullptr;
+  std::optional<unsigned> functionResult;
+  std::optional<StorageAliasInfo> storageAlias;
+  std::optional<OperationExecutionBinding> operationExecution;
+  /// Candidate-generation environment; the matching ResourceLimit is hard.
+  int64_t requiredThreads = 0;
+  /// Instruction proposals replace generic SIMT defaults for this endpoint.
+  bool instructionRole = false;
+  /// A reduction result is seeded only by forward projection, never defaults.
+  bool reductionResult = false;
+  // A LogicalResult-only target decoder rejected generated candidates. An
+  // ensuing empty domain is unsupported evidence, not proven infeasibility.
+  bool candidatePreparationUnsupported = false;
+};
+
+enum class AccessKind { Read, Write };
+
+enum class EdgeResolutionKind { KeepCommonLayout, Convert, Rematerialize };
+
+enum class ConversionExchangeKind { Identity, Register, Shuffle, Shared, Conservative };
+
+struct LayoutConversionEdge {
+  OpOperand *use = nullptr;
+  Attribute sourceEncoding;
+  Attribute targetEncoding;
+  EdgeResolutionKind resolution = EdgeResolutionKind::KeepCommonLayout;
+  uint64_t bytes = 0;
+  uint64_t synchronizationCost = 0;
+  LayoutConstraintID constraint = std::numeric_limits<LayoutConstraintID>::max();
+  ConversionExchangeKind exchange = ConversionExchangeKind::Identity;
+  uint64_t loopDepth = 0;
+  uint64_t frequencyFactor = 1;
+  bool frequencyUsesProxy = false, frequencySaturated = false;
+  // Model identity is needed even where both modes estimate the same factor.
+  bool staticTripCountFrequency = false;
+  std::string costProvenance;
+  Operation *insertionPoint = nullptr;
+  // The earliest use's constraint owns a shared conversion. Each use still has
+  // its own edge record so missing/duplicate consumers can be verified.
+  LayoutConstraintID sharedLeader = std::numeric_limits<LayoutConstraintID>::max();
+  SmallVector<Operation *> rematerialization;
+};
+
+struct LayoutProvenance {
+  ProvenanceID id = 0;
+  std::optional<ProvenanceID> parent;
+  Operation *source = nullptr;
+  std::string rule;
+  std::string reason;
+};
+
+struct InstructionLayoutTuple {
+  SmallVector<Attribute> encodings;
+  Attribute binding;
+};
+
+struct InstructionLayoutContract {
+  Operation *source = nullptr;
+  Attribute binding;
+  SmallVector<InstructionLayoutTuple, 0> tuples;
+};
+
+struct ReductionLayoutPair {
+  Attribute sourceEncoding;
+  Attribute resultEncoding;
+  Attribute binding;
+};
+
+/// Named, directed two-role relation; not an invertible axis permutation.
+struct ReductionLayoutContract {
+  Operation *source = nullptr;
+  int64_t axis = 0;
+  Attribute binding;
+  SmallVector<ReductionLayoutPair, 0> pairs;
+};
+
+/// Output coordinates delete these ordered axes to address the source use.
+struct BroadcastLayoutContract {
+  Operation *source = nullptr;
+  DenseI64ArrayAttr axes;
+};
+
+/// A fixed declaration, not a candidate variable. Its IR identity is borrowed
+/// just like graph operands; rebuilding the graph revalidates the declaration.
+struct RootStorageContract {
+  Operation *declaration = nullptr;
+  StorageAliasInfo root;
+  Attribute layout;
+};
+
+struct LayoutConstraint {
+  LayoutConstraintID id = 0;
+  ConstraintKind kind = ConstraintKind::SameLayout;
+  ConstraintStrength strength = ConstraintStrength::Hard;
+  SmallVector<LayoutVarID> vars;
+  Attribute requiredEncoding;
+  ProvenanceID provenance = 0;
+  Attribute coordinateTransform;
+  AccessKind access = AccessKind::Read;
+  OpOperand *use = nullptr;
+  bool existingConversion = false;
+  std::string stableUseKey;
+  int64_t requiredThreads = 0;
+  std::optional<InstructionLayoutContract> instruction;
+  std::optional<ReductionLayoutContract> reduction;
+  std::optional<BroadcastLayoutContract> broadcast;
+  std::optional<RootStorageContract> rootStorage;
+};
+
+enum class RegionLayoutEdgeKind {
+  IfYield, ForInit, ForBackedge, ForResult,
+  WhileInit, WhileBackedge, WhileCondition, WhileResult
+};
+
+/// An auditable view of an existing hard relation, not another constraint.
+/// Borrowed IR identities have the same lifetime as the graph's SSA uses.
+struct RegionLayoutEdge {
+  RegionLayoutEdgeKind kind;
+  LayoutVarID source;
+  LayoutVarID target;
+  LayoutConstraintID constraint;
+  Operation *owner;
+  OpOperand *use;
+  unsigned slot;
+  std::string stableKey;
+};
+
+StringRef stringifyRegionLayoutEdgeKind(RegionLayoutEdgeKind kind);
+
+struct PropagationPhaseStatistics {
+  bool ran = false;
+  uint64_t initialCandidates = 0;
+  uint64_t finalCandidates = 0;
+  uint64_t initialConstraints = 0;
+  uint64_t deletedCandidates = 0;
+  uint64_t domainChanges = 0;
+  uint64_t queuePops = 0;
+  uint64_t enqueues = 0;
+  uint64_t maximumQueue = 0;
+  uint64_t popUpperBound = 0;
+  uint64_t staticPopUpperBound = 0;
+  SmallVector<uint64_t> changesByVariable;
+
+  bool hasValidBounds() const {
+    return deletedCandidates <= initialCandidates &&
+           finalCandidates == initialCandidates - deletedCandidates &&
+           queuePops <= popUpperBound && popUpperBound <= staticPopUpperBound &&
+           queuePops <= enqueues;
+  }
+  void print(StringRef phase, raw_ostream &os) const;
+};
+
+struct LayoutPropagationStatistics {
+  PropagationPhaseStatistics strict;
+  PropagationPhaseStatistics common;
+};
+
+struct LayoutCandidatePreparationStatistics {
+  // Generated target/root/constraint-projection proposals, before deduplication.
+  // Explicit input seeds are not generated proposals.
+  uint64_t generatedProposals = 0;
+  uint64_t origins = 0;
+  uint64_t projectedCandidates = 0;
+  uint64_t footprintEvaluations = 0;
+  uint64_t pairProofEvaluations = 0;
+  uint64_t instructionCombinations = 0;
+  // Geometry-conditioned role proofs, separately from complete tuple attempts.
+  uint64_t instructionFragmentPrechecks = 0;
+  uint64_t reductionCombinations = 0;
+};
+
+class LayoutConstraintGraph {
+public:
+  using AliasCandidateKey = std::pair<LayoutVarID, Attribute>;
+  using AliasPairKey = std::pair<AliasCandidateKey, AliasCandidateKey>;
+  // Raw, unweighted SM90 StorageAccess terms. A graph owns all root/alias/IR
+  // facts; candidate attributes and the selected Copy binding distinguish the
+  // remaining varying inputs. Type and alignment are explicit defensive keys.
+  using AccessCostCacheKey = std::tuple<LayoutConstraintID, Type, Attribute,
+      Type, Attribute, Attribute, uint64_t, unsigned>;
+  static constexpr unsigned maximumCostQueryCacheEntries = 4096;
+  auto &getAccessCostCache() const { return accessCosts; }
+  auto &getStaticCostValidationCache() const { return staticCostValidations; }
+  bool isCostQueryCacheEnabled() const { return finalized && costQueryCacheEnabled; }
+  unsigned getCostQueryCacheCapacity() const { return costQueryCacheCapacity; }
+  // Diagnostic/differential controls only: neither option changes candidates,
+  // proof limits, search probes, scoring semantics or selected plans.
+  void setCostQueryCacheOptions(bool enabled,
+      unsigned capacity = maximumCostQueryCacheEntries) {
+    costQueryCacheEnabled = enabled;
+    costQueryCacheCapacity = capacity > maximumCostQueryCacheEntries
+        ? maximumCostQueryCacheEntries : capacity;
+    clearCostQueryCaches();
+  }
+  void clearCostQueryCaches() const {
+    accessCosts.clear();
+    staticCostValidations.clear();
+  }
+
+  auto &getAliasFootprintCache() const { return aliasFootprints; }
+  auto &getAliasPairCache() const { return aliasPairProofs; }
+  auto &getCandidatePreparationStatistics() const { return preparationStatistics; }
+  LayoutVarID addVariable(LayoutKind kind, Type type, StringRef stableName,
+                          Operation *anchor = nullptr);
+  ProvenanceID addProvenance(std::optional<ProvenanceID> parent,
+                             Operation *source, StringRef rule,
+                             StringRef reason);
+  LayoutConstraintID addConstraint(ConstraintKind kind,
+                                   ConstraintStrength strength,
+                                   ArrayRef<LayoutVarID> vars,
+                                   Operation *source, StringRef rule,
+                                   StringRef reason,
+                                   Attribute requiredEncoding = {});
+
+  LogicalResult finalize(Location loc);
+  bool isFinalized() const { return finalized; }
+  LogicalResult verifyInvariants(Location loc) const;
+  LogicalResult printProvenanceChain(ProvenanceID id,
+                                     raw_ostream &os) const;
+
+  ArrayRef<LayoutVar> getVariables() const { return variables; }
+  MutableArrayRef<LayoutVar> getVariables() { return variables; }
+  ArrayRef<LayoutConstraint> getConstraints() const { return constraints; }
+  MutableArrayRef<LayoutConstraint> getConstraints() { return constraints; }
+  ArrayRef<LayoutProvenance> getProvenances() const { return provenances; }
+  ArrayRef<RegionLayoutEdge> getRegionEdges() const { return regionEdges; }
+  const LayoutPropagationStatistics &getPropagationStatistics() const {
+    return propagationStatistics;
+  }
+  LayoutPropagationStatistics &getPropagationStatistics() {
+    return propagationStatistics;
+  }
+  void addRegionEdge(RegionLayoutEdge edge) {
+    clearCostQueryCaches();
+    finalized = false;
+    regionEdges.push_back(std::move(edge));
+  }
+
+  LayoutVar &getVariable(LayoutVarID id) { return variables[id]; }
+  const LayoutVar &getVariable(LayoutVarID id) const { return variables[id]; }
+  const LayoutConstraint &getConstraint(LayoutConstraintID id) const {
+    return constraints[id];
+  }
+  std::optional<LayoutVarID> lookupVariable(StringRef stableName) const;
+  std::optional<LayoutVarID> lookupVariable(Value value) const;
+
+  void print(raw_ostream &os) const;
+
+private:
+  SmallVector<LayoutVar, 0> variables;
+  SmallVector<LayoutConstraint, 0> constraints;
+  SmallVector<LayoutProvenance> provenances;
+  SmallVector<RegionLayoutEdge> regionEdges;
+  LayoutPropagationStatistics propagationStatistics;
+  mutable LayoutCandidatePreparationStatistics preparationStatistics;
+  mutable DenseMap<AliasCandidateKey, StorageAliasFootprint> aliasFootprints;
+  mutable DenseMap<AliasPairKey, LayoutProof> aliasPairProofs;
+  // IR, alias transforms and root contracts are immutable while a finalized
+  // graph is queried. Rebuild/re-finalize after changing those facts, as for
+  // footprint proofs. Domain pruning alone does not change query meanings.
+  mutable DenseMap<AccessCostCacheKey, CostEstimate> accessCosts;
+  mutable llvm::DenseSet<std::pair<Type, Attribute>> staticCostValidations;
+  bool costQueryCacheEnabled = true;
+  unsigned costQueryCacheCapacity = maximumCostQueryCacheEntries;
+
+  bool finalized = false;
+};
+
+raw_ostream &operator<<(raw_ostream &os, const LayoutConstraintGraph &graph);
+
+StringRef stringifyConstraintKind(ConstraintKind kind);
+StringRef stringifyConstraintStrength(ConstraintStrength strength);
+
+} // namespace mlir::frisk
+
+#endif // FRISK_ANALYSIS_LAYOUTCONSTRAINT_H

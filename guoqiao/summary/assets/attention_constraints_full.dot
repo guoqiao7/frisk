@@ -1,0 +1,116 @@
+digraph AttentionConstraints {
+  graph [rankdir=TB, bgcolor="white", pad=0.25, nodesep=0.30, ranksep=0.48,
+         fontname="DejaVu Sans", fontsize=19,
+         label="Attention: all 38 layout variables / 78 constraints", labelloc=t];
+  node [shape=box, style="rounded,filled", fillcolor="#eaf2ff", color="#4a6da7",
+        fontname="DejaVu Sans", fontsize=12, margin="0.12,0.08"];
+  edge [fontname="DejaVu Sans", fontsize=10, color="#567096", arrowsize=0.65];
+
+  // variable_id is the snapshot variable index. constraint_ids are audited
+  // against the collected graph; these attributes do not add visible nodes.
+  v0 [variable_id="0", label="V0  %qg\nQ Global", fillcolor="#dcf4ec"];
+  v1 [variable_id="1", label="V1  %kg\nK Global", fillcolor="#dcf4ec"];
+  v16 [variable_id="16", label="V16  %vg\nV Global", fillcolor="#dcf4ec"];
+  v28 [variable_id="28", label="V28  %qv\nQ Shared", fillcolor="#dcf4ec"];
+  v29 [variable_id="29", label="V29  %kv\nK Shared", fillcolor="#dcf4ec"];
+  v30 [variable_id="30", label="V30  %vv\nV Shared", fillcolor="#dcf4ec"];
+  v26 [variable_id="26", label="V26  %ov\nO Global", fillcolor="#dcf4ec"];
+  v31 [variable_id="31", label="V31  Copy Q execution\nRL · OW", constraint_ids="40,67", fillcolor="#d9f2fb"];
+  v32 [variable_id="32", label="V32  Copy Q path", fillcolor="#fff0cf"];
+  v33 [variable_id="33", label="V33  Copy K execution\nRL · OW", constraint_ids="41,68", fillcolor="#d9f2fb"];
+  v34 [variable_id="34", label="V34  Copy K path", fillcolor="#fff0cf"];
+  v35 [variable_id="35", label="V35  Copy V execution\nRL · OW", constraint_ids="42,69", fillcolor="#d9f2fb"];
+  v36 [variable_id="36", label="V36  Copy V path", fillcolor="#fff0cf"];
+  v37 [variable_id="37", label="V37  %zero\nSS zero constant · RL", constraint_ids="70"];
+  v3 [variable_id="3", label="V3  SS accumulator use\nRL", constraint_ids="44", fillcolor="#eee4fb"];
+  v2 [variable_id="2", label="V2  %scores\nSS MMA result · RL", constraint_ids="43"];
+  v4 [variable_id="4", label="V4  %scale\nConstant 0.25 · RL", constraint_ids="45"];
+  v5 [variable_id="5", label="V5  %scaled\nMul result · RL", constraint_ids="46"];
+  v7 [variable_id="7", label="V7  ReduceMax input use\nRL", constraint_ids="48", fillcolor="#eee4fb"];
+  v6 [variable_id="6", label="V6  %max\nReduceMax result · RL", constraint_ids="47"];
+  v10 [variable_id="10", label="V10  BroadcastMax input use\nRL", constraint_ids="51", fillcolor="#eee4fb"];
+  v8 [variable_id="8", label="V8  %e0\ntensor.empty · RL", constraint_ids="49"];
+  v9 [variable_id="9", label="V9  %bm\nBroadcastMax result · RL", constraint_ids="50"];
+  v11 [variable_id="11", label="V11  %centered\nSub result · RL", constraint_ids="52"];
+  v12 [variable_id="12", label="V12  %exp\nExp result · RL", constraint_ids="53"];
+  v14 [variable_id="14", label="V14  ReduceSum input use\nRL", constraint_ids="55", fillcolor="#eee4fb"];
+  v13 [variable_id="13", label="V13  %sum\nReduceSum result · RL", constraint_ids="54"];
+  v18 [variable_id="18", label="V18  BroadcastSum input use\nRL", constraint_ids="58", fillcolor="#eee4fb"];
+  v15 [variable_id="15", label="V15  %e1\ntensor.empty · RL", constraint_ids="56"];
+  v17 [variable_id="17", label="V17  %bs\nBroadcastSum result · RL", constraint_ids="57"];
+  v19 [variable_id="19", label="V19  %normalized\nDiv result · RL", constraint_ids="59"];
+  v21 [variable_id="21", label="V21  truncf input use\nRL", constraint_ids="61", fillcolor="#eee4fb"];
+  v20 [variable_id="20", label="V20  %p\ntruncf result · RL", constraint_ids="60"];
+  v24 [variable_id="24", label="V24  RS A input use\nRL", constraint_ids="64", fillcolor="#eee4fb"];
+  v22 [variable_id="22", label="V22  %ozero\nRS zero constant · RL", constraint_ids="62"];
+  v25 [variable_id="25", label="V25  RS accumulator use\nRL", constraint_ids="65", fillcolor="#eee4fb"];
+  v23 [variable_id="23", label="V23  %result\nRS MMA result · RL", constraint_ids="63"];
+  v27 [variable_id="27", label="V27  Store input use\nRL", constraint_ids="66", fillcolor="#eee4fb"];
+
+  node [shape=diamond, style=filled, fillcolor="#fff1e8", color="#b76b35", fontsize=11];
+  h25 [label="IC\nCopy Q", constraint_ids="25"];
+  h26 [label="IC\nCopy K", constraint_ids="26"];
+  h27 [label="IC\nCopy V", constraint_ids="27"];
+  h28 [label="IC\nRS MMA", constraint_ids="28"];
+  h29 [label="IC\nSS MMA", constraint_ids="29"];
+
+  // Each diamond denotes one joint constraint, not pairwise compatibility.
+  v0 -> h25 [label="src", dir=none];
+  v31 -> h25 [label="exec", dir=none];
+  v32 -> h25 [label="path", dir=none];
+  h25 -> v28 [label="dst", dir=none];
+  v1 -> h26 [label="src", dir=none];
+  v33 -> h26 [label="exec", dir=none];
+  v34 -> h26 [label="path", dir=none];
+  h26 -> v29 [label="dst", dir=none];
+  v16 -> h27 [label="src", dir=none];
+  v35 -> h27 [label="exec", dir=none];
+  v36 -> h27 [label="path", dir=none];
+  h27 -> v30 [label="dst", dir=none];
+  v28 -> h29 [label="A", dir=none];
+  v29 -> h29 [label="B", dir=none];
+  v3 -> h29 [label="acc", dir=none];
+  h29 -> v2 [label="result", dir=none];
+  v24 -> h28 [label="A", dir=none];
+  v30 -> h28 [label="B", dir=none];
+  v25 -> h28 [label="acc", dir=none];
+  h28 -> v23 [label="result", dir=none];
+
+  v3 -> v2 [label="S", constraint_ids="0", dir=none, color="#9b59b6", penwidth=2];
+  v21 -> v20 [label="S", constraint_ids="1", dir=none, color="#9b59b6", penwidth=2];
+  v25 -> v23 [label="S", constraint_ids="2", dir=none, color="#9b59b6", penwidth=2];
+  v2 -> v5 [label="C", constraint_ids="3"];
+  v4 -> v5 [label="C", constraint_ids="4"];
+  v5 -> v7 [label="C", constraint_ids="5"];
+  v5 -> v11 [label="C", constraint_ids="6"];
+  v6 -> v10 [label="C", constraint_ids="7"];
+  v8 -> v9 [label="C", constraint_ids="8"];
+  v9 -> v11 [label="C", constraint_ids="9"];
+  v11 -> v12 [label="C", constraint_ids="10"];
+  v12 -> v14 [label="C", constraint_ids="11"];
+  v12 -> v19 [label="C", constraint_ids="12"];
+  v13 -> v18 [label="C", constraint_ids="13"];
+  v15 -> v17 [label="C", constraint_ids="14"];
+  v17 -> v19 [label="C", constraint_ids="15"];
+  v19 -> v21 [label="C", constraint_ids="16"];
+  v20 -> v24 [label="C", constraint_ids="17"];
+  v22 -> v25 [label="C", constraint_ids="18"];
+  v23 -> v27 [label="C", constraint_ids="19"];
+  v37 -> v3 [label="C", constraint_ids="20"];
+  v10 -> v9 [label="B", constraint_ids="21", color="#d97706", penwidth=2];
+  v18 -> v17 [label="B", constraint_ids="22", color="#d97706", penwidth=2];
+  v7 -> v6 [label="R", constraint_ids="23", color="#16856a", penwidth=2];
+  v14 -> v13 [label="R", constraint_ids="24", color="#16856a", penwidth=2];
+
+  // A+P represents two constraints on the same endpoints, not one new kind.
+  v27 -> v26 [label="A + P", constraint_ids="30,71", dir=none, color="#64748b"];
+  v31 -> v0 [label="A + P", constraint_ids="31,72", dir=none, color="#64748b", constraint=false];
+  v31 -> v28 [label="A + P", constraint_ids="32,73", dir=none, color="#64748b", constraint=false];
+  v33 -> v1 [label="A + P", constraint_ids="33,74", dir=none, color="#64748b", constraint=false];
+  v33 -> v29 [label="A + P", constraint_ids="34,75", dir=none, color="#64748b", constraint=false];
+  v35 -> v16 [label="A + P", constraint_ids="35,76", dir=none, color="#64748b", constraint=false];
+  v35 -> v30 [label="A + P", constraint_ids="36,77", dir=none, color="#64748b", constraint=false];
+  v0 -> v28 [label="CA", constraint_ids="37", dir=none, color="#64748b", style=dashed, constraint=false];
+  v1 -> v29 [label="CA", constraint_ids="38", dir=none, color="#64748b", style=dashed, constraint=false];
+  v16 -> v30 [label="CA", constraint_ids="39", dir=none, color="#64748b", style=dashed, constraint=false];
+}

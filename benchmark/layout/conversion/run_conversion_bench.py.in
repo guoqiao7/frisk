@@ -1,0 +1,13 @@
+#!@Python3_EXECUTABLE@
+import runpy
+import sys
+sys.argv[1:1] = [
+    "--generator", "@CMAKE_CURRENT_BINARY_DIR@/frisk_generate_conversion_cases",
+    "--runtime", "@CMAKE_CURRENT_BINARY_DIR@/frisk_layout_conversion_runtime",
+    "--frisk-opt", "@PROJECT_BINARY_DIR@/bin/frisk-opt",
+    "--mlir-opt", "@LLVM_TOOLS_BINARY_DIR@/mlir-opt",
+    "--output-dir", "@CMAKE_CURRENT_BINARY_DIR@/measurements",
+    "--source-manifest", "@CMAKE_CURRENT_BINARY_DIR@/source-manifest.txt",
+    "--build-configuration", "@CMAKE_CURRENT_BINARY_DIR@/build-configuration.txt",
+]
+runpy.run_path("@CMAKE_CURRENT_SOURCE_DIR@/compile_conversion_case.py", run_name="__main__")

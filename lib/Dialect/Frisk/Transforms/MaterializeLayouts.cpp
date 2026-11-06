@@ -1,0 +1,427 @@
+#include "Dialect/Frisk/Analysis/LayoutVerifier.h"
+#include "Dialect/Frisk/Analysis/LayoutConversionChoice.h"
+
+#include "Dialect/Frisk/IR/FriskDialect.h"
+#include "Dialect/Frisk/IR/FriskOps.h"
+#include "Dialect/Frisk/Target/SM90/SM90LayoutTarget.h"
+#include "Dialect/Frisk/Target/SM90/SM90MmaLayoutProof.h"
+#include "Dialect/Frisk/Transforms/LayoutTypeConverter.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Verifier.h"
+#include "mlir/Transforms/RegionUtils.h"
+
+#include "llvm/ADT/DenseMap.h"
+
+namespace mlir::frisk {
+
+namespace {
+struct ConversionSnapshot {
+  unsigned operand;
+  LayoutConversionEdge plan;
+};
+
+/// Owns no original IR. Until commit, all lookups use still-live original
+/// identities; every constructed op is owned by the detached module.
+class LayoutRebuild {
+public:
+  LayoutRebuild(const LayoutConstraintGraph &graph, const LayoutSolution &solution,
+                bool authorizeInternalOptimization)
+      : graph(graph), solution(solution), converter(graph, solution),
+        authorizeInternalOptimization(authorizeInternalOptimization) {}
+
+  LogicalResult prepare(Operation *root, ArrayRef<LayoutConversionEdge> edges) {
+    for (const auto &edge : edges) {
+      Operation *owner = edge.use->getOwner();
+      if (!root->isAncestor(owner))
+        return root->emitError("conversion consumer is outside materialization root");
+      unsigned operand = edge.use->getOperandNumber();
+      auto &list = conversions[owner];
+      if (llvm::any_of(list, [&](auto snapshot) { return snapshot.operand == operand; }))
+        return owner->emitError("duplicate conversion consumer operand");
+      list.push_back({operand, edge});
+    }
+    for (const auto &constraint : graph.getConstraints()) {
+      if (constraint.kind == ConstraintKind::ReductionLayout) {
+        auto *op = constraint.reduction ? constraint.reduction->source : nullptr;
+        auto binding = solution.reductionBindings.lookup(constraint.id);
+        if (!op || !root->isAncestor(op) || !binding)
+          return root->emitError("invalid reduction materialization source or binding");
+        Builder b(op->getContext());
+        NamedAttrList attrs;
+        attrs.set("frisk.reduction_contract", binding);
+        attrs.set("frisk.execution_threads", b.getI64IntegerAttr(
+            graph.getVariable(constraint.vars.back()).requiredThreads));
+        for (auto attr : attrs)
+          if (auto original = op->getAttr(attr.getName()))
+            if (original != attr.getValue())
+              return op->emitError("materialization would overwrite an explicit reduction contract");
+        executions[op] = attrs.getDictionary(op->getContext());
+        continue;
+      }
+      if (constraint.kind != ConstraintKind::InstructionContract) continue;
+      if (!constraint.instruction || !constraint.instruction->source ||
+          !root->isAncestor(constraint.instruction->source))
+        return root->emitError("invalid instruction materialization source");
+      auto *op = constraint.instruction->source;
+      Attribute binding = solution.instructionBindings.lookup(constraint.id);
+      if (!binding) return op->emitError("missing selected instruction binding");
+      Builder b(op->getContext());
+      NamedAttrList attrs;
+      attrs.set(isa<CopyOp>(op) ? "frisk.copy_contract" : "frisk.mma_contract", binding);
+      attrs.set("frisk.execution_threads", b.getI64IntegerAttr(
+          graph.getVariable(constraint.vars.back()).requiredThreads));
+      for (auto attr : attrs)
+        if (auto original = op->getAttr(attr.getName()))
+          if (original != attr.getValue())
+            return op->emitError("materialization would overwrite an explicit instruction contract");
+      executions[op] = attrs.getDictionary(op->getContext());
+    }
+    for (const LayoutVar &var : graph.getVariables()) {
+      if (var.kind == LayoutKind::Storage) {
+        auto view = dyn_cast_or_null<LayoutViewOp>(var.anchor);
+        auto layout = dyn_cast_or_null<StorageLayoutAttr>(solution.assignments.lookup(var.id));
+        if (!view || !layout || !root->isAncestor(view))
+          return root->emitError("invalid storage materialization binding");
+        if (view.getLayoutAttr() && view.getLayoutAttr() != layout)
+          return view.emitError("materialization would overwrite an explicit hard binding");
+        storage[var.anchor] = layout;
+      } else if (var.operationExecution) {
+        const auto &binding = *var.operationExecution;
+        auto *op = var.anchor;
+        if (!op || !root->isAncestor(op))
+          return root->emitError("invalid operation execution materialization binding");
+        Builder b(op->getContext());
+        NamedAttrList attrs(executions.lookup(op));
+        attrs.set("frisk.execution_layout", solution.assignments.lookup(var.id));
+        attrs.set("frisk.execution_threads", b.getI64IntegerAttr(binding.threads));
+        attrs.set("frisk.writer_policy", b.getStringAttr(binding.writerPolicy));
+        attrs.set("frisk.vector_bytes", b.getI64IntegerAttr(binding.vectorBytes));
+        for (auto attr : attrs)
+          if (auto original = op->getAttr(attr.getName()))
+            if (original != attr.getValue())
+              return op->emitError("materialization would overwrite an explicit execution contract");
+        executions[op] = attrs.getDictionary(op->getContext());
+      } else if (var.value) {
+        auto type = converter.convertLayoutBearingTensor(var.value);
+        if (failed(type)) return failure();
+        types[var.value] = *type;
+      } else if (var.functionResult) {
+        auto function = dyn_cast_or_null<func::FuncOp>(var.anchor);
+        auto encoding = solution.assignments.lookup(var.id);
+        if (!function || *var.functionResult >= function.getNumResults())
+          return root->emitError("invalid function result layout binding");
+        auto type = cast<RankedTensorType>(function.getResultTypes()[*var.functionResult]);
+        if (type.getEncoding() && type.getEncoding() != encoding)
+          return function.emitError("materialization would overwrite an explicit hard binding");
+        functionResults[{var.anchor, *var.functionResult}] =
+            RankedTensorType::get(type.getShape(), type.getElementType(), encoding);
+      }
+    }
+    return success();
+  }
+
+  LogicalResult rebuildRegion(Region &original, Region &replacement) {
+    // All block arguments/successors are available before visiting any op.
+    // A worklist keeps original per-block order but also handles scalar CFGs
+    // whose printed block order is not dominance order.
+    SmallVector<std::pair<Block *, Block::iterator>> pending;
+    for (Block &block : original) {
+      auto *copy = new Block();
+      replacement.push_back(copy);
+      mapping.map(&block, copy);
+      for (BlockArgument arg : block.getArguments()) {
+        auto type = replacementType(arg);
+        if (failed(type)) return failure();
+        mapping.map(arg, copy->addArgument(*type, arg.getLoc()));
+      }
+      pending.emplace_back(&block, block.begin());
+    }
+    while (!pending.empty()) {
+      bool progressed = false;
+      for (auto &entry : pending) {
+        Block *block = entry.first;
+        auto &next = entry.second;
+        while (next != block->end()) {
+          Operation *op = &*next;
+          if (llvm::any_of(op->getOperands(), [&](Value value) {
+                return !mapping.contains(value);
+              }))
+            break;
+          llvm::SetVector<Value> captures;
+          getUsedValuesDefinedAbove(op->getRegions(), captures);
+          if (llvm::any_of(captures, [&](Value value) {
+                return !mapping.contains(value);
+              }))
+            break;
+          if (failed(rebuildOperation(op, mapping.lookup(block))))
+            return failure();
+          ++next;
+          progressed = true;
+        }
+      }
+      llvm::erase_if(pending, [](const auto &entry) {
+        return entry.second == entry.first->end();
+      });
+      if (!pending.empty() && !progressed)
+        return pending.front().first->getParentOp()->emitError(
+            "unmapped SSA dependency during layout rebuilding");
+    }
+    return success();
+  }
+
+private:
+  FailureOr<Value> rebuildBoundary(OpBuilder &builder,
+                                  const LayoutConversionEdge &edge) {
+    if (edge.resolution == EdgeResolutionKind::Convert) {
+      auto found = sharedConversions.find(edge.sharedLeader);
+      if (found != sharedConversions.end()) return found->second;
+      Value source = mapping.lookup(edge.use->get());
+      auto type = cast<RankedTensorType>(source.getType());
+      auto target = RankedTensorType::get(type.getShape(), type.getElementType(),
+                                         edge.targetEncoding);
+      Value converted = builder.create<ConvertLayoutOp>(edge.insertionPoint->getLoc(),
+                                                        target, source);
+      sharedConversions[edge.sharedLeader] = converted;
+      return converted;
+    }
+    // Sharing is authorized by the verified selected plan, never discovered
+    // while rebuilding. Keep clone and conversion caches separate even though
+    // their leaders are currently globally unique constraint identifiers.
+    auto shared = sharedRematerializations.find(edge.sharedLeader);
+    if (shared != sharedRematerializations.end()) return shared->second;
+    IRMapping cloned;
+    for (Operation *original : edge.rematerialization) {
+      for (Value input : original->getOperands()) {
+        if (cloned.contains(input)) continue;
+        Value value = mapping.lookup(input);
+        if (auto type = dyn_cast<RankedTensorType>(value.getType())) {
+          if (type.getEncoding() != edge.targetEncoding) {
+            auto target = RankedTensorType::get(type.getShape(), type.getElementType(),
+                                               edge.targetEncoding);
+            value = builder.create<ConvertLayoutOp>(edge.insertionPoint->getLoc(),
+                                                    target, value);
+          }
+        }
+        cloned.map(input, value);
+      }
+      Operation *copy = builder.clone(*original, cloned);
+      auto type = cast<RankedTensorType>(copy->getResult(0).getType());
+      auto result = RankedTensorType::get(type.getShape(), type.getElementType(),
+                                         edge.targetEncoding);
+      copy->getResult(0).setType(result);
+      copy->removeAttr("frisk.inferred_result_layout");
+      if (authorizeInternalOptimization &&
+          !cast<RankedTensorType>(original->getResult(0).getType()).getEncoding())
+        copy->setAttr("frisk.inferred_result_layout", edge.targetEncoding);
+      if (original->getName().getStringRef() == "arith.constant")
+        copy->setAttr("value", cast<DenseElementsAttr>(original->getAttr("value")).reshape(result));
+    }
+    Value value = cloned.lookupOrNull(edge.use->get());
+    if (!value) return failure();
+    sharedRematerializations[edge.sharedLeader] = value;
+    return value;
+  }
+
+  FailureOr<Type> replacementType(Value value) {
+    if (!isa<TensorType>(value.getType())) return value.getType();
+    auto found = types.find(value);
+    if (found == types.end()) {
+      emitError(value.getLoc()) << "tensor has no distributed definition binding";
+      return failure();
+    }
+    return found->second;
+  }
+
+  LogicalResult rebuildOperation(Operation *op, Block *block) {
+    SmallVector<Value> operands;
+    for (Value value : op->getOperands()) operands.push_back(mapping.lookup(value));
+    OpBuilder builder(block, block->end());
+    for (const auto &edge : conversions.lookup(op)) {
+      auto source = dyn_cast<RankedTensorType>(operands[edge.operand].getType());
+      const auto &plan = edge.plan;
+      if (!source || source.getEncoding() != plan.sourceEncoding ||
+          plan.sourceEncoding == plan.targetEncoding)
+        return op->emitError("selected conversion does not match rebuilt source encoding");
+      auto value = rebuildBoundary(builder, plan);
+      if (failed(value)) return op->emitError("failed to rebuild selected boundary plan");
+      operands[edge.operand] = *value;
+    }
+    SmallVector<Type> results;
+    for (Value value : op->getResults()) {
+      auto type = replacementType(value);
+      if (failed(type)) return failure();
+      results.push_back(*type);
+    }
+    SmallVector<Block *> successors;
+    for (Block *successor : op->getSuccessors()) {
+      auto *copy = mapping.lookupOrNull(successor);
+      if (!copy) return op->emitError("unmapped successor during layout rebuilding");
+      successors.push_back(copy);
+    }
+    Operation *copy = Operation::create(op->getLoc(), op->getName(), results,
+        operands, op->getDiscardableAttrDictionary(), op->getPropertiesStorage(),
+        successors, op->getNumRegions());
+    block->push_back(copy);
+    // Transient authorization for local cleanup: pre-existing encoded results
+    // are mandatory seeds, not inferred internals that may be retyped. Never
+    // import this authorization from user/serialized input.
+    copy->removeAttr("frisk.inferred_result_layout");
+    if (authorizeInternalOptimization && op->getNumResults() == 1)
+      if (auto oldType = dyn_cast<RankedTensorType>(op->getResult(0).getType()))
+        if (!oldType.getEncoding())
+          copy->setAttr("frisk.inferred_result_layout",
+                        cast<RankedTensorType>(copy->getResult(0).getType()).getEncoding());
+    mapping.map(op, copy);
+    mapping.map(op->getResults(), copy->getResults());
+    if (Attribute layout = storage.lookup(op)) copy->setAttr("layout", layout);
+    if (auto attrs = executions.lookup(op))
+      for (auto attr : attrs) copy->setAttr(attr.getName(), attr.getValue());
+    if (op->getName().getStringRef() == "arith.constant" && !results.empty() &&
+        isa<RankedTensorType>(results.front())) {
+      auto value = dyn_cast_or_null<DenseElementsAttr>(op->getAttr("value"));
+      if (!value) return op->emitError("cannot retype non-dense tensor constant");
+      copy->setAttr("value", value.reshape(cast<ShapedType>(results.front())));
+    }
+    if (auto function = dyn_cast<func::FuncOp>(op)) {
+      SmallVector<Type> inputs(function.getArgumentTypes());
+      SmallVector<Type> outputs(function.getResultTypes());
+      if (!function.isExternal()) {
+        for (auto [index, arg] : llvm::enumerate(function.getArguments())) {
+          auto type = replacementType(arg);
+          if (failed(type)) return failure();
+          inputs[index] = *type;
+        }
+      }
+      for (auto [index, type] : llvm::enumerate(outputs)) {
+        if (!isa<TensorType>(type)) continue;
+        auto found = functionResults.find({op, unsigned(index)});
+        if (found == functionResults.end())
+          return op->emitError("missing function signature result layout");
+        outputs[index] = found->second;
+      }
+      cast<func::FuncOp>(copy).setType(FunctionType::get(op->getContext(), inputs, outputs));
+    }
+    for (auto [oldRegion, newRegion] : llvm::zip(op->getRegions(), copy->getRegions()))
+      if (failed(rebuildRegion(oldRegion, newRegion))) return failure();
+    return success();
+  }
+
+  const LayoutConstraintGraph &graph;
+  const LayoutSolution &solution;
+  LayoutTypeConverter converter;
+  bool authorizeInternalOptimization;
+  IRMapping mapping;
+  DenseMap<Value, Type> types;
+  DenseMap<Operation *, Attribute> storage;
+  DenseMap<Operation *, DictionaryAttr> executions;
+  DenseMap<std::pair<Operation *, unsigned>, Type> functionResults;
+  DenseMap<Operation *, SmallVector<ConversionSnapshot>> conversions;
+  DenseMap<LayoutConstraintID, Value> sharedConversions;
+  DenseMap<LayoutConstraintID, Value> sharedRematerializations;
+};
+} // namespace
+
+LogicalResult materializeDistributedLayouts(
+    Operation *root, const LayoutConstraintGraph &graph,
+    const LayoutSolution &solution, ArrayRef<LayoutConversionEdge> conversions,
+    bool authorizeInternalOptimization, LayoutTarget *target, ConversionPolicy expectedPolicy) {
+  auto module = dyn_cast<ModuleOp>(root);
+  if (!module) return root->emitError("layout materialization requires a module root");
+  if (conversions.size() != solution.conversions.size() ||
+      !llvm::equal(conversions, solution.conversions, sameLayoutConversionPlan))
+    return root->emitError("conversion argument differs from selected layout solution");
+  auto ownedTarget = target ? nullptr : createSM90LayoutTarget();
+  if (!target) target = ownedTarget.get();
+  if (failed(verifySolvedLayoutGraph(graph, solution, *target, root->getLoc(), expectedPolicy)))
+    return failure();
+  LayoutRebuild rebuild(graph, solution, authorizeInternalOptimization);
+  if (failed(rebuild.prepare(root, conversions))) return failure();
+  OwningOpRef<ModuleOp> staged(cast<ModuleOp>(root->cloneWithoutRegions()));
+  if (failed(rebuild.rebuildRegion(module.getBodyRegion(), staged->getBodyRegion())) ||
+      failed(verify(*staged)) || failed(verifyMaterializedLayouts(*staged, *target)))
+    return failure();
+  // This is the only original-IR mutation. No graph/solution identity may be
+  // dereferenced after the old body (and original use pointers) is destroyed.
+  module.getBodyRegion().takeBody(staged->getBodyRegion());
+  return success();
+}
+
+LogicalResult materializeLayouts(Operation *root,
+                                 const LayoutConstraintGraph &graph,
+                                 const LayoutSolution &solution,
+                                 bool authorizeInternalOptimization, LayoutTarget *target, ConversionPolicy expectedPolicy) {
+  return materializeDistributedLayouts(root, graph, solution, solution.conversions,
+                                      authorizeInternalOptimization, target, expectedPolicy);
+}
+
+LogicalResult verifyMaterializedLayouts(Operation *root,
+                                        LayoutTarget &target) {
+  if (failed(verify(root))) return failure();
+  auto graph = collectLayoutConstraints(root, target, LayoutCollectionMode::RelationsOnly);
+  if (failed(graph)) return failure();
+  LayoutSolution actual;
+  for (const auto &constraint : graph->getConstraints()) {
+    if (constraint.kind == ConstraintKind::ReductionLayout) {
+      auto *op = constraint.reduction ? constraint.reduction->source : nullptr;
+      if (!op || !op->hasAttr("frisk.reduction_contract") ||
+          !op->hasAttr("frisk.execution_threads"))
+        return root->emitError("unresolved materialized reduction contract or execution_threads");
+      actual.reductionBindings[constraint.id] = op->getAttr("frisk.reduction_contract");
+      continue;
+    }
+    if (constraint.kind != ConstraintKind::InstructionContract) continue;
+    auto *op = constraint.instruction ? constraint.instruction->source : nullptr;
+    StringRef name = op && isa<CopyOp>(op) ? "frisk.copy_contract" : "frisk.mma_contract";
+    if (!op || !op->hasAttr(name) || !op->hasAttr("frisk.execution_threads"))
+      return root->emitError("unresolved materialized instruction contract or execution_threads");
+    actual.instructionBindings[constraint.id] = op->getAttr(name);
+  }
+  for (LayoutVar &var : graph->getVariables()) {
+    Attribute encoding;
+    if (var.kind == LayoutKind::Storage) {
+      encoding = cast<LayoutViewOp>(var.anchor).getLayoutAttr();
+      if (!encoding)
+        return var.anchor->emitError("unresolved storage layout for materialized view");
+    } else if (var.kind == LayoutKind::Instruction) {
+      if (auto mma = dyn_cast_or_null<MmaOp>(var.anchor)) {
+        auto geometry = getSM90MmaContractGeometry(mma, var.requiredThreads,
+            mma->getAttr("frisk.mma_contract"));
+        if (failed(geometry))
+          return mma.emitError("unresolved materialized MMA geometry");
+        encoding = encodeSM90MmaGeometry(mma.getContext(), *geometry);
+      } else {
+        auto binding = var.anchor->getAttrOfType<DictionaryAttr>("frisk.copy_contract");
+        if (!binding || !binding.getAs<StringAttr>("path"))
+          return var.anchor->emitError("unresolved materialized Copy instruction path");
+        encoding = binding.getAs<StringAttr>("path");
+      }
+    } else if (var.operationExecution) {
+      for (StringRef name : {"frisk.execution_layout", "frisk.execution_threads",
+                             "frisk.writer_policy", "frisk.vector_bytes"})
+        if (!var.anchor->hasAttr(name))
+          return var.anchor->emitError() << "unresolved materialized operation contract: " << name;
+      encoding = var.anchor->getAttr("frisk.execution_layout");
+    } else {
+      Type type;
+      if (var.value) type = var.value.getType();
+      else if (var.use) type = var.use->get().getType();
+      else if (var.functionResult)
+        type = cast<func::FuncOp>(var.anchor).getResultTypes()[*var.functionResult];
+      auto tensor = dyn_cast_or_null<RankedTensorType>(type);
+      if (tensor) encoding = tensor.getEncoding();
+      if (!isa_and_nonnull<DistributedEncodingAttr>(encoding))
+        return emitError(var.anchor ? var.anchor->getLoc() : root->getLoc())
+               << "unresolved distributed tensor encoding at materialized boundary";
+    }
+    // Pin synthetic uses to the encoding actually present on the operand.
+    // Propagated alternatives must not hide a missing conversion by imagining
+    // a future Convertible edge. No solver or propagation runs here.
+    actual.assignments[var.id] = encoding;
+    var.candidates = {{encoding, kInvalidProvenanceID, 0}};
+    var.state = LayoutState::Resolved;
+  }
+  return verifySolvedLayoutGraph(*graph, actual, target, root->getLoc());
+}
+
+} // namespace mlir::frisk

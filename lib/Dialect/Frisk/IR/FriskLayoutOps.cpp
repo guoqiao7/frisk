@@ -1,0 +1,294 @@
+#include "Dialect/Frisk/IR/FriskOps.h"
+
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/MathExtras.h"
+
+#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/AffineMap.h"
+
+namespace mlir::frisk {
+
+LogicalResult StorageContractOp::verify() {
+  auto type = cast<MemRefType>(getRoot().getType());
+  if (!type.hasStaticShape())
+    return emitOpError("storage-root-contract: requires a static root");
+  auto space = getFriskMemorySpace(type);
+  if (!space || *space == attr::MemorySpace::Local)
+    return emitOpError("storage-root-contract: requires Shared or Global storage");
+  bool root = false;
+  if (auto def = getRoot().getDefiningOp()) {
+    StringRef name = def->getName().getStringRef();
+    root = name == "memref.alloc" || name == "memref.alloca" ||
+           name == "memref.get_global";
+  } else if (auto arg = dyn_cast<BlockArgument>(getRoot())) {
+    Operation *owner = arg.getOwner()->getParentOp();
+    StringRef name = owner->getName().getStringRef();
+    root = (name == "func.func" || name == "frisk.kernel") &&
+           &owner->getRegion(0).front() == arg.getOwner();
+  }
+  if (!root)
+    return emitOpError("storage-root-contract: operand must be a supported storage root, not a view");
+  return getLayout().verifyForType(type, getLoc());
+}
+
+LogicalResult ReduceTensorOp::verify() {
+  auto src = cast<RankedTensorType>(getSource().getType());
+  auto dst = cast<RankedTensorType>(getResult().getType());
+  if (getKind() != "sum" && getKind() != "max" && getKind() != "min")
+    return emitOpError("reduce-shape: kind must be sum/max/min");
+  if (src.getRank() < 2 || dst.getRank() != src.getRank() - 1 ||
+      getDim() < 0 || getDim() >= src.getRank())
+    return emitOpError("reduce-shape: rank >= 2 and valid axis required");
+  auto dtype = src.getElementType();
+  if ((!dtype.isF16() && !dtype.isBF16() && !dtype.isF32()) || dtype != dst.getElementType())
+    return emitOpError("reduce-shape: requires matching f16/bf16/f32 element types");
+  for (auto type : {src,dst}) {
+    if (!type.hasStaticShape() || llvm::any_of(type.getShape(), [](int64_t e) {
+          return e <= 0 || !llvm::isPowerOf2_64(e); }))
+      return emitOpError("reduce-shape: requires static positive power-of-two extents");
+    if (auto attr = type.getEncoding()) {
+      auto encoding = dyn_cast<DistributedEncodingAttr>(attr);
+      if (!encoding) return emitOpError("reduce-shape: requires distributed tensor encoding");
+      if (failed(encoding.verifyForType(type,getLoc()))) return failure();
+    }
+  }
+  SmallVector<int64_t> shape(src.getShape());
+  shape.erase(shape.begin() + getDim());
+  if (dst.getShape() != ArrayRef<int64_t>(shape))
+    return emitOpError("reduce-shape: result must delete the reduction axis");
+  if (auto attr = (*this)->getAttr("frisk.reduction_contract"))
+    if (!isa<ReductionContractAttr>(attr))
+      return emitOpError("reduce-contract: expected complete typed reduction contract");
+  if (auto attr = (*this)->getAttr("frisk.execution_threads")) {
+    auto integer = dyn_cast<IntegerAttr>(attr);
+    if (!integer || !integer.getType().isSignlessInteger(64) || integer.getInt() < 32 ||
+        integer.getInt() > 1024 || !llvm::isPowerOf2_64(integer.getInt()))
+      return emitOpError("reduce-thread-group: requires 32/64/128/256/512/1024 threads");
+  }
+  return success();
+}
+
+void MmaOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  for (OpOperand &operand : getOperation()->getOpOperands())
+    if (isa<MemRefType>(operand.get().getType()))
+      effects.emplace_back(MemoryEffects::Read::get(), &operand,
+                           SideEffects::DefaultResource::get());
+}
+
+LogicalResult MmaOp::verify() {
+  if (getMAttr().getInt() <= 0 || getNAttr().getInt() <= 0 || getKAttr().getInt() <= 0)
+    return emitOpError("mma-shape: m/n/k must be positive signless i64");
+  auto a = cast<ShapedType>(getA().getType());
+  auto b = cast<ShapedType>(getB().getType());
+  auto init = cast<RankedTensorType>(getInit().getType());
+  auto result = cast<RankedTensorType>(getResult().getType());
+  for (ShapedType type : {a, b, ShapedType(init), ShapedType(result)}) {
+    if (type.getRank() != 2 || !type.hasStaticShape() ||
+        llvm::any_of(type.getShape(), [](int64_t e) { return e <= 0; }) ||
+        !isa<FloatType>(type.getElementType()))
+      return emitOpError("mma-shape: requires positive static rank-2 floating matrices");
+  }
+  if (a.getElementType() != b.getElementType() ||
+      init.getElementType() != result.getElementType() ||
+      init.getElementTypeBitWidth() < a.getElementTypeBitWidth())
+    return emitOpError("mma-shape: incompatible input/accumulator element types");
+  if (a.getDimSize(getTransA() ? 1 : 0) != getM() ||
+      a.getDimSize(getTransA() ? 0 : 1) != getK() ||
+      b.getDimSize(getTransB() ? 1 : 0) != getK() ||
+      b.getDimSize(getTransB() ? 0 : 1) != getN() ||
+      init.getShape() != ArrayRef<int64_t>({getMAttr().getInt(), getNAttr().getInt()}) ||
+      result.getShape() != init.getShape())
+    return emitOpError("mma-shape: matrix extents disagree with m/n/k and transpose");
+  for (ShapedType type : {a, b, ShapedType(init), ShapedType(result)}) {
+    auto tensor = dyn_cast<RankedTensorType>(type);
+    if (!tensor || !tensor.getEncoding()) continue;
+    auto encoding = dyn_cast<DistributedEncodingAttr>(tensor.getEncoding());
+    if (!encoding)
+      return emitOpError("mma-shape: tensor carrier encoding must be DistributedEncodingAttr");
+    if (failed(encoding.verifyForType(tensor, getLoc()))) return failure();
+  }
+  if (Attribute binding = (*this)->getAttr("frisk.mma_contract"))
+    if (!isa<MmaInstructionContractAttr>(binding))
+      return emitOpError("mma-joint-contract: expected typed complete MMA contract");
+  if (Attribute threads = (*this)->getAttr("frisk.execution_threads")) {
+    auto integer = dyn_cast<IntegerAttr>(threads);
+    if (!integer || !integer.getType().isSignlessInteger(64) || integer.getInt() <= 0)
+      return emitOpError("sm90-mma-thread-group: expected positive signless i64 threads");
+  }
+  return success();
+}
+
+namespace {
+
+bool isIdentityStorageLayout(StorageLayoutAttr layout, MemRefType type) {
+  auto affine = dyn_cast<AffineLayoutMapAttr>(layout.getMap());
+  if (!affine || !type.hasStaticShape() || !type.getLayout().isIdentity() ||
+      !type.getElementType().isIntOrFloat())
+    return false;
+
+  unsigned elementBits = type.getElementTypeBitWidth();
+  if (elementBits == 0 || elementBits % 8 != 0)
+    return false;
+
+  MLIRContext *context = type.getContext();
+  AffineExpr byteOffset = getAffineConstantExpr(0, context);
+  int64_t stride = elementBits / 8;
+  for (int64_t dim = type.getRank() - 1; dim >= 0; --dim) {
+    byteOffset = byteOffset + getAffineDimExpr(dim, context) * stride;
+    stride *= type.getDimSize(dim);
+  }
+  AffineMap expected = AffineMap::get(
+      type.getRank(), 0,
+      {byteOffset, getAffineConstantExpr(0, context)}, context);
+  return affine.getAffineMap().getValue() == expected;
+}
+
+bool hasNonReturnUser(LayoutViewOp op) {
+  return llvm::any_of(op.getResult().getUsers(), [&](Operation *user) {
+    return user->getName().getStringRef() != "func.return";
+  });
+}
+
+LogicalResult verifyStaticWholeTile(Operation *op, ShapedType memref,
+                                    RankedTensorType tensor,
+                                    StringRef mismatchMessage) {
+  if (!memref.hasStaticShape() || !tensor.hasStaticShape())
+    return op->emitOpError()
+           << op->getName().stripDialect()
+           << " requires static source and result shapes";
+  if (memref.getShape() != tensor.getShape() ||
+      memref.getElementType() != tensor.getElementType())
+    return op->emitOpError(mismatchMessage);
+
+  Attribute encoding = tensor.getEncoding();
+  if (!encoding)
+    return success();
+  auto distributed = dyn_cast<DistributedEncodingAttr>(encoding);
+  if (!distributed)
+    return op->emitOpError(
+        "tensor encoding must be a DistributedEncodingAttr");
+  return distributed.verifyForType(tensor, op->getLoc());
+}
+
+bool haveEquivalentDistributedEncodings(RankedTensorType lhs,
+                                        RankedTensorType rhs) {
+  auto lhsEncoding =
+      dyn_cast_or_null<DistributedEncodingAttr>(lhs.getEncoding());
+  auto rhsEncoding =
+      dyn_cast_or_null<DistributedEncodingAttr>(rhs.getEncoding());
+  if (!lhsEncoding || !rhsEncoding ||
+      lhsEncoding.getTopology() != rhsEncoding.getTopology() ||
+      lhsEncoding.getReplication() != rhsEncoding.getReplication())
+    return false;
+  FailureOr<Attribute> lhsMap = lhsEncoding.getCanonicalMap(lhs);
+  FailureOr<Attribute> rhsMap = rhsEncoding.getCanonicalMap(rhs);
+  return succeeded(lhsMap) && succeeded(rhsMap) && *lhsMap == *rhsMap;
+}
+
+} // namespace
+
+Value LayoutViewOp::getViewSource() { return getSource(); }
+
+LogicalResult LayoutViewOp::verify() {
+  if (getSource().getType() != getResult().getType())
+    return emitOpError("source and result must have identical memref types");
+  if (StorageLayoutAttr layout = getLayoutAttr())
+    return layout.verifyForType(cast<MemRefType>(getResult().getType()),
+                                getLoc());
+  return success();
+}
+
+LogicalResult LayoutViewOp::canonicalize(LayoutViewOp op,
+                                         PatternRewriter &rewriter) {
+  if (StorageLayoutAttr layout = op.getLayoutAttr()) {
+    if (isIdentityStorageLayout(
+            layout, cast<MemRefType>(op.getResult().getType())) &&
+        !hasNonReturnUser(op)) {
+      rewriter.replaceOp(op, op.getSource());
+      return success();
+    }
+  }
+
+  auto inner = op.getSource().getDefiningOp<LayoutViewOp>();
+  if (!inner || !op.getLayoutAttr() ||
+      op.getLayoutAttr() != inner.getLayoutAttr())
+    return failure();
+
+  rewriter.modifyOpInPlace(op, [&] { op->setOperand(0, inner.getSource()); });
+  return success();
+}
+
+LogicalResult TileLoadOp::verify() {
+  return verifyStaticWholeTile(
+      getOperation(), cast<MemRefType>(getSource().getType()),
+      cast<RankedTensorType>(getResult().getType()),
+      "source memref and result tensor must have identical static shape and "
+      "element type");
+}
+
+LogicalResult TileStoreOp::verify() {
+  auto valueType = cast<RankedTensorType>(getValue().getType());
+  auto targetType = cast<MemRefType>(getTarget().getType());
+  if (!valueType.hasStaticShape() || !targetType.hasStaticShape())
+    return emitOpError("tile_store requires static value and target shapes");
+  if (valueType.getShape() != targetType.getShape() ||
+      valueType.getElementType() != targetType.getElementType())
+    return emitOpError(
+        "value tensor and target memref must have identical static shape and "
+        "element type");
+  Attribute encoding = valueType.getEncoding();
+  if (!encoding)
+    return success();
+  auto distributed = dyn_cast<DistributedEncodingAttr>(encoding);
+  if (!distributed)
+    return emitOpError("tensor encoding must be a DistributedEncodingAttr");
+  return distributed.verifyForType(valueType, getLoc());
+}
+
+LogicalResult ConvertLayoutOp::verify() {
+  auto sourceType = cast<RankedTensorType>(getSource().getType());
+  auto resultType = cast<RankedTensorType>(getResult().getType());
+  if (sourceType.getShape() != resultType.getShape() ||
+      sourceType.getElementType() != resultType.getElementType())
+    return emitOpError(
+        "source and target must have identical shape and element type");
+
+  auto sourceEncoding =
+      dyn_cast_or_null<DistributedEncodingAttr>(sourceType.getEncoding());
+  auto resultEncoding =
+      dyn_cast_or_null<DistributedEncodingAttr>(resultType.getEncoding());
+  if (!sourceEncoding || !resultEncoding)
+    return emitOpError("source and target must use DistributedEncodingAttr");
+  if (failed(sourceEncoding.verifyForType(sourceType, getLoc())) ||
+      failed(resultEncoding.verifyForType(resultType, getLoc())))
+    return failure();
+  return success();
+}
+
+LogicalResult ConvertLayoutOp::canonicalize(ConvertLayoutOp op,
+                                            PatternRewriter &rewriter) {
+  auto sourceType = cast<RankedTensorType>(op.getSource().getType());
+  auto resultType = cast<RankedTensorType>(op.getResult().getType());
+  if (sourceType == resultType &&
+      haveEquivalentDistributedEncodings(sourceType, resultType)) {
+    rewriter.replaceOp(op, op.getSource());
+    return success();
+  }
+
+  auto inner = op.getSource().getDefiningOp<ConvertLayoutOp>();
+  if (!inner)
+    return failure();
+  auto innerSourceType =
+      cast<RankedTensorType>(inner.getSource().getType());
+  if (innerSourceType == resultType &&
+      haveEquivalentDistributedEncodings(innerSourceType, resultType)) {
+    rewriter.replaceOp(op, inner.getSource());
+    return success();
+  }
+  // Composition preserves the exact requested result type. A semantic map
+  // identity with distinct attribute spelling is not an SSA type identity.
+  rewriter.replaceOpWithNewOp<ConvertLayoutOp>(op, resultType, inner.getSource());
+  return success();
+}
+
+} // namespace mlir::frisk
