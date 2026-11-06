@@ -12,6 +12,8 @@ from async_host import validate_launch,TensorMaps,physical_abi
 p=argparse.ArgumentParser();p.add_argument('--path',choices=['vector','cp.async','tma'],default='vector');p.add_argument('--root',default='/home/baopeihua/frisk');p.add_argument('--opt');p.add_argument('--output',required=True);p.add_argument('--compile-only',action='store_true')
 p.add_argument('--target-ctas-per-sm', type=int, choices=(2, 3, 4),
                help='require a spill-free SM90 binary with this driver residency')
+p.add_argument('--normalization-division', choices=('exact-divide', 'guarded-row-reciprocal'),
+               default='exact-divide', help='select the checked packed Attention normalization path')
 args=p.parse_args()
 r=Path(args.root);output_root=Path(args.output);output_root.mkdir(parents=True,exist_ok=True);out=Path(tempfile.mkdtemp(prefix='run-',dir=output_root));print('artifact_directory='+str(out),flush=True);opt=args.opt or str(r/'build-m6-release/bin/frisk-opt')
 def execute(cmd,name):
@@ -19,7 +21,7 @@ def execute(cmd,name):
  if q.returncode:raise RuntimeError(name+' failed')
  return time.perf_counter_ns()-t
 source=r/('test/Transforms/attention-layout-'+{'vector':'fixed','cp.async':'cp-async','tma':'tma'}[args.path]+'-abi.mlir');(out/'input.mlir').write_bytes(source.read_bytes());start=time.perf_counter_ns();infer=execute([opt,str(source),'--frisk-layout-pipeline','-o',str(out/'selected.mlir')],'infer');execute([opt,str(out/'selected.mlir'),'-frisk-export-execution=output='+str(out/'execution.json'),'-o','/dev/null'],'export')
-data=json.loads((out/'execution.json').read_text());text,info=emit(data)
+data=json.loads((out/'execution.json').read_text());text,info=emit(data, normalization_division=args.normalization_division)
 target = None
 if args.target_ctas_per_sm is not None:
  from native_static_support import target_sm90_residency
