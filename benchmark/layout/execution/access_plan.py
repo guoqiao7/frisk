@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
+from itertools import combinations
 
 
 _MAX_BYTE_OFFSET = (1 << 32) - 1
@@ -27,6 +28,89 @@ class AccessPlan:
     # verifier as an unfactored access. byte_offset is an integer displacement.
     bases: tuple[tuple[int, ...], ...]
     groups: tuple[AccessGroup, ...]
+
+
+def linear(table):
+    """Return affine GF(2) bit bases after full-domain equivalence."""
+    size = len(table)
+    if size < 1 or size & (size - 1):
+        raise ValueError("non power-of-two map domain")
+    base = table[0]
+    bits = [table[1 << i] ^ base for i in range(size.bit_length() - 1)]
+    for index, expected in enumerate(table):
+        actual = base
+        for i, bit in enumerate(bits):
+            if index >> i & 1:
+                actual ^= bit
+        if actual != expected:
+            raise ValueError("map is outside checked GF(2) subset")
+    return base, bits
+
+
+def _copy_cost(source, target):
+    sectors = tuple(
+        sum(len({(offset + phase) // 32 for offset in row[warp:warp + 32]})
+            for row in source for warp in range(0, 128, 32))
+        for phase in (0, 16)
+    )
+    # Each 128-byte portion of STS.128 has eight lanes. Each 16-byte
+    # vector occupies one aligned group of four consecutive Shared banks.
+    shared_excess = sum(
+        max(Counter((offset >> 4) & 7 for offset in row[lane:lane + 8]).values()) - 1
+        for row in target for lane in range(0, 128, 8)
+    )
+    return (*sectors, shared_excess)
+
+
+def _independent_bank_axes(columns, axes):
+    first, second, third = (columns[axis] for axis in axes)
+    return (first != 0 and second not in (0, first)
+            and third not in (0, first, second, first ^ second))
+
+
+def plan_copy_owners(source, target):
+    """Reassign whole Copy16 segments, keeping each source/destination pair intact.
+
+    The caller proves each segment's byte pairing and checks its resulting
+    addresses with plan_access. Return None when the original execution
+    ownership is preferable or the checked affine subset does not apply.
+    """
+    if not source or len(source) != len(target) or any(len(row) != 128 for row in (*source, *target)):
+        return None
+    pairs = sorted(pair for src, dst in zip(source, target) for pair in zip(src, dst))
+    base = pairs[0][0]
+    if base % 16 or any(src != base + 16 * i or dst % 16 for i, (src, dst) in enumerate(pairs)):
+        return None
+
+    rows = [tuple(zip(*pairs[start:start + 128])) for start in range(0, len(pairs), 128)]
+    try:
+        bank_columns = []
+        for src, dst in rows:
+            linear(src)
+            _, bits = linear(dst)
+            bank_columns.append(tuple((bit >> 4) & 7 for bit in bits[:5]))
+    except ValueError:
+        return None
+
+    # Permuting five lane bits preserves the 32 consecutive source vectors.
+    # Pick three independent Shared bank-group columns for the low lane bits,
+    # so every eight-lane transaction uses all eight bank groups once.
+    axes = next((axes for axes in combinations(range(5), 3)
+                 if all(_independent_bank_axes(cols, axes) for cols in bank_columns)), None)
+    if axes is None:
+        return None
+    order = (*axes, *(axis for axis in range(5) if axis not in axes))
+    lanes = tuple((lane & ~31) | sum(((lane >> i) & 1) << axis for i, axis in enumerate(order))
+                  for lane in range(128))
+    planned = tuple(tuple(tuple(row[endpoint][lane] for lane in lanes) for row in rows)
+                    for endpoint in range(2))
+    before = _copy_cost(source, target)
+    after = _copy_cost(*planned)
+    if before == after or any(new > old for old, new in zip(before, after)):
+        return None
+    return planned, dict(lane_bit_order=list(order), global_sectors_32=list(after[:2]),
+                         previous_global_sectors_32=list(before[:2]), shared_excess_wavefronts=after[2],
+                         previous_shared_excess_wavefronts=before[2])
 
 
 def plan_access(offset_tables, *, element_bytes, root_alignment, root_bytes,

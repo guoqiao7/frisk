@@ -9,20 +9,8 @@ from shuffle_network import plan_shuffle_network, network_resource_proxy
 from async_copy import plan as async_plan
 from async_host import validate_launch
 from shared_allocation import reserve_shared, plan_shared_allocation, _extent
-from access_plan import plan_access
+from access_plan import linear, plan_access, plan_copy_owners
 from storage_addresses import RowMajorAddresses, needs_storage_normalization
-
-def linear(table):
- """Return affine GF(2) bit bases only after full-domain equivalence."""
- n=len(table)
- if n<1 or n&(n-1):raise ValueError('non power-of-two map domain')
- base=table[0];bits=[table[1<<i]^base for i in range(n.bit_length()-1)]
- for x,y in enumerate(table):
-  got=base
-  for i,b in enumerate(bits):
-   if x>>i&1:got^=b
-  if got!=y:raise ValueError('map is outside checked GF(2) subset')
- return base,bits
 
 def splat_f32_bits(attribute):
  """Decode an MLIR dense f32 splat without losing hexadecimal payload bits."""
@@ -37,7 +25,8 @@ def splat_f32_bits(attribute):
 
 class Emitter:
  def __init__(self,data,*,demand_query_observer=None,demand_query_budget=65536,shuffle_network_policy='auto', access_policy='vector', reduction_policy='auto',
-              mma_group_size=1, shared_policy='declared', store_policy='direct', copy_batch=False, trace_execution=False):
+              mma_group_size=1, shared_policy='declared', store_policy='direct', copy_batch=False, trace_execution=False,
+              copy_owner_policy='gf2'):
   if type(mma_group_size) is not int or mma_group_size not in (1, 2, 4, 8, 16):
    raise ValueError('unsupported WGMMA group size')
   if shared_policy not in ('declared','reuse','late','reuse-k') or store_policy not in ('direct','shared','warp-gf2'):
@@ -48,6 +37,9 @@ class Emitter:
    raise ValueError('copy batching must be enabled explicitly')
   if shared_policy in ('late','reuse-k') and (not copy_batch or store_policy!='direct'):
    raise ValueError('late V scheduling requires batched Copy16 and direct output')
+  if copy_owner_policy not in ('execution', 'gf2'):
+   raise ValueError('unknown Copy16 ownership policy')
+  self.copy_owner_policy=copy_owner_policy
   self.copy_batch=copy_batch
   self.mma_group_size=mma_group_size
   self.shared_policy=shared_policy
@@ -175,6 +167,13 @@ class Emitter:
      raise ValueError('aligned Copy elements are not contiguous')
     tables[endpoint].append(starts)
 
+  owner_receipt = {}
+  if self.copy_owner_policy == 'gf2' and self.access_policy == 'vector':
+   plan = plan_copy_owners(*tables)
+   if plan is not None:
+    tables, receipt = plan
+    owner_receipt['copy_owners'] = receipt
+
   all_threads = (1 << 128) - 1
   proof_src = plan_access(tables[0], element_bytes=16, root_alignment=self.storage(src_root)['alignment'],
                          root_bytes=self._root_bytes(src_root))
@@ -205,7 +204,7 @@ class Emitter:
    self.emit('fence.proxy.async.shared::cta;')
   self._record_access('copy',2,{16:len(proof_src.groups)},
                       len(proof_src.groups) if self.access_policy == 'legacy' else len(src_bases),
-                      proof_src,16,self.storage(src_root)['alignment'])
+                      proof_src,16,self.storage(src_root)['alignment'],**owner_receipt)
 
  def async_copy(self,o):
   p=async_plan(o,self.v);a,b=o['operands'][:2]
@@ -970,8 +969,9 @@ class Emitter:
 
 def emit(data, *, demand_query_observer=None, demand_query_budget=65536, shuffle_network_policy='auto',
          access_policy='vector', reduction_policy='auto', mma_group_size=1, shared_policy='declared',
-         store_policy='direct', copy_batch=False, trace_execution=False):
+         store_policy='direct', copy_batch=False, trace_execution=False, copy_owner_policy='gf2'):
  return Emitter(data, demand_query_observer=demand_query_observer, demand_query_budget=demand_query_budget,
                 shuffle_network_policy=shuffle_network_policy, access_policy=access_policy,
                 reduction_policy=reduction_policy, mma_group_size=mma_group_size, shared_policy=shared_policy,
-                store_policy=store_policy, copy_batch=copy_batch, trace_execution=trace_execution).run()
+                store_policy=store_policy, copy_batch=copy_batch, trace_execution=trace_execution,
+                copy_owner_policy=copy_owner_policy).run()

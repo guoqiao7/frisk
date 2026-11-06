@@ -1,6 +1,6 @@
 import unittest
 
-from access_plan import plan_access
+from access_plan import plan_access, plan_copy_owners
 
 
 def rows(offsets, bases=(0, 64, 128, 192)):
@@ -60,6 +60,31 @@ class AccessPlanTest(unittest.TestCase):
         self.assertEqual([g.width_bytes for g in plan.groups], [16, 16])
         with self.assertRaisesRegex(ValueError, "escapes"):
             plan_access(offsets, element_bytes=16, root_alignment=16, root_bytes=223)
+
+    def test_copy_owner_reassigns_whole_paired_vectors(self):
+        # Shared bank groups use the third through fifth bits of the source
+        # vector ordinal. The original owner makes consecutive lane IDs
+        # advance by eight vectors instead of one.
+        source = [[16 * (8 * lane + slot) for lane in range(128)] for slot in range(8)]
+        target = [[16 * ((index & ~31) | ((index & 3) << 3) | ((index >> 2) & 7))
+                   for index in (offset // 16 for offset in row)] for row in source]
+        (planned_source, planned_target), receipt = plan_copy_owners(source, target)
+        pairs = lambda src, dst: sorted(pair for a, b in zip(src, dst) for pair in zip(a, b))
+        self.assertEqual(pairs(source, target), pairs(planned_source, planned_target))
+        self.assertEqual(receipt["lane_bit_order"], [2, 3, 4, 0, 1])
+        self.assertEqual(receipt["previous_global_sectors_32"], [1024, 1024])
+        self.assertEqual(receipt["global_sectors_32"], [512, 544])
+        self.assertGreater(receipt["previous_shared_excess_wavefronts"], 0)
+        self.assertEqual(receipt["shared_excess_wavefronts"], 0)
+        self.assertIsNone(plan_copy_owners(planned_source, planned_target))
+
+    def test_copy_owner_falls_back_for_gaps_or_nonaffine_destination(self):
+        source = [list(range(0, 16 * 128, 16))]
+        target = [source[0].copy()]
+        target[0][0], target[0][1] = target[0][1], target[0][0]
+        self.assertIsNone(plan_copy_owners(source, target))
+        source[0][-1] += 16
+        self.assertIsNone(plan_copy_owners(source, source))
 
     def test_weak_or_misaligned_layout_remains_byte_wise(self):
         for alignment, offsets in ((1, rows([0, 4])), (16, rows([1, 5]))):
