@@ -26,7 +26,7 @@ def splat_f32_bits(attribute):
 class Emitter:
  def __init__(self,data,*,demand_query_observer=None,demand_query_budget=65536,shuffle_network_policy='auto', access_policy='vector', reduction_policy='auto',
               mma_group_size=1, shared_policy='declared', store_policy='direct', copy_batch=False, trace_execution=False,
-              copy_owner_policy='gf2'):
+              copy_owner_policy='gf2', normalization_pack=True):
   if type(mma_group_size) is not int or mma_group_size not in (1, 2, 4, 8, 16):
    raise ValueError('unsupported WGMMA group size')
   if shared_policy not in ('declared','reuse','late','reuse-k') or store_policy not in ('direct','shared','warp-gf2'):
@@ -40,6 +40,10 @@ class Emitter:
   if copy_owner_policy not in ('execution', 'gf2'):
    raise ValueError('unknown Copy16 ownership policy')
   self.copy_owner_policy=copy_owner_policy
+  if type(normalization_pack) is not bool:
+   raise ValueError('normalization pack policy must be boolean')
+  self.normalization_pack=normalization_pack
+  self.packed_f16={}
   self.copy_batch=copy_batch
   self.mma_group_size=mma_group_size
   self.shared_policy=shared_policy
@@ -219,6 +223,64 @@ class Emitter:
   self.emit(f'@{pred} mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 {state}, [{bar}], 2048;')
   self.emit(f'@{pred} cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [{dst}], [${5+i}, {{0, 0}}], [{bar}];')
   self.emit(label+':');self.emit(f'mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 {done}, [{bar}], 0;');self.emit(f'@!{done} bra {label};');self.emit('bar.sync 0;')
+ def _normalization_pack_sites(self, operations, reuse_barriers):
+  """Find exact div/trunc pairs whose only consumer accepts native f16x2."""
+  uses={}
+  for ordinal, op in enumerate(operations):
+   for index, operand in enumerate(op.get('operands', ())):
+    uses.setdefault(operand, []).append((ordinal,index))
+  sites=set()
+  audit_attributes={'frisk.execution_audit_boundaries','frisk.execution_audit_variables',
+                    'frisk.inferred_result_layout'}
+  for ordinal, (divide, narrow) in enumerate(zip(operations,operations[1:])):
+   if (divide['name']!='arith.divf' or narrow['name']!='arith.truncf' or ordinal+1 in reuse_barriers
+       or len(divide['operands'])!=2 or len(divide['results'])!=1 or len(narrow['results'])!=1):
+    continue
+   attributes=divide.get('attrs', {})
+   if (attributes.get('fastmath','#arith.fastmath<none>')!='#arith.fastmath<none>'
+       or attributes.keys()-audit_attributes-{'fastmath'}
+       or narrow.get('attrs', {}).keys()-audit_attributes):
+    continue
+   quotient,=divide['results']; probability,=narrow['results']
+   if narrow['operands']!=[quotient] or uses.get(quotient)!=[(ordinal+1,0)]:
+    continue
+   consumers=uses.get(probability, [])
+   if len(consumers)!=1 or consumers[0][1]!=0 or consumers[0][0]<=ordinal+1:
+    continue
+   consumer=operations[consumers[0][0]]
+   contract=consumer.get('attrs', {}).get('frisk.mma_contract', {})
+   repeats=contract.get('repeats', ())
+   if (consumer['name']!='frisk.mma' or contract.get('form')!='rs'
+       or contract.get('packing')!='f16x2-low-high' or not isinstance(repeats,list) or len(repeats)!=3
+       or type(repeats[2]) is not int or repeats[2]<1):
+    continue
+   values=[self.v[x] for x in (*divide['operands'],quotient,probability)]
+   if any(not value['type'].split(',',1)[0].removesuffix('>').endswith('x'+dtype)
+          for value,dtype in zip(values,('f32','f32','f32','f16'))):
+    continue
+   layout=values[-1].get('distributed', {})
+   topology=[repeats[2]*8,32,4,1,1]
+   if (layout.get('topology')!=topology or len(layout.get('logical',()))!=128*topology[0]
+       or any(any(value.get('distributed',{}).get(key)!=layout.get(key)
+                  for key in ('shape','topology','logical')) for value in values[:-1])):
+    continue
+   sites.add(ordinal)
+  return sites
+ def _pack_normalization(self, divide, narrow):
+  numerator,denominator=(self.regs(x) for x in divide['operands'])
+  slots=self.v[narrow['results'][0]]['distributed']['topology'][0]
+  if len(numerator)!=slots or len(denominator)!=slots:
+   raise ValueError('normalization pair carrier size mismatch')
+  packed=[]
+  for index in range(0,slots,2):
+   low,high=self.tmp('f32'),self.tmp('f32')
+   self.emit(f'div.rn.f32 {low}, {numerator[index]}, {denominator[index]};')
+   self.emit(f'div.rn.f32 {high}, {numerator[index+1]}, {denominator[index+1]};')
+   pair=self.tmp()
+   # PTX converts the first operand to the high half and the second to low.
+   self.emit(f'cvt.rn.f16x2.f32 {pair}, {high}, {low};')
+   packed.append(pair)
+  self.packed_f16[narrow['results'][0]]=packed
  def mma(self,o):
   a,b,c=o['operands'];v=o['results'][0];d=o['attrs']['frisk.mma_contract']
   required={'accumulator_type','atom','b_descriptor','form','grid','input_type','packing','repeats','target','version'}|({'a_descriptor'} if d['form']=='ss' else set())
@@ -243,16 +305,20 @@ class Emitter:
     ad=self.descriptor(a,d['a_descriptor'],sl);args=f'{ad}, {bd}, mma_acc, 1, 1, 0, 0'
    else:
     if d['packing']!='f16x2-low-high':raise ValueError('RS packing')
-    source=self.regs(a);slots=self.tensor_slots(a);shape=self.v[a]['distributed']['shape'];pack=[]
+    packed=self.packed_f16.get(a)
+    source=self.regs(a) if packed is None else None
+    slots=self.tensor_slots(a);shape=self.v[a]['distributed']['shape'];pack=[]
     for j in range(4):
-     pair=[]
      for h in range(2):
       r=sl*8+j*2+h
       for t in range(128):
        row=(t//32)*16+(t%32)//4+((j*2+h)%4//2)*8;col=(t%4)*2+(h%2)+(j//2)*8+sl*16
        if slots[r][t]!=row*shape[1]+col:raise ValueError('RS native f16x2 map mismatch')
-      pair.append(source[r])
-     z=self.tmp();self.emit('mov.b32 '+z+', {'+', '.join(pair)+'};');pack.append(z)
+     if packed is None:
+      first=sl*8+j*2
+      pair=(source[first],source[first+1])
+      z=self.tmp();self.emit('mov.b32 '+z+', {'+', '.join(pair)+'};');pack.append(z)
+     else:pack.append(packed[sl*4+j])
     args='{'+', '.join(pack)+'}, '+bd+', mma_acc, 1, 1, '+str(int(d['b_descriptor']['major']=='mn'))
    pending.append(f'wgmma.mma_async.sync.aligned.m64n{n}k16.f32.f16.f16 '+'{'+', '.join(out)+'}, '+args+';')
    if len(pending)==self.mma_group_size or sl+1==rk:
@@ -914,6 +980,7 @@ class Emitter:
   if register_counts and max(register_counts)<=256 and sum(register_counts)>self.demand_query_budget:raise ValueError('eager affine-query carrier budget exceeded')
   demand=self.demand_program()
   if demand is None:
+   pack_sites=self._normalization_pack_sites(operations,reuse_barriers) if self.normalization_pack else set()
    ignored={'builtin.module','frisk.kernel','frisk.parallel','frisk.end','frisk.storage_contract','frisk.layout_view','memref.alloc','tensor.empty','linalg.yield'}
    for ordinal,o in enumerate(operations):
     n=o['name'];self.handled+=1
@@ -931,6 +998,8 @@ class Emitter:
     elif n=='frisk.reduce_tensor':self.reduce(o)
     elif n=='linalg.broadcast':self.broadcast(o)
     elif n=='frisk.tile_store':self.store(o)
+    elif ordinal in pack_sites:self._pack_normalization(o,operations[ordinal+1])
+    elif ordinal-1 in pack_sites:pass # The preceding division emitted the paired cast.
     elif n in ('arith.addf','arith.mulf','arith.subf','arith.divf','math.exp','math.rsqrt','arith.truncf'):
      v=o['results'][0];out=self.newregs(v);args=[self.regs(x) for x in o['operands']]
      if n in ('arith.addf','math.rsqrt'):
@@ -965,13 +1034,14 @@ class Emitter:
   extra_values=''.join(', %d'+str(i) for i in range(len(self.tma)))
   extra_types=', !tt.ptr<i8>'*len(self.tma)
   text='module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.target" = "cuda:90"} {\n tt.func public @frisk_execution(%q: !tt.ptr<i8>, %k: !tt.ptr<i8>, %v: !tt.ptr<i8>, %o: !tt.ptr<i8>'+extra_args+') {\n  %done = tt.elementwise_inline_asm "'+escaped+'" {constraints = "=r,l,l,l,l'+',l'*len(self.tma)+'", pure = false, packed_element = 1 : i32} %q, %k, %v, %o'+extra_values+' : !tt.ptr<i8>, !tt.ptr<i8>, !tt.ptr<i8>, !tt.ptr<i8>'+extra_types+' -> i32\n tt.return\n }\n}\n'
-  return text,{'copy_path':self.copy_path,'tma_plans':self.tma,'global_alignments':[self.storage(x)['alignment'] for x in global_roots],'emitted_operations':self.handled,'static_shared_bytes':size,'physical_shared_bytes':physical_shared,'shared_limit_bytes':limit,'shared_root_bytes':root_bytes,'scratch_offset':self.scratch,'scratch_max_bytes':scratch_max,'route_counts':routes,'tma_barrier_bytes':tma_barrier_bytes,'root_order':global_roots,'shared_allocation_plan':allocation,'exp':'ex2.approx.f32(mul.rn.f32(x, log2e-f32))','ftz':False,'fp_fusion':False,'p_rounding':'cvt.rn.f16.f32','reassociation':False,**({'demand_lowering':demand} if demand else {}),**({'shuffle_networks':self.shuffle_networks} if self.shuffle_networks else {}),**({'global_access':self.global_access} if self.global_access else {}),**({'reduction_plans':self.reduction_plans} if self.reduction_plans else {}),**({'execution_trace':self.execution_trace} if self.execution_trace is not None and demand is None else {}),**({'copy_batches':batches} if batches else {}),**({'attention_schedule':publication} if publication else {})}
+  return text,{'copy_path':self.copy_path,'tma_plans':self.tma,'global_alignments':[self.storage(x)['alignment'] for x in global_roots],'emitted_operations':self.handled,'static_shared_bytes':size,'physical_shared_bytes':physical_shared,'shared_limit_bytes':limit,'shared_root_bytes':root_bytes,'scratch_offset':self.scratch,'scratch_max_bytes':scratch_max,'route_counts':routes,'tma_barrier_bytes':tma_barrier_bytes,'root_order':global_roots,'shared_allocation_plan':allocation,'exp':'ex2.approx.f32(mul.rn.f32(x, log2e-f32))','ftz':False,'fp_fusion':False,'p_rounding':'cvt.rn.f16.f32','reassociation':False,**({'demand_lowering':demand} if demand else {}),**({'shuffle_networks':self.shuffle_networks} if self.shuffle_networks else {}),**({'global_access':self.global_access} if self.global_access else {}),**({'reduction_plans':self.reduction_plans} if self.reduction_plans else {}),**({'execution_trace':self.execution_trace} if self.execution_trace is not None and demand is None else {}),**({'copy_batches':batches} if batches else {}),**({'attention_schedule':publication} if publication else {}),**({'normalization_pack_pairs':sum(map(len,self.packed_f16.values()))} if self.packed_f16 else {})}
 
 def emit(data, *, demand_query_observer=None, demand_query_budget=65536, shuffle_network_policy='auto',
          access_policy='vector', reduction_policy='auto', mma_group_size=1, shared_policy='declared',
-         store_policy='direct', copy_batch=False, trace_execution=False, copy_owner_policy='gf2'):
+         store_policy='direct', copy_batch=False, trace_execution=False, copy_owner_policy='gf2',
+         normalization_pack=True):
  return Emitter(data, demand_query_observer=demand_query_observer, demand_query_budget=demand_query_budget,
                 shuffle_network_policy=shuffle_network_policy, access_policy=access_policy,
                 reduction_policy=reduction_policy, mma_group_size=mma_group_size, shared_policy=shared_policy,
                 store_policy=store_policy, copy_batch=copy_batch, trace_execution=trace_execution,
-                copy_owner_policy=copy_owner_policy).run()
+                copy_owner_policy=copy_owner_policy, normalization_pack=normalization_pack).run()

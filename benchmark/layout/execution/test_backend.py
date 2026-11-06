@@ -4,13 +4,44 @@ import backend
 class BackendTests(unittest.TestCase):
  def test_complete_input_drives_operations(self):
   data=json.loads(Path(INPUT).read_text())
-  text,info=backend.emit(data)
+  text,info=backend.emit(data,normalization_pack=False)
   self.assertIn('wgmma.mma_async.sync.aligned.m64n64k16',text)
   self.assertEqual(text.count('wgmma.mma_async.sync.aligned.m64n16k16'),4)
   self.assertIn('fence.proxy.async.shared::cta',text)
   self.assertIn('cvt.rn.f16.f32',text)
   self.assertEqual(text.count('mma_acc, 1, 1, 1;'),4)
   self.assertEqual(info['emitted_operations'],len(data['operations']))
+ def test_normalization_pack_preserves_rounding_and_native_consumption(self):
+  data=json.loads(Path(INPUT).read_text())
+  packed,info=backend.emit(data)
+  scalar,control=backend.emit(data,normalization_pack=False)
+  pairs=info['normalization_pack_pairs']
+  self.assertNotIn('normalization_pack_pairs',control)
+  self.assertEqual(info['p_rounding'],control['p_rounding'])
+  self.assertEqual(packed.count('cvt.rn.f16x2.f32'),pairs)
+  self.assertEqual(scalar.count('cvt.rn.f16.f32'),pairs*2)
+  self.assertNotIn('cvt.rn.f16.f32',packed)
+  for instruction in ('div.rn.f32','wgmma.mma_async','wgmma.wait_group','bar.sync'):
+   self.assertEqual(packed.count(instruction),scalar.count(instruction))
+  self.assertEqual(info['emitted_operations'],control['emitted_operations'])
+ def test_normalization_pack_requires_single_use_and_no_intervening_barrier(self):
+  data=json.loads(Path(INPUT).read_text())
+  emitter=backend.Emitter(data)
+  operations=data['operations']
+  ordinal,=emitter._normalization_pack_sites(operations,set())
+  quotient=operations[ordinal]['results'][0]
+  probability=operations[ordinal+1]['results'][0]
+  for extra in (quotient,probability):
+   self.assertFalse(emitter._normalization_pack_sites(
+       [*operations,{'name':'test.use','operands':[extra]}],set()))
+  self.assertFalse(emitter._normalization_pack_sites(operations,{ordinal+1}))
+  fast_ops=copy.deepcopy(operations)
+  fast_ops[ordinal]['attrs']['fastmath']='#arith.fastmath<fast>'
+  self.assertFalse(emitter._normalization_pack_sites(fast_ops,set()))
+  denominator=operations[ordinal]['operands'][1]
+  logical=emitter.v[denominator]['distributed']['logical']
+  logical[0],logical[1]=logical[1],logical[0]
+  self.assertFalse(emitter._normalization_pack_sites(operations,set()))
  def test_full_coordinate_maps_include_replica_unit_and_atomic_refusal(self):
   for table in ([i for i in range(128)],[i^16 for i in range(128)],[i&63 for i in range(128)],[0]):
    base,bits=backend.linear(table)
