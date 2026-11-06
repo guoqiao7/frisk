@@ -1201,13 +1201,18 @@ class Emitter:
    from execution_schedule import verify_attention_publication
    publication=verify_attention_publication(publication,publication_code)
   if self._packet_content_seal is not None and content_digest(self.data)!=self._packet_content_seal:raise ValueError('execution content changed during emission')
-  asm='{\n'+'\n'.join(self.decl+self.code+['mov.u32 $0, 0;'])+'\n}'
-  escaped=asm.replace('\\','\\5C').replace('"','\\22').replace('\n','\\0A')
-  extra_args=''.join(', %d'+str(i)+': !tt.ptr<i8>' for i in range(len(self.tma)))
-  extra_values=''.join(', %d'+str(i) for i in range(len(self.tma)))
-  extra_types=', !tt.ptr<i8>'*len(self.tma)
-  text='module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.target" = "cuda:90"} {\n tt.func public @frisk_execution(%q: !tt.ptr<i8>, %k: !tt.ptr<i8>, %v: !tt.ptr<i8>, %o: !tt.ptr<i8>'+extra_args+') {\n  %done = tt.elementwise_inline_asm "'+escaped+'" {constraints = "=r,l,l,l,l'+',l'*len(self.tma)+'", pure = false, packed_element = 1 : i32} %q, %k, %v, %o'+extra_values+' : !tt.ptr<i8>, !tt.ptr<i8>, !tt.ptr<i8>, !tt.ptr<i8>'+extra_types+' -> i32\n tt.return\n }\n}\n'
+  text=render_inline_execution(self.decl, self.code, len(self.tma))
   return text,{'copy_path':self.copy_path,'tma_plans':self.tma,'global_alignments':[self.storage(x)['alignment'] for x in global_roots],'emitted_operations':self.handled,'static_shared_bytes':size,'physical_shared_bytes':physical_shared,'shared_limit_bytes':limit,'shared_root_bytes':root_bytes,'scratch_offset':self.scratch,'scratch_max_bytes':scratch_max,'route_counts':routes,'tma_barrier_bytes':tma_barrier_bytes,'root_order':global_roots,'shared_allocation_plan':allocation,'exp':'ex2.approx.f32(mul.rn.f32(x, log2e-f32))','ftz':False,'fp_fusion':False,'p_rounding':'cvt.rn.f16.f32','reassociation':False,**({'demand_lowering':demand} if demand else {}),**({'shuffle_networks':self.shuffle_networks} if self.shuffle_networks else {}),**({'global_access':self.global_access} if self.global_access else {}),**({'reduction_plans':self.reduction_plans} if self.reduction_plans else {}),**({'execution_trace':self.execution_trace} if self.execution_trace is not None and demand is None else {}),**({'copy_batches':batches} if batches else {}),**({'attention_schedule':publication} if publication else {}),**({'normalization_pack_pairs':sum(map(len,self.packed_f16.values()))} if self.packed_f16 else {}),**({'normalization_reciprocal':self.normalization_reciprocal} if self.normalization_reciprocal else {}),**({'conversion_reuse':self.conversion_reuse} if self.conversion_reuse else {})}
+
+def render_inline_execution(declarations, code, tma_count=0):
+ """Package checked execution PTX in the shared SM90 TTGIR launch ABI."""
+ asm='{\n'+'\n'.join(declarations+code+['mov.u32 $0, 0;'])+'\n}'
+ escaped=asm.replace('\\','\\5C').replace('"','\\22').replace('\n','\\0A')
+ extra_args=''.join(', %d'+str(i)+': !tt.ptr<i8>' for i in range(tma_count))
+ extra_values=''.join(', %d'+str(i) for i in range(tma_count))
+ extra_types=', !tt.ptr<i8>'*tma_count
+ text='module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.target" = "cuda:90"} {\n tt.func public @frisk_execution(%q: !tt.ptr<i8>, %k: !tt.ptr<i8>, %v: !tt.ptr<i8>, %o: !tt.ptr<i8>'+extra_args+') {\n  %done = tt.elementwise_inline_asm "'+escaped+'" {constraints = "=r,l,l,l,l'+',l'*tma_count+'", pure = false, packed_element = 1 : i32} %q, %k, %v, %o'+extra_values+' : !tt.ptr<i8>, !tt.ptr<i8>, !tt.ptr<i8>, !tt.ptr<i8>'+extra_types+' -> i32\n tt.return\n }\n}\n'
+ return text
 
 def emit(data, *, demand_query_observer=None, demand_query_budget=65536, shuffle_network_policy='auto',
          access_policy='vector', reduction_policy='auto', mma_group_size=1, shared_policy='declared',
