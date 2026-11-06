@@ -2,7 +2,8 @@
 import copy
 import unittest
 from native_static_support import (STATIC_SHARED_LIMIT_BYTES, StaticSharedUnsupported,
-                                   check_static_shared)
+                                   _SM90_TTGIR_HEADER, check_sm90_residency_binary,
+                                   check_static_shared, target_sm90_residency)
 
 
 class NativeStaticSupportTest(unittest.TestCase):
@@ -35,6 +36,40 @@ class NativeStaticSupportTest(unittest.TestCase):
             with self.subTest(info=info):
                 with self.assertRaises(ValueError) as caught:check_static_shared(info)
                 self.assertNotIsInstance(caught.exception,StaticSharedUnsupported)
+
+
+class Sm90ResidencyTargetTest(unittest.TestCase):
+    def setUp(self):
+        self.ttgir = _SM90_TTGIR_HEADER + '} {\n  checked body\n}\n'
+        self.info = dict(static_shared_bytes=36864, physical_shared_bytes=36864)
+
+    def test_three_ctas_round_to_168_registers_without_modifying_the_body(self):
+        text, target = target_sm90_residency(self.ttgir, self.info, 3)
+        self.assertEqual(target['max_registers_per_thread'], 168)
+        self.assertEqual(target['threads_per_block'], 128)
+        self.assertEqual(text.replace(', "ttg.maxnreg" = 168 : i32', ''), self.ttgir)
+        self.assertEqual(self.info, dict(static_shared_bytes=36864, physical_shared_bytes=36864))
+        for ttgir, blocks in ((text, 3), (self.ttgir.replace('cuda:90', 'cuda:80'), 3),
+                             (self.ttgir, 1), (self.ttgir, True)):
+            with self.assertRaises(ValueError):
+                target_sm90_residency(ttgir, self.info, blocks)
+
+    def test_ignores_no_failed_native_resource_contract(self):
+        _, target = target_sm90_residency(self.ttgir, self.info, 3)
+        ptx = '.reqntid 128\n.maxnreg 168\n'
+        resources = dict(registers_per_thread=168, stack_bytes_per_thread=0, local_bytes=0)
+        ops = {'HMMA.16816.F32': 16}
+        self.assertEqual(check_sm90_residency_binary(target, ptx, resources, ops)
+                         ['native_spill_instructions'], 0)
+        for kwargs in (
+            dict(ptx='.reqntid 128\n.maxnreg 176\n'),
+            dict(resources=dict(resources, registers_per_thread=169)),
+            dict(resources=dict(resources, stack_bytes_per_thread=4)),
+            dict(resources=dict(resources, local_bytes=4)),
+            dict(mnemonics={'LDL.64': 1, **ops}),
+        ):
+            with self.assertRaises(ValueError):
+                check_sm90_residency_binary(target, **(dict(ptx=ptx, resources=resources, mnemonics=ops) | kwargs))
 
 
 if __name__=='__main__':unittest.main()
