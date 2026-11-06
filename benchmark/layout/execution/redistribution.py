@@ -30,6 +30,30 @@ def shuffle_source_support(plan, register):
  coset={base^x for x in image}
  return tuple(sorted(coset if coset==actual else actual))
 
+def affine_warp_sections(plan):
+ """Replace a piecewise local-first owner by the canonical same-warp section.
+
+ Selecting the least physical preimage is linear on the image of a linear
+ layout. Verify both affine holder tables over the finite destination domain.
+ Replicas carry the same immutable SSA payload.
+ """
+ from access_plan import linear
+ nr,dr=plan['source_registers'],plan['destination_registers']
+ source=plan['source_slots']
+ first={}
+ for index,slot in enumerate(source):
+  first.setdefault((index//(32*nr),slot),index%(32*nr))
+ sections=[]
+ for register in range(dr):
+  holders=[first[(thread//32,plan['destinations'][thread*dr+register]['slot'])]
+           for thread in range(128)]
+  lanes,regs=zip(*(divmod(holder,nr) for holder in holders))
+  linear(lanes)
+  linear(regs)
+  sections.append((lanes,regs))
+ return sections
+
+
 def _network_declaration(plan, require):
  import json
  from shuffle_network import plan_shuffle_network,network_resource_proxy
