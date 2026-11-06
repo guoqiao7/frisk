@@ -42,6 +42,43 @@ class BackendTests(unittest.TestCase):
   logical=emitter.v[denominator]['distributed']['logical']
   logical[0],logical[1]=logical[1],logical[0]
   self.assertFalse(emitter._normalization_pack_sites(operations,set()))
+ def test_guarded_reciprocal_preserves_exact_divide_and_packing_fallback(self):
+  data=json.loads(Path(INPUT).read_text())
+  original,baseline=backend.emit(data)
+  optimized,info=backend.emit(data,normalization_division='guarded-row-reciprocal')
+  proof,=info['normalization_reciprocal']
+  pairs=baseline['normalization_pack_pairs']
+  self.assertEqual((proof['row_denominators'],proof['pairs']),(2,pairs))
+  self.assertEqual(optimized.count('rcp.rn.f64'),2)
+  self.assertEqual(optimized.count('mul.rn.f64'),pairs*2)
+  self.assertEqual(optimized.count('div.rn.f32'),pairs*2)
+  original_divides=[line for line in original.split(r'\0A') if line.startswith(('div.rn.f32','cvt.rn.f16x2'))]
+  fallback=optimized.split('exact_normalize_fallback:',1)[1].split('exact_normalize_merge:',1)[0]
+  self.assertEqual([line for line in fallback.split(r'\0A') if line],original_divides)
+  self.assertLess(optimized.index('exact_normalize_merge:'),optimized.rindex('wgmma.fence.sync.aligned'))
+  self.assertEqual(original.count('wgmma.wait_group'),optimized.count('wgmma.wait_group'))
+ def test_guarded_reciprocal_requires_checked_ordered_row_sum(self):
+  data=json.loads(Path(INPUT).read_text())
+  emitter=backend.Emitter(data)
+  operations=emitter.data['operations']
+  ordinal,=emitter._normalization_pack_sites(operations,set())
+  self.assertEqual(emitter._normalization_reciprocal_sites(operations,{ordinal}),{ordinal})
+  for name,edit in (
+    ('sum',lambda operation: operation['attrs'].update(kind='max')),
+    ('broadcast',lambda operation: operation['attrs'].update(dimensions=[0])),
+    ('exp',lambda operation: operation.update(name='arith.addf'))):
+   bad=copy.deepcopy(operations)
+   if name=='sum':
+    target=next(o for o in bad if o['name']=='frisk.reduce_tensor' and o['attrs']['kind'].strip('"')=='sum')
+   elif name=='broadcast':
+    denominator=bad[ordinal]['operands'][1]
+    target=next(o for o in bad if o['results']==[denominator])
+   else:
+    target=next(o for o in bad if o['name']=='math.exp')
+   edit(target)
+   self.assertFalse(emitter._normalization_reciprocal_sites(bad,{ordinal}))
+  with self.assertRaisesRegex(ValueError,'packed FP16'):
+   backend.emit(data,normalization_pack=False,normalization_division='guarded-row-reciprocal')
  def test_exact_k_reuse_batches_qk_for_both_source_policies(self):
   data=json.loads(Path(INPUT).read_text())
   original,baseline=backend.emit(data,copy_batch=False)
