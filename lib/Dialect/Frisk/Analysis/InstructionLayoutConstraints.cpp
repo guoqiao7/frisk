@@ -45,11 +45,33 @@ LogicalResult prepareInstructionTuples(LayoutConstraintGraph &graph,
       return emitError(loc) << "unsupported instruction contract";
     auto &instruction = *constraint.instruction;
     instruction.tuples.clear();
-    for (auto id : constraint.vars)
-      if (graph.getVariable(id).candidates.size() > 4)
-        return emitError(loc) << "unknown proof: instruction proof budget exceeded: candidate domain is too large";
+    constexpr unsigned completeProofBudget = 256;
+    bool expandedEndpoint = false;
     SmallVector<Attribute> encodings(constraint.vars.size());
+    SmallVector<SmallVector<Attribute>> baseDomains(constraint.vars.size());
     SmallVector<SmallVector<Attribute>> domains(constraint.vars.size());
+    for (auto [role, id] : llvm::enumerate(constraint.vars)) {
+      const auto &var = graph.getVariable(id);
+      SmallVector<const LayoutConstraint *> requirements;
+      if (var.candidates.size() > 4) {
+        expandedEndpoint = true;
+        for (const auto &requirement : graph.getConstraints())
+          if (requirement.strength == ConstraintStrength::Hard &&
+              requirement.vars.size() == 1 && requirement.vars.front() == id &&
+              (requirement.kind == ConstraintKind::RequireEncoding ||
+               requirement.kind == ConstraintKind::RootStorageContract))
+            requirements.push_back(&requirement);
+      }
+      for (const auto &candidate : var.candidates) {
+        bool incompatible = llvm::any_of(requirements, [&](const auto *requirement) {
+          if (requirement->kind == ConstraintKind::RequireEncoding)
+            return candidate.value != requirement->requiredEncoding;
+          return proveUnaryLayoutConstraint(graph, *requirement, candidate.value).status ==
+                 ProofStatus::Disproven;
+        });
+        if (!incompatible) baseDomains[role].push_back(candidate.value);
+      }
+    }
     DenseMap<LayoutVarID, Attribute> chosen;
     std::optional<InstructionContractBuildResult> firstFailure;
     bool sawUnknown = false;
@@ -58,7 +80,7 @@ LogicalResult prepareInstructionTuples(LayoutConstraintGraph &graph,
     std::function<void(unsigned)> visit = [&](unsigned role) {
       if (exhausted) return;
       if (role == (mma ? 4u : constraint.vars.size())) {
-        if (completeAttempts == 256) { exhausted = true; return; }
+        if (completeAttempts == completeProofBudget) { exhausted = true; return; }
         ++completeAttempts;
         ++graph.getCandidatePreparationStatistics().instructionCombinations;
         auto result = [&] {
@@ -117,6 +139,46 @@ LogicalResult prepareInstructionTuples(LayoutConstraintGraph &graph,
         if (exhausted) break;
       }
     };
+    // Only widened endpoint domains require a preflight product bound. Count
+    // distinct variable assignments after intersecting repeated roles. The
+    // geometry binding is already chosen for MMA and has cardinality one.
+    auto visitBounded = [&] {
+      if (!expandedEndpoint) {
+        visit(0);
+        return;
+      }
+      constexpr unsigned roleCount = 4;
+      SmallVector<LayoutVarID> seen;
+      SmallVector<size_t> counts;
+      for (unsigned role = 0; role < roleCount; ++role) {
+        LayoutVarID id = constraint.vars[role];
+        if (llvm::is_contained(seen, id)) continue;
+        seen.push_back(id);
+        size_t count = 0;
+        for (Attribute candidate : domains[role]) {
+          if (Attribute prior = chosen.lookup(id); prior && prior != candidate)
+            continue;
+          bool matches = true;
+          for (unsigned other = role + 1; other < roleCount; ++other)
+            if (constraint.vars[other] == id && !llvm::is_contained(domains[other], candidate)) {
+              matches = false;
+              break;
+            }
+          count += matches;
+        }
+        if (!count) return; // No possible complete assignment.
+        counts.push_back(count);
+      }
+      size_t product = 1, remaining = completeProofBudget - completeAttempts;
+      for (size_t count : counts) {
+        if (product > remaining / count) {
+          exhausted = true;
+          return;
+        }
+        product *= count;
+      }
+      visit(0);
+    };
     // Rejected alternatives are not user errors. Report one joint failure if
     // there is no supported tuple, with pure-proof details for explicit plans.
     {
@@ -124,24 +186,23 @@ LogicalResult prepareInstructionTuples(LayoutConstraintGraph &graph,
                                      [](Diagnostic &) { return success(); });
       if (!mma) {
         for (unsigned role = 0; role < 4; ++role)
-          for (const auto &c : graph.getVariable(constraint.vars[role]).candidates)
-            domains[role].push_back(c.value);
-        visit(0);
-      } else for (const auto &geometry : graph.getVariable(constraint.vars[4]).candidates) {
-        encodings[4] = geometry.value;
-        chosen[constraint.vars[4]] = geometry.value;
+          domains[role] = baseDomains[role];
+        visitBounded();
+      } else for (Attribute geometry : baseDomains[4]) {
+        encodings[4] = geometry;
+        chosen[constraint.vars[4]] = geometry;
         for (unsigned role = 0; role < 4; ++role) {
           domains[role].clear();
           const auto &var = graph.getVariable(constraint.vars[role]);
-          for (const auto &candidate : var.candidates) {
+          for (Attribute candidate : baseDomains[role]) {
             if (var.kind == LayoutKind::Distributed) {
               ++graph.getCandidatePreparationStatistics().instructionFragmentPrechecks;
-              auto proof = target.precheckInstructionRole(graph,constraint,role,candidate.value,geometry.value);
+              auto proof = target.precheckInstructionRole(graph,constraint,role,candidate,geometry);
               if (trace) trace->recordEvent([&] {
                 return llvm::json::Object{{"event","instruction-fragment-precheck"},
                     {"constraint",constraint.id},{"operand",role},
-                    {"geometry",LayoutTrace::candidateID(geometry.value)},
-                    {"candidate",LayoutTrace::candidateID(candidate.value)},
+                    {"geometry",LayoutTrace::candidateID(geometry)},
+                    {"candidate",LayoutTrace::candidateID(candidate)},
                     {"status",proof.status == ProofStatus::Proven ? "proven" :
                               proof.status == ProofStatus::Disproven ? "disproven" : "unknown"},
                     {"reason",proof.reason}};
@@ -152,17 +213,20 @@ LogicalResult prepareInstructionTuples(LayoutConstraintGraph &graph,
                 continue;
               }
             }
-            domains[role].push_back(candidate.value);
+            domains[role].push_back(candidate);
           }
         }
-        visit(0);
+        visitBounded();
         chosen.erase(constraint.vars[4]);
         if (exhausted) break;
       }
     }
     if (exhausted) {
       instruction.tuples.clear();
-      return emitError(loc) << "mma-joint-contract: unknown proof: complete tuple proof budget exceeded (256 attempts); partial table discarded";
+      return emitError(loc)
+          << (mma ? "mma-joint-contract" : "copy-joint-contract")
+          << ": unknown proof: complete tuple proof budget exceeded ("
+          << completeProofBudget << " attempts); partial table discarded";
     }
     if (instruction.tuples.empty()) {
       auto diagnostic = emitError(instruction.source ? instruction.source->getLoc() : loc);
