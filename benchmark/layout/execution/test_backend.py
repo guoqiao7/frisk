@@ -42,6 +42,20 @@ class BackendTests(unittest.TestCase):
   logical=emitter.v[denominator]['distributed']['logical']
   logical[0],logical[1]=logical[1],logical[0]
   self.assertFalse(emitter._normalization_pack_sites(operations,set()))
+ def test_exact_k_reuse_batches_qk_for_both_source_policies(self):
+  data=json.loads(Path(INPUT).read_text())
+  original,baseline=backend.emit(data,copy_batch=False)
+  unbatched,info=backend.emit(data,copy_batch=False,shared_policy='reuse-k')
+  batched,other=backend.emit(data,copy_batch=True,shared_policy='reuse-k')
+  self.assertEqual((unbatched,info),(batched,other))
+  self.assertLess(info['static_shared_bytes'],baseline['static_shared_bytes'])
+  proof=info['attention_schedule']
+  q,k,v=(proof['roots'][role] for role in ('q','k','v'))
+  self.assertEqual((k['offset'],k['bytes']),(v['offset'],v['bytes']))
+  self.assertLess(k['reader_operation'],v['copy_operation'])
+  self.assertLess(v['copy_operation'],v['reader_operation'])
+  self.assertEqual(proof['cta_barriers'],{'publish_qk':1,'before_v_overwrite':1,'publish_v':1})
+  self.assertEqual(unbatched.count('wgmma.wait_group'),original.count('wgmma.wait_group'))
  def test_full_coordinate_maps_include_replica_unit_and_atomic_refusal(self):
   for table in ([i for i in range(128)],[i^16 for i in range(128)],[i&63 for i in range(128)],[0]):
    base,bits=backend.linear(table)

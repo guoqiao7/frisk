@@ -159,6 +159,12 @@ def attention_publication(roles, allocation, batches, *, reuse_k):
     """Verify actual Q/K/V allocation and the intended publication boundaries."""
     allocated = {row['root_id']: row for row in allocation['allocations']}
     q, k, v = (roles[role]['copy_operation'] for role in ('q', 'k', 'v'))
+    qk = roles['k']['reader_operation']
+    pv = roles['v']['reader_operation']
+    if (len({events['root'] for events in roles.values()}) != 3
+            or roles['q']['reader_operation'] != qk
+            or not (q + 1 == k and k + 1 == qk < v and v + 1 == pv)):
+        raise ValueError('expected ordered Q/K publication, QK, V publication and PV')
     if [batch['operations'] for batch in batches] != [[q, k]]:
         raise ValueError('late V requires precisely one Q/K publication batch')
     barriers = allocation.get('reuse_barriers', [])
@@ -167,6 +173,9 @@ def attention_publication(roles, allocation, batches, *, reuse_k):
     proof = {}
     for role, events in roles.items():
         entry = allocated[events['root']]
+        lifetime = [events['copy_operation'], events['reader_operation']]
+        if reuse_k and entry.get('lifetime') != lifetime:
+            raise ValueError('Shared allocation lifetime differs from checked Attention events')
         proof[role] = dict(events, offset=entry['offset'], bytes=entry['bytes'])
     q, k, v = (proof[role] for role in ('q', 'k', 'v'))
 
@@ -217,7 +226,9 @@ def verify_attention_publication(proof, code_by_operation):
         if issued or pending or not drained or mma[-1] != wait:
             raise ValueError('late V requires fully drained WGMMA groups')
         drains[role] = drained
-    return dict(proof, wgmma_wait_group_0=drains)
+    return dict(proof, wgmma_wait_group_0=drains,
+                cta_barriers=dict(publish_qk=1, before_v_overwrite=v_barriers-1, publish_v=1),
+                proxy_fences=dict(publish_qk=1, publish_v=1))
 
 
 def synchronous_copy_batches(operations, values, allocation):

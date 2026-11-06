@@ -98,13 +98,28 @@ class ScheduleTest(unittest.TestCase):
         mma = ['wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 out, a, b, c;',
                'wgmma.commit_group.sync.aligned;', 'wgmma.wait_group.sync.aligned 0;']
         code = {0: [store], 1: [store, *publish], 2: mma, 7: [publish[0], store, *publish], 8: mma}
-        self.assertEqual(verify_attention_publication(proof, code)['wgmma_wait_group_0'], {'qk': 1, 'pv': 1})
+        checked = verify_attention_publication(proof, code)
+        self.assertEqual(checked['wgmma_wait_group_0'], {'qk': 1, 'pv': 1})
+        self.assertEqual(checked['cta_barriers'], {'publish_qk': 1, 'before_v_overwrite': 1, 'publish_v': 1})
+        self.assertEqual(checked['proxy_fences'], {'publish_qk': 1, 'publish_v': 1})
         with self.assertRaisesRegex(ValueError, 'fully drained'):
             verify_attention_publication(proof, code | {2: mma[:-1]})
         with self.assertRaisesRegex(ValueError, 'publication differs'):
             verify_attention_publication(proof, code | {7: [store, *publish]})
+        with self.assertRaisesRegex(ValueError, 'publication differs'):
+            verify_attention_publication(proof, code | {7: [publish[0], store, publish[0]]})
         with self.assertRaisesRegex(ValueError, 'unexpected CTA barrier'):
             attention_publication(roles, dict(allocations=roots, reuse_barriers=[]),
+                                  [{'operations': [0, 1]}], reuse_k=True)
+        wrong_order = copy.deepcopy(roles)
+        wrong_order['v']['reader_operation'] = wrong_order['v']['copy_operation']
+        with self.assertRaisesRegex(ValueError, 'expected ordered'):
+            attention_publication(wrong_order, dict(allocations=roots, reuse_barriers=barriers),
+                                  [{'operations': [0, 1]}], reuse_k=True)
+        wrong_lifetime = copy.deepcopy(roots)
+        wrong_lifetime[1]['lifetime'][1] = roles['v']['copy_operation']
+        with self.assertRaisesRegex(ValueError, 'lifetime differs'):
+            attention_publication(roles, dict(allocations=wrong_lifetime, reuse_barriers=barriers),
                                   [{'operations': [0, 1]}], reuse_k=True)
 
     def test_exact_reuse_rejects_unequal_live_or_misaligned_intervals(self):

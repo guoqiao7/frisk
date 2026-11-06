@@ -35,8 +35,10 @@ class Emitter:
    raise ValueError('execution trace must be enabled explicitly')
   if type(copy_batch) is not bool:
    raise ValueError('copy batching must be enabled explicitly')
-  if shared_policy in ('late','reuse-k') and (not copy_batch or store_policy!='direct'):
-   raise ValueError('late V scheduling requires batched Copy16 and direct output')
+  if shared_policy in ('late','reuse-k') and store_policy!='direct':
+   raise ValueError('late V scheduling requires direct output')
+  if shared_policy=='late' and not copy_batch:
+   raise ValueError('disjoint late V scheduling requires batched Copy16')
   if copy_owner_policy not in ('execution', 'gf2'):
    raise ValueError('unknown Copy16 ownership policy')
   self.copy_owner_policy=copy_owner_policy
@@ -945,7 +947,8 @@ class Emitter:
                                     lifetimes=lifetimes, epilogue_bytes=epilogue_bytes, reuse_after=reuse_after)
   reuse_barriers=set(allocation.get('reuse_barriers',[]))
   batches=[]
-  if self.copy_batch:
+  # Exact K reuse owns Q/K publication even for an originally unbatched slot.
+  if self.copy_batch or self.shared_policy=='reuse-k':
    from execution_schedule import synchronous_copy_batches
    batches=synchronous_copy_batches(operations,self.v,allocation)
    if not batches:raise ValueError('copy batching requires adjacent disjoint synchronous Copy16 operations')
