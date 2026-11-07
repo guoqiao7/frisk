@@ -29,8 +29,12 @@ def checked_geometry(spec, *, kv_width=TILE):
     batch, heads, length, dim = (spec[k] for k in ('B', 'H', 'N', 'D'))
     if (dim, spec['q_block'], spec['kv_block']) != (64, TILE, TILE) or not TILE <= length <= 1025:
         raise ValueError('checked tiled Attention requires 64 <= N <= 1025, D64 and Q64/KV64 carriers')
-    if type(kv_width) is not int or kv_width not in (TILE, TILE * 2) or length < kv_width:
+    if type(kv_width) is not int or kv_width not in (32, TILE, TILE * 2, TILE * 4) or length < kv_width:
         raise ValueError('execution KV width requires a complete checked KV64 or KV128 group')
+    if kv_width == 32 and length % TILE:
+        raise ValueError('compact KV32 requires complete KV64 pairs')
+    if kv_width == 256 and length != 256:
+        raise ValueError('KV256 is checked for one complete cached score tile')
     full, remainder = divmod(length, TILE)
     tiles = full + bool(remainder)
     grid = batch * heads * tiles
@@ -190,14 +194,19 @@ def _row_fibers():
 
 class _TiledAttention(Emitter):
     def __init__(self, spec, *, tile_packet, copy_owner_policy, kv_width=TILE,
-                 retain_tail_scores=False, vector_store=False):
+                 retain_tail_scores=False, vector_store=False, narrow_tail=False,
+                 simplify_tail_copy=False, factored_copy=False):
         super().__init__({'values': [], 'operations': []}, copy_owner_policy=copy_owner_policy)
-        if type(retain_tail_scores) is not bool or type(vector_store) is not bool:
+        if any(type(flag) is not bool for flag in
+               (retain_tail_scores, vector_store, narrow_tail, simplify_tail_copy, factored_copy)):
             raise ValueError('checked Attention strategies require boolean flags')
         self.geometry = checked_geometry(spec, kv_width=kv_width)
         self.length = spec['N']
         self.kv_width = kv_width
         self.vector_store = vector_store
+        self.narrow_tail = narrow_tail
+        self.simplify_tail_copy = simplify_tail_copy
+        self.factored_copy = factored_copy
         self.group_tiles = kv_width // TILE
         self.group_count, residual = divmod(self.geometry['full_kv_tiles'], self.group_tiles)
         self.residual_row = self.group_count * kv_width if residual else None
@@ -273,26 +282,43 @@ class _TiledAttention(Emitter):
         row = self._value('add.u32', tile_row, local)
         return self._value('setp.lt.u32', row, self.length, kind='pred')
 
-    def _copy(self, root, tile_row, shared_offset, *, guard, prefix=TILE):
+    def _copy(self, root, tile_row, shared_offset, *, guard, prefix=TILE, storage_rows=TILE):
+        if self.factored_copy:
+            from attention_copy_schedule import emit_factored_copy
+
+            if emit_factored_copy(self, root, tile_row, shared_offset, guard=guard,
+                                  prefix=prefix, storage_rows=storage_rows):
+                return
         tile = self._tile_pointer(root, tile_row, TILE * 2)
         shared = self._value('add.u32', self.smem_base, shared_offset)
+        if type(storage_rows) is not int or storage_rows not in (8, 16, 32, TILE) or storage_rows < prefix:
+            raise ValueError('copy publication must cover the checked valid prefix')
         for group in self.copy_plans[prefix].groups:
+            if min(group.rows) >= storage_rows:
+                continue
+            group_guard = guard
+            if self.simplify_tail_copy and prefix < TILE and group.active_mask == _ALL_THREADS:
+                group_guard = False
             dst_offset = self.map(group.destination_offsets)
             dst = self._value('add.u32', shared, dst_offset)
             vector = [self.tmp('b32') for _ in range(4)]
             names = '{' + ', '.join(vector) + '}'
-            if guard:
+            if group_guard:
                 for reg in vector:
                     self.emit(f'mov.b32 {reg}, 0;')
             if group.active_mask:
                 src_offset = self._value('cvt.u64.u32', self.map(group.source_offsets), kind='b64')
                 src = self._value('add.u64', tile, src_offset, kind='b64')
-                pred = self._row_predicate(tile_row, group.rows) if guard else None
+                pred = self._row_predicate(tile_row, group.rows) if group_guard else None
                 qualifier = f'@{pred} ' if pred else ''
                 self.emit(f'{qualifier}ld.global.v4.b32 {names}, [{src}];')
-            elif not guard:
+            elif not group_guard:
                 raise ValueError('inactive copy requires checked zero publication')
-            self.emit(f'st.shared.v4.b32 [{dst}], {names};')
+            store_guard = ''
+            if max(group.rows) >= storage_rows:
+                active = self._value('setp.lt.u32', self.map(group.rows), storage_rows, kind='pred')
+                store_guard = f'@{active} '
+            self.emit(f'{store_guard}st.shared.v4.b32 [{dst}], {names};')
 
     def _publish(self):
         self.emit('bar.sync 0;')
@@ -301,13 +327,21 @@ class _TiledAttention(Emitter):
     def _scores(self, tile_row, *, prefix, copy_v=False):
         # The prior QK/PV group has drained before any physical root overwrite.
         self.emit('bar.sync 0;')
-        self._copy(self.roots[1], tile_row, self.mma_tiles.k_offset, guard=prefix != TILE, prefix=prefix)
+        from attention_tile_mma import score_width_for_prefix
+
+        width = score_width_for_prefix(prefix) if self.narrow_tail and prefix < TILE else TILE
+        self._copy(self.roots[1], tile_row, self.mma_tiles.k_offset, guard=prefix != TILE,
+                   prefix=prefix, storage_rows=width)
         if copy_v:
             self._copy(self.roots[2], tile_row, self.mma_tiles.v_offset, guard=prefix != TILE, prefix=prefix)
         self._publish()
-        scores = [self._value('mov.f32', _FP_ZERO, kind='f32') for _ in range(FRAGMENT_SLOTS)]
-        self.mma_tiles.emit_qk(self.emit, self.tmp, self.smem_base, scores)
-        return [self._value('mul.rn.f32', reg, '0f3e000000', kind='f32') for reg in scores]
+        scores = [self._value('mov.f32', _FP_ZERO, kind='f32') for _ in range(width // 2)]
+        if width < TILE:
+            self.mma_tiles.emit_qk_prefix(self.emit, self.tmp, self.smem_base, scores, prefix)
+        else:
+            self.mma_tiles.emit_qk(self.emit, self.tmp, self.smem_base, scores)
+        scaled = [self._value('mul.rn.f32', reg, '0f3e000000', kind='f32') for reg in scores]
+        return scaled + [self.zero] * (FRAGMENT_SLOTS - len(scaled))
 
     def _wide_scores(self, tile_row):
         # A full KV128 is two adjacent, independently proved K64 copies.
@@ -556,16 +590,31 @@ class _TiledAttention(Emitter):
             groups = groups[::2]
             accum = ['{' + low + ', ' + high + '}' for low, high in zip(accum[::2], accum[1::2], strict=True)]
         opcode = 'st.global.v2.b32' if self.vector_store else 'st.global.b32'
+        output_predicates = {}
         for group, reg in zip(groups, accum, strict=True):
             offset = self._value('cvt.u64.u32', self.map(group.destination_offsets), kind='b64')
             addr = self._value('add.u64', root, offset, kind='b64')
-            pred = self._row_predicate(self.query_row, group.rows) if self.geometry['final_rows'] else None
+            pred = None
+            if self.geometry['final_rows']:
+                key = tuple(group.rows)
+                if not self.simplify_tail_copy or key not in output_predicates:
+                    output_predicates[key] = self._row_predicate(self.query_row, group.rows)
+                pred = output_predicates[key]
             qualifier = f'@{pred} ' if pred else ''
             self.emit(f'{qualifier}{opcode} [{addr}], {reg};')
 
     def run(self):
-        self._copy(self.roots[0], self.query_row, self.mma_tiles.q_offset,
-                   guard=bool(self.geometry['final_rows']))
+        if self.simplify_tail_copy and self.tail_prefix:
+            complete = self._value('setp.le.u32', self.query_row, self.length - TILE, kind='pred')
+            self.emit(f'@{complete} bra.uni query_copy_complete;')
+            self._copy(self.roots[0], self.query_row, self.mma_tiles.q_offset, guard=True)
+            self.emit('bra.uni query_copy_done;')
+            self.emit('query_copy_complete:')
+            self._copy(self.roots[0], self.query_row, self.mma_tiles.q_offset, guard=False)
+            self.emit('query_copy_done:')
+        else:
+            self._copy(self.roots[0], self.query_row, self.mma_tiles.q_offset,
+                       guard=bool(self.geometry['final_rows']))
         maxima = self._max_pass([self._value('mov.f32', _NEG_INF, kind='f32') for _ in self.rows])
         self._write_output(self._value_pass(maxima, self._sum_pass(maxima)))
         text = render_inline_execution(self.decl, self.code)
@@ -576,7 +625,8 @@ class _TiledAttention(Emitter):
                     execution_kv_width=self.kv_width,
                     score_gf2_columns=list(self.mma_tiles.score_fragment_columns),
                     retain_tail_score_slots=list(self.score_prefix.held_slots) if self.score_prefix else [],
-                    vector_store=self.vector_store,
+                    vector_store=self.vector_store, narrow_tail=self.narrow_tail,
+                    simplify_tail_copy=self.simplify_tail_copy, factored_copy=self.factored_copy,
                     shared_v_reuse='upper-k64-after-wait0' if self.group_tiles == 2 else 'disjoint',
                     copy_owner_policy=self.copy_owner_policy,
                     copy_lane_bit_order=self.copy_plans[TILE].lane_bit_order,
@@ -596,7 +646,53 @@ class _TiledAttention(Emitter):
 
 
 def emit_tiled_attention(spec, *, tile_packet, copy_owner_policy='gf2', kv_width=TILE,
-                         retain_tail_scores=False, vector_store=False):
+                         retain_tail_scores=False, vector_store=False, narrow_tail=False,
+                         simplify_tail_copy=False, retain_all_scores=False, factored_copy=False,
+                         bulk_value_publish=False, retain_residual_scores=False,
+                         streaming_bulk_values=False):
+    if type(kv_width) is not int or any(type(flag) is not bool for flag in
+            (retain_all_scores, retain_tail_scores, vector_store, narrow_tail, simplify_tail_copy,
+             factored_copy, bulk_value_publish, retain_residual_scores, streaming_bulk_values)):
+        raise ValueError('Attention requires an integer KV width and boolean strategy flags')
+    if retain_all_scores:
+        from attention_single_score import emit_single_score_attention
+        from attention_single_score_bulk import emit_single_score_bulk_attention
+
+        if retain_tail_scores or narrow_tail or simplify_tail_copy or retain_residual_scores or streaming_bulk_values:
+            raise ValueError('full score retention has no tail-copy strategy')
+        if kv_width != spec['N']:
+            raise ValueError('full score retention requires one complete native key tile')
+        implementation = emit_single_score_bulk_attention if bulk_value_publish else emit_single_score_attention
+        return implementation(spec, tile_packet=tile_packet, vector_store=vector_store,
+                              copy_owner_policy=copy_owner_policy, factored_copy=factored_copy)
+    if bulk_value_publish:
+        raise ValueError('bulk value publication requires a complete retained score tile')
+    if streaming_bulk_values:
+        from attention_streaming_bulk import emit_streaming_bulk_attention
+
+        if kv_width != 128 or not retain_tail_scores:
+            raise ValueError('streaming bulk values require the checked KV128 schedule')
+        return emit_streaming_bulk_attention(spec, tile_packet=tile_packet, vector_store=vector_store,
+            copy_owner_policy=copy_owner_policy, retain_residual_scores=retain_residual_scores,
+            factored_copy=factored_copy, narrow_tail=narrow_tail, simplify_tail_copy=simplify_tail_copy)
+    if retain_residual_scores:
+        from attention_residual_score import emit_residual_score_attention
+
+        if kv_width != 128 or not retain_tail_scores or narrow_tail:
+            raise ValueError('residual score retention requires the full KV128 remainder')
+        return emit_residual_score_attention(spec, tile_packet=tile_packet, vector_store=vector_store,
+            copy_owner_policy=copy_owner_policy, factored_copy=factored_copy,
+            simplify_tail_copy=simplify_tail_copy)
+    if kv_width == 32:
+        from attention_narrow import emit_narrow_attention
+
+        if retain_tail_scores or narrow_tail or simplify_tail_copy:
+            raise ValueError('compact KV32 admits aligned complete KV64 pairs')
+        return emit_narrow_attention(spec, tile_packet=tile_packet, vector_store=vector_store,
+                                     copy_owner_policy=copy_owner_policy, factored_copy=factored_copy)
+    if kv_width not in (64, 128):
+        raise ValueError('streaming Attention requires KV32, KV64 or KV128')
     return _TiledAttention(spec, tile_packet=tile_packet, copy_owner_policy=copy_owner_policy,
                            kv_width=kv_width, retain_tail_scores=retain_tail_scores,
-                           vector_store=vector_store).run()
+                           vector_store=vector_store, narrow_tail=narrow_tail,
+                           simplify_tail_copy=simplify_tail_copy, factored_copy=factored_copy).run()

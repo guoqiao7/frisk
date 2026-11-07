@@ -100,15 +100,26 @@ def main():
     parser.add_argument('--batch', type=int, default=2)
     parser.add_argument('--heads', type=int, default=8)
     parser.add_argument('--length', type=int, action='append')
-    parser.add_argument('--kv-width', type=int, choices=(64, 128), default=64)
+    parser.add_argument('--kv-width', type=int, choices=(32, 64, 128, 256), default=64)
     parser.add_argument('--retain-tail-scores', action='store_true')
     parser.add_argument('--vector-store', action='store_true')
+    parser.add_argument('--retain-all-scores', action='store_true')
+    parser.add_argument('--narrow-tail', action='store_true')
+    parser.add_argument('--simplify-tail-copy', action='store_true')
+    parser.add_argument('--factored-copy', action='store_true')
+    parser.add_argument('--bulk-value-publish', action='store_true')
+    parser.add_argument('--retain-residual-scores', action='store_true')
+    parser.add_argument('--streaming-bulk-values', action='store_true')
     args = parser.parse_args()
     lengths = args.length or (512, 513)
     if len(set(lengths)) != len(lengths):
         parser.error('duplicate sequence length')
     strategy = dict(kv_width=args.kv_width, retain_tail_scores=args.retain_tail_scores,
-                    vector_store=args.vector_store)
+                    vector_store=args.vector_store, retain_all_scores=args.retain_all_scores,
+                    narrow_tail=args.narrow_tail, simplify_tail_copy=args.simplify_tail_copy,
+                    factored_copy=args.factored_copy, bulk_value_publish=args.bulk_value_publish,
+                    retain_residual_scores=args.retain_residual_scores,
+                    streaming_bulk_values=args.streaming_bulk_values)
     for length in lengths:
         checked_geometry(dict(B=args.batch, H=args.heads, N=length, D=64, q_block=64, kv_block=64),
                          kv_width=args.kv_width)
@@ -135,7 +146,8 @@ def main():
                    selected=str(selected), selected_sha256=_sha(selected),
                    execution=str(packet_path), execution_sha256=_sha(packet_path))
     sources = {name: _sha(SOURCE / name) for name in
-               ('access_plan.py', 'attention_score_reuse.py', 'attention_tile_mma.py', 'backend.py', 'build_tiled_attention.py',
+               ('access_plan.py', 'attention_copy_schedule.py', 'attention_streaming_bulk.py', 'attention_residual_score.py', 'attention_narrow.py',
+                'attention_single_score_bulk.py', 'attention_single_score.py', 'attention_score_reuse.py', 'attention_tile_mma.py', 'backend.py', 'build_tiled_attention.py',
                 'native_static_support.py', 'tiled_attention.py', 'valid_domain.py')}
     commit = subprocess.check_output(['git', '-C', str(SOURCE), 'rev-parse', 'HEAD'], text=True).strip()
     _write(out / 'registration.json', dict(source_commit=commit, sources=sources, tool_hashes=tools,
