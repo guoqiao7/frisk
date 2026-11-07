@@ -12,7 +12,7 @@ from time import perf_counter_ns
 
 from async_host import physical_abi
 from resource_prediction import compiler_exact_resources
-from tiled_attention import emit_tiled_attention
+from tiled_attention import checked_geometry, emit_tiled_attention
 
 
 PTXAS_SHA256 = 'c960a4f238b17d5c5d3c01ad2bbc1ebd2c5aecc459cb4d223bff10b45f9b8fca'
@@ -47,15 +47,19 @@ def _toolchain():
     return triton, hashes
 
 
-def _build_case(triton, out, batch, heads, length, packet):
-    from triton.backends.compiler import GPUTarget
-
+def _build_case(triton, out, batch, heads, length, packet, **strategy):
     case = f'attention-b{batch}-h{heads}-n{length}-d64'
     spec = dict(B=batch, H=heads, N=length, D=64, q_block=64, kv_block=64)
     dest = out / case
-    dest.mkdir()
+    return build_native_image(triton, dest, case, spec, packet, **strategy)
+
+
+def build_native_image(triton, dest, case, spec, packet, **strategy):
+    from triton.backends.compiler import GPUTarget
+
+    dest.mkdir(parents=True)
     start = perf_counter_ns()
-    ttgir, proof = emit_tiled_attention(spec, tile_packet=packet)
+    ttgir, proof = emit_tiled_attention(spec, tile_packet=packet, **strategy)
     emission_ns = perf_counter_ns() - start
     input_path = dest / 'kernel.ttgir'
     input_path.write_text(ttgir)
@@ -95,7 +99,19 @@ def main():
     parser.add_argument('--frisk-opt', required=True, type=Path)
     parser.add_argument('--batch', type=int, default=2)
     parser.add_argument('--heads', type=int, default=8)
+    parser.add_argument('--length', type=int, action='append')
+    parser.add_argument('--kv-width', type=int, choices=(64, 128), default=64)
+    parser.add_argument('--retain-tail-scores', action='store_true')
+    parser.add_argument('--vector-store', action='store_true')
     args = parser.parse_args()
+    lengths = args.length or (512, 513)
+    if len(set(lengths)) != len(lengths):
+        parser.error('duplicate sequence length')
+    strategy = dict(kv_width=args.kv_width, retain_tail_scores=args.retain_tail_scores,
+                    vector_store=args.vector_store)
+    for length in lengths:
+        checked_geometry(dict(B=args.batch, H=args.heads, N=length, D=64, q_block=64, kv_block=64),
+                         kv_width=args.kv_width)
     if os.environ.get('CUDA_VISIBLE_DEVICES') != '':
         raise ValueError('native build must run CPU-only with CUDA_VISIBLE_DEVICES empty')
     out = args.output.resolve()
@@ -119,15 +135,16 @@ def main():
                    selected=str(selected), selected_sha256=_sha(selected),
                    execution=str(packet_path), execution_sha256=_sha(packet_path))
     sources = {name: _sha(SOURCE / name) for name in
-               ('access_plan.py', 'attention_tile_mma.py', 'backend.py', 'build_tiled_attention.py',
+               ('access_plan.py', 'attention_score_reuse.py', 'attention_tile_mma.py', 'backend.py', 'build_tiled_attention.py',
                 'native_static_support.py', 'tiled_attention.py', 'valid_domain.py')}
     commit = subprocess.check_output(['git', '-C', str(SOURCE), 'rev-parse', 'HEAD'], text=True).strip()
     _write(out / 'registration.json', dict(source_commit=commit, sources=sources, tool_hashes=tools,
-        target=TARGET, options=OPTIONS, B=args.batch, H=args.heads, N=[512, 513], D=64,
+        target=TARGET, options=OPTIONS, B=args.batch, H=args.heads, N=lengths, D=64, strategy=strategy,
         slots_per_shape=1, compiler_invocations_per_shape=1, tile_witness=witness,
         numeric='global max, fixed ordered f32 sum/div, RN f16 P before ascending K16 PV'))
     with ThreadPoolExecutor(2) as pool:
-        futures = [pool.submit(_build_case, triton, out, args.batch, args.heads, n, packet) for n in (512, 513)]
+        futures = [pool.submit(_build_case, triton, out, args.batch, args.heads, n, packet, **strategy)
+                   for n in lengths]
         rows = [task.result() for task in futures]
     if sources != {name: _sha(SOURCE / name) for name in sources}:
         raise ValueError('checked Attention source changed during compilation')

@@ -6,6 +6,7 @@ import hashlib
 from attention_tile_mma import (FRAGMENT_SLOTS, ROOT_BYTES, SHARED_ALIGNMENT, THREADS,
                                 TILE, build_d64_wgmma_tiles, fragment_coordinate,
                                 shared_offsets_64x64)
+from attention_score_reuse import prove_score_prefix
 from backend import Emitter, render_inline_execution, splat_f32_bits
 from native_static_support import check_static_shared
 from reduction_plan import verified_warp_reduction_trees
@@ -20,14 +21,16 @@ _SHAPE = (TILE, TILE)
 _ALL_THREADS = (1 << THREADS) - 1
 
 
-def checked_geometry(spec):
+def checked_geometry(spec, *, kv_width=TILE):
     """Admit compact BHSD buffers and bind one exact query-tile/grid mapping."""
     if (type(spec) is not dict or set(spec) != {'B', 'H', 'N', 'D', 'q_block', 'kv_block'}
             or any(type(n) is not int or n <= 0 for n in spec.values())):
         raise ValueError('expected the exact tiled BHSD specification')
     batch, heads, length, dim = (spec[k] for k in ('B', 'H', 'N', 'D'))
-    if (dim, spec['q_block'], spec['kv_block']) != (64, TILE, TILE) or length not in (512, 513):
-        raise ValueError('first checked tiled Attention supports N=512/513, D=64, Q64/KV64')
+    if (dim, spec['q_block'], spec['kv_block']) != (64, TILE, TILE) or not TILE <= length <= 1025:
+        raise ValueError('checked tiled Attention requires 64 <= N <= 1025, D64 and Q64/KV64 carriers')
+    if type(kv_width) is not int or kv_width not in (TILE, TILE * 2) or length < kv_width:
+        raise ValueError('execution KV width requires a complete checked KV64 or KV128 group')
     full, remainder = divmod(length, TILE)
     tiles = full + bool(remainder)
     grid = batch * heads * tiles
@@ -186,11 +189,19 @@ def _row_fibers():
 
 
 class _TiledAttention(Emitter):
-    def __init__(self, spec, *, tile_packet, copy_owner_policy):
+    def __init__(self, spec, *, tile_packet, copy_owner_policy, kv_width=TILE,
+                 retain_tail_scores=False, vector_store=False):
         super().__init__({'values': [], 'operations': []}, copy_owner_policy=copy_owner_policy)
-        self.geometry = checked_geometry(spec)
+        if type(retain_tail_scores) is not bool or type(vector_store) is not bool:
+            raise ValueError('checked Attention strategies require boolean flags')
+        self.geometry = checked_geometry(spec, kv_width=kv_width)
         self.length = spec['N']
-        self.mma_tiles = build_d64_wgmma_tiles()
+        self.kv_width = kv_width
+        self.vector_store = vector_store
+        self.group_tiles = kv_width // TILE
+        self.group_count, residual = divmod(self.geometry['full_kv_tiles'], self.group_tiles)
+        self.residual_row = self.group_count * kv_width if residual else None
+        self.mma_tiles = build_d64_wgmma_tiles(kv_tile=kv_width)
         self.rows, self.row_index, self.columns = _row_fibers()
         self.copy_plans = {}
         self.store_plans = {}
@@ -211,6 +222,21 @@ class _TiledAttention(Emitter):
             for a, b in zip(full, tail, strict=True):
                 if (a.rows, a.source_offsets, a.destination_offsets) != (b.rows, b.source_offsets, b.destination_offsets):
                     raise ValueError('boundary copy changed the physical ownership assignment')
+        self.tail_prefix = self.geometry['final_rows']
+        self.tail_row = self.length - self.tail_prefix
+        self.score_prefix = None
+        self.retained_tail = None
+        if retain_tail_scores and self.tail_prefix:
+            # Verify the predicate implemented by _guards against the image of
+            # the native GF(2) score map restricted to the actual key prefix.
+            self.score_prefix = prove_score_prefix(self.mma_tiles.fragment_columns, self.tail_prefix)
+            for column, mask in zip(self.columns, self.score_prefix.holder_masks, strict=True):
+                expected = sum(1 << tid for tid in range(THREADS)
+                               if column + 2 * (tid & 3) < self.tail_prefix)
+                if mask != expected:
+                    raise ValueError('retained score domain differs from the emitted key predicate')
+        if kv_width == 2 * TILE and self.mma_tiles.v_offset != self.mma_tiles.k_offset + ROOT_BYTES:
+            raise ValueError('KV128 requires V to alias the second K64 root')
         self.smem_base = self.tmp('b32')
         self.decl.extend(('.reg .u32 tid;',
                           f'.shared .align {SHARED_ALIGNMENT} .b8 frisk_shared[{self.mma_tiles.shared_bytes}];'))
@@ -283,6 +309,32 @@ class _TiledAttention(Emitter):
         self.mma_tiles.emit_qk(self.emit, self.tmp, self.smem_base, scores)
         return [self._value('mul.rn.f32', reg, '0f3e000000', kind='f32') for reg in scores]
 
+    def _wide_scores(self, tile_row):
+        # A full KV128 is two adjacent, independently proved K64 copies.
+        self.emit('bar.sync 0;')
+        second_row = self._value('add.u32', tile_row, TILE)
+        k = self.mma_tiles.k_offset
+        self._copy(self.roots[1], tile_row, k, guard=False)
+        self._copy(self.roots[1], second_row, k + ROOT_BYTES, guard=False)
+        self._publish()
+        scores = [self._value('mov.f32', _FP_ZERO, kind='f32') for _ in range(2 * FRAGMENT_SLOTS)]
+        self.mma_tiles.emit_qk(self.emit, self.tmp, self.smem_base, scores)
+        scaled = [self._value('mul.rn.f32', reg, '0f3e000000', kind='f32') for reg in scores]
+        return second_row, scaled[:FRAGMENT_SLOTS], scaled[FRAGMENT_SLOTS:]
+
+    def _publish_values(self, row, prefix):
+        # The native producer and previous PV consumer have completed wait0.
+        self.emit('bar.sync 0;')
+        self._copy(self.roots[2], row, self.mma_tiles.v_offset, guard=prefix != TILE, prefix=prefix)
+        self._publish()
+
+    def _tail_scores(self, *, copy_v=False):
+        if self.retained_tail is None:
+            return self._scores(self.tail_row, prefix=self.tail_prefix, copy_v=copy_v)
+        if copy_v:
+            self._publish_values(self.tail_row, self.tail_prefix)
+        return self.retained_tail
+
     def _guards(self, prefix):
         if prefix == TILE:
             return (True,) * FRAGMENT_SLOTS
@@ -328,15 +380,15 @@ class _TiledAttention(Emitter):
     def _full_loop(self, label, body):
         tile = self._value('mov.u32', 0)
         self.emit(f'{label}_loop:')
-        row = self._value('shl.b32', tile, 6)
-        body(tile, row)
+        first = tile if self.group_tiles == 1 else self._value('shl.b32', tile, 1)
+        row = self._value('shl.b32', first, 6)
+        body(first, row)
         self.emit(f'add.u32 {tile}, {tile}, 1;')
-        again = self._value('setp.lt.u32', tile, self.geometry['full_kv_tiles'], kind='pred')
+        again = self._value('setp.lt.u32', tile, self.group_count, kind='pred')
         self.emit(f'@{again} bra.uni {label}_loop;')
 
     def _max_pass(self, maxima):
-        def update(row, prefix):
-            scores = self._scores(row, prefix=prefix)
+        def update(scores, prefix):
             guards = self._guards(prefix)
             masked = [(_NEG_INF if p is False else score if p is True else
                        self._value('selp.b32', score, _NEG_INF, p))
@@ -344,9 +396,23 @@ class _TiledAttention(Emitter):
             for dst, slots in zip(maxima, self.rows, strict=True):
                 value, _ = self._tree('max.f32', [masked[i] for i in slots])
                 self.emit(f'max.f32 {dst}, {dst}, {value};')
-        self._full_loop('row_max', lambda _, row: update(row, TILE))
-        if self.geometry['final_rows']:
-            update(self.length - self.geometry['final_rows'], self.geometry['final_rows'])
+        def full(_, row):
+            if self.group_tiles == 1:
+                update(self._scores(row, prefix=TILE), TILE)
+            else:
+                _, left, right = self._wide_scores(row)
+                update(left, TILE)
+                update(right, TILE)
+
+        self._full_loop('row_max', full)
+        if self.residual_row is not None:
+            update(self._scores(self.residual_row, prefix=TILE), TILE)
+        if self.tail_prefix:
+            scores = self._tail_scores()
+            if self.score_prefix is not None:
+                self.retained_tail = tuple(score if mask else self.zero for score, mask in
+                                           zip(scores, self.score_prefix.holder_masks, strict=True))
+            update(scores, self.tail_prefix)
         return [self._warp_reduce('max.f32', maximum, ordered=False) for maximum in maxima]
 
     def _exponents(self, scores, maxima, guards):
@@ -367,50 +433,79 @@ class _TiledAttention(Emitter):
                  for _ in range(levels)]
         add = 'add.rn.f32'
 
-        def local(row, prefix):
-            scores = self._scores(row, prefix=prefix)
+        def local(scores, prefix):
             valid = self._guards(prefix)
             exps = self._exponents(scores, maxima, valid)
             return [self._tree(add, [exps[i] for i in slots], [valid[i] for i in slots])
                     for slots in self.rows]
 
         def update(tile, row):
-            values = [value for value, _ in local(row, TILE)]
-            assignments = []
-            for level, registers in enumerate(stack):
-                assignments.append(values)
+            first_level = self.group_tiles - 1
+            if first_level == 0:
+                values = [value for value, _ in local(self._scores(row, prefix=TILE), TILE)]
+            else:
+                _, left, right = self._wide_scores(row)
+                values = [self._value(add, a, b, kind='f32') for (a, _), (b, _) in
+                          zip(local(left, TILE), local(right, TILE), strict=True)]
+            assignments = {}
+            for level in range(first_level, len(stack)):
+                registers = stack[level]
+                assignments[level] = values
                 if level + 1 < len(stack):
                     bit = self._value('and.b32', tile, 1 << level)
                     store = self._value('setp.eq.u32', bit, 0, kind='pred')
                     self.emit(f'@{store} bra.uni row_sum_store_{level};')
                     values = [self._value(add, previous, value, kind='f32')
                               for previous, value in zip(registers, values, strict=True)]
-            for level in reversed(range(levels)):
+            for level in reversed(range(first_level, levels)):
                 self.emit(f'row_sum_store_{level}:')
                 for out, value in zip(stack[level], assignments[level], strict=True):
                     self.emit(f'mov.f32 {out}, {value};')
                 self.emit('bra.uni row_sum_tile_done;')
             self.emit('row_sum_tile_done:')
 
-        # Within a lane this is the same balanced tree over the ordered
-        # register leaves as the whole-row contract. The 8 full tiles are
-        # one complete subtree. The next power-of-two half contains only
-        # the tail's valid leaves, so its absent descendants pass through.
+        def join(left, right):
+            parents = []
+            for first, (second, active) in zip(left, right, strict=True):
+                if active is True:
+                    result = self._value(add, first, second, kind='f32')
+                elif active is False:
+                    result = first
+                else:
+                    result = self._value('mov.f32', first, kind='f32')
+                    self.emit(f'@{active} {add} {result}, {first}, {second};')
+                parents.append((result, True))
+            return parents
+
+        # Each loop iteration consumes an aligned dyadic subtree of one or
+        # two original 64-key tiles. Join the remaining complete subtrees
+        # right-to-left, with the odd full tile and guarded prefix at the end.
         self._full_loop('row_sum', update)
-        totals = list(stack[-1])
-        if self.geometry['final_rows']:
-            prefix = self.geometry['final_rows']
-            for reg, (value, guard) in zip(totals, local(self.length - prefix, prefix), strict=True):
-                if guard is not False:
-                    qualifier = '' if guard is True else f'@{guard} '
-                    self.emit(f'{qualifier}{add} {reg}, {reg}, {value};')
+        covered = self.group_count * self.group_tiles
+        if self.residual_row is None and not (covered & (covered - 1)):
+            totals = list(stack[-1])
+            if self.tail_prefix:
+                for reg, (value, guard) in zip(totals, local(self._tail_scores(), self.tail_prefix), strict=True):
+                    if guard is not False:
+                        qualifier = '' if guard is True else f'@{guard} '
+                        self.emit(f'{qualifier}{add} {reg}, {reg}, {value};')
+        else:
+            suffix = None
+            if self.residual_row is not None:
+                suffix = local(self._scores(self.residual_row, prefix=TILE), TILE)
+            if self.tail_prefix:
+                tail = local(self._tail_scores(), self.tail_prefix)
+                suffix = tail if suffix is None else join([reg for reg, _ in suffix], tail)
+            for level, complete in enumerate(stack):
+                if covered & (1 << level):
+                    suffix = ([(reg, True) for reg in complete] if suffix is None else join(complete, suffix))
+            totals = [value for value, _ in suffix]
         return [self._warp_reduce(add, value, ordered=True) for value in totals]
 
     def _value_pass(self, maxima, sums):
         accum = [self._value('mov.f32', _FP_ZERO, kind='f32') for _ in range(FRAGMENT_SLOTS)]
 
-        def update(row, prefix):
-            scores = self._scores(row, prefix=prefix, copy_v=True)
+        def update(scores, prefix):
             guards = self._guards(prefix)
             exps = self._exponents(scores, maxima, guards)
             probabilities = []
@@ -428,19 +523,45 @@ class _TiledAttention(Emitter):
                       zip(probabilities[::2], probabilities[1::2], strict=True)]
             self.mma_tiles.emit_pv(self.emit, self.tmp, self.smem_base, packed, accum)
 
-        self._full_loop('row_value', lambda _, row: update(row, TILE))
-        if self.geometry['final_rows']:
-            update(self.length - self.geometry['final_rows'], self.geometry['final_rows'])
+        def full(_, row):
+            if self.group_tiles == 1:
+                update(self._scores(row, prefix=TILE, copy_v=True), TILE)
+            else:
+                second_row, left, right = self._wide_scores(row)
+                # KV128 QK is complete. The high K root can now stage each V64
+                # in order, draining PV before the second overwrite.
+                self._publish_values(row, TILE)
+                update(left, TILE)
+                self._publish_values(second_row, TILE)
+                update(right, TILE)
+
+        self._full_loop('row_value', full)
+        if self.residual_row is not None:
+            update(self._scores(self.residual_row, prefix=TILE, copy_v=True), TILE)
+        if self.tail_prefix:
+            update(self._tail_scores(copy_v=True), self.tail_prefix)
         return accum
 
     def _write_output(self, accum):
         root = self._tile_pointer(self.roots[3], self.query_row, TILE * 4)
-        for group, reg in zip(self.store_plans[TILE].groups, accum, strict=True):
+        groups = self.store_plans[TILE].groups
+        if self.vector_store:
+            for plan in self.store_plans.values():
+                for low, high in zip(plan.groups[::2], plan.groups[1::2], strict=True):
+                    if (low.rows != high.rows or low.active_mask != high.active_mask
+                            or low.owner_mask != high.owner_mask
+                            or any(a % 8 or b != a + 4 for a, b in
+                                   zip(low.destination_offsets, high.destination_offsets, strict=True))):
+                        raise ValueError('vector store requires adjacent, jointly active output owners')
+            groups = groups[::2]
+            accum = ['{' + low + ', ' + high + '}' for low, high in zip(accum[::2], accum[1::2], strict=True)]
+        opcode = 'st.global.v2.b32' if self.vector_store else 'st.global.b32'
+        for group, reg in zip(groups, accum, strict=True):
             offset = self._value('cvt.u64.u32', self.map(group.destination_offsets), kind='b64')
             addr = self._value('add.u64', root, offset, kind='b64')
             pred = self._row_predicate(self.query_row, group.rows) if self.geometry['final_rows'] else None
             qualifier = f'@{pred} ' if pred else ''
-            self.emit(f'{qualifier}st.global.b32 [{addr}], {reg};')
+            self.emit(f'{qualifier}{opcode} [{addr}], {reg};')
 
     def run(self):
         self._copy(self.roots[0], self.query_row, self.mma_tiles.q_offset,
@@ -452,6 +573,11 @@ class _TiledAttention(Emitter):
                     physical_shared_bytes=self.mma_tiles.shared_bytes,
                     qkv_root_offsets=[self.mma_tiles.q_offset, self.mma_tiles.k_offset, self.mma_tiles.v_offset],
                     fragment_gf2_columns=list(self.mma_tiles.fragment_columns),
+                    execution_kv_width=self.kv_width,
+                    score_gf2_columns=list(self.mma_tiles.score_fragment_columns),
+                    retain_tail_score_slots=list(self.score_prefix.held_slots) if self.score_prefix else [],
+                    vector_store=self.vector_store,
+                    shared_v_reuse='upper-k64-after-wait0' if self.group_tiles == 2 else 'disjoint',
                     copy_owner_policy=self.copy_owner_policy,
                     copy_lane_bit_order=self.copy_plans[TILE].lane_bit_order,
                     passes=['global-max', 'canonical-row-sum', 'normalized-fp16-pv'],
@@ -469,5 +595,8 @@ class _TiledAttention(Emitter):
         return text, info
 
 
-def emit_tiled_attention(spec, *, tile_packet, copy_owner_policy='gf2'):
-    return _TiledAttention(spec, tile_packet=tile_packet, copy_owner_policy=copy_owner_policy).run()
+def emit_tiled_attention(spec, *, tile_packet, copy_owner_policy='gf2', kv_width=TILE,
+                         retain_tail_scores=False, vector_store=False):
+    return _TiledAttention(spec, tile_packet=tile_packet, copy_owner_policy=copy_owner_policy,
+                           kv_width=kv_width, retain_tail_scores=retain_tail_scores,
+                           vector_store=vector_store).run()

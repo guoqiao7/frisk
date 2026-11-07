@@ -1,4 +1,4 @@
-"""Validate compact strict D64 Attention images at N512 and N513 on one H100."""
+"""Validate compact strict D64 Attention images on one H100."""
 
 import argparse
 import ctypes as ct
@@ -13,7 +13,8 @@ import sys
 import numpy as np
 
 from physical_resources import query_physical_resources
-from tail_attention_reference import BLOCK, ERROR, NAMES, check_output, geometry, inputs, references
+from tail_attention_reference import (BLOCK, ERROR, NAMES, check_neutral_extension, check_output,
+                                      geometry, inputs, neutral_prefix, references)
 
 
 H100S = frozenset({'GPU-7bafb1de-da7b-3bf6-e8cd-2369e0c92767',
@@ -30,6 +31,7 @@ PROTOCOL = dict(seed=14261107, fixtures=NAMES, offsets=OFFSETS, errors=ERROR,
                 oracle='FP64 stable softmax with FP16 P boundary and FP64 products',
                 guards='exact logical BHSD spans, disjoint inputs/output, change physical redzones',
                 scratch='nullptr', launch_types=('ordinary','CUDA graph'),
+                inventory='registered compact shapes; cross-check any present aligned base and its tails',
                 gpu_timing=False)
 
 
@@ -107,12 +109,17 @@ def load_manifest(path, case=None, *, allow_partial=False):
                              ptx_parameters=params))
     if not selected:
         raise ValueError('requested case is absent')
-    if case is None and not allow_partial:
+    # Preserve the original paired acceptance rule for legacy-only N512/513
+    # inventories. A registered singleton or expanded sweep is independently
+    # admissible and checks any neutral pairs actually present.
+    legacy_pair = {512, 513}
+    if (case is None and not allow_partial
+            and {row['spec']['N'] for row in selected} == legacy_pair):
         by_batch_heads = {}
         for row in selected:
             spec = row['spec']
             by_batch_heads.setdefault((spec['B'],spec['H']), set()).add(spec['N'])
-        if not any(b>1 and h>1 and ns=={512,513} for (b,h),ns in by_batch_heads.items()):
+        if not any(b>1 and h>1 and ns==legacy_pair for (b,h),ns in by_batch_heads.items()):
             raise ValueError('qualification requires a paired N512/N513 inventory with B,H both >1')
     return selected
 
@@ -339,16 +346,21 @@ def compare_neutral(cases, outputs):
         pairs.setdefault((spec['B'],spec['H']), {}).setdefault(spec['N'], []).append(name)
     checks = []
     for group in pairs.values():
-        for base in group.get(512,[]):
-            for tail in group.get(513,[]):
-                prefix = outputs[tail][..., :512, :]
-                if not np.array_equal(outputs[base].view(np.uint32), prefix.view(np.uint32)):
-                    raise ValueError(f'zero-weight KV extension changed old output bits for {base} and {tail}')
-                duplicate = outputs[tail][...,512,:]
-                if not np.array_equal(duplicate.view(np.uint32), prefix[...,0,:].view(np.uint32)):
-                    raise ValueError(f'last real query differs from its duplicated query 0 for {tail}')
-                checks.append(dict(base=base,tail=tail,status='bitwise',sha256=_hash_array(prefix),
-                                   duplicate_query_512_matches_0=True))
+        for n, tails in sorted(group.items()):
+            prefix = neutral_prefix(n)
+            if prefix == n:
+                continue
+            for base in group.get(prefix, ()):
+                for tail in tails:
+                    try:
+                        proof = check_neutral_extension(outputs[base], outputs[tail])
+                    except ValueError as error:
+                        raise ValueError(f'{error} for {base} and {tail}') from error
+                    receipt = dict(base=base, tail=tail, status='bitwise',
+                                   sha256=_hash_array(outputs[tail][..., :prefix, :]), **proof)
+                    if (prefix, n) == (512, 513):
+                        receipt['duplicate_query_512_matches_0'] = True
+                    checks.append(receipt)
     return checks
 
 
