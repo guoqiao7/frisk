@@ -123,6 +123,9 @@ def main():
                         help='explicit shape list for --layout-search')
     parser.add_argument('--kv-width', type=int, choices=(32, 64, 128, 256), default=64)
     parser.add_argument('--retain-tail-scores', action='store_true')
+    parser.add_argument('--k-stage-policy',
+                        choices=('late-v-control', 'resident-k', 'boundary-control', 'boundary-reuse'),
+                        help='use checked short residency or aligned max-to-sum K reuse')
     parser.add_argument('--vector-store', action='store_true')
     parser.add_argument('--retain-all-scores', action='store_true')
     parser.add_argument('--narrow-tail', action='store_true')
@@ -138,7 +141,7 @@ def main():
         manual = (args.kv_width != 64 or args.retain_tail_scores or args.vector_store
                   or args.retain_all_scores or args.narrow_tail or args.simplify_tail_copy
                   or args.factored_copy or args.bulk_value_publish or args.retain_residual_scores
-                  or args.streaming_bulk_values)
+                  or args.streaming_bulk_values or args.k_stage_policy is not None)
         if manual or (args.shape and args.length):
             parser.error('layout search owns the execution strategy and accepts one shape list')
         specs = args.shape or [(args.batch, args.heads, n) for n in (args.length or (512, 513))]
@@ -154,7 +157,7 @@ def main():
                     narrow_tail=args.narrow_tail, simplify_tail_copy=args.simplify_tail_copy,
                     factored_copy=args.factored_copy, bulk_value_publish=args.bulk_value_publish,
                     retain_residual_scores=args.retain_residual_scores,
-                    streaming_bulk_values=args.streaming_bulk_values)
+                    streaming_bulk_values=args.streaming_bulk_values, k_stage_policy=args.k_stage_policy)
     for length in lengths:
         checked_geometry(dict(B=args.batch, H=args.heads, N=length, D=64, q_block=64, kv_block=64),
                          kv_width=args.kv_width)
@@ -181,7 +184,7 @@ def main():
                    selected=str(selected), selected_sha256=_sha(selected),
                    execution=str(packet_path), execution_sha256=_sha(packet_path))
     sources = {name: _sha(SOURCE / name) for name in
-               ('access_plan.py', 'attention_copy_schedule.py', 'attention_streaming_bulk.py', 'attention_residual_score.py', 'attention_narrow.py',
+               ('access_plan.py', 'attention_copy_schedule.py', 'attention_k_stage_reuse.py', 'attention_k_boundary_reuse.py', 'attention_streaming_bulk.py', 'attention_residual_score.py', 'attention_narrow.py',
                 'attention_single_score_bulk.py', 'attention_single_score.py', 'attention_score_reuse.py', 'attention_tile_mma.py', 'backend.py', 'build_tiled_attention.py',
                 'native_static_support.py', 'tiled_attention.py', 'valid_domain.py')}
     commit = subprocess.check_output(['git', '-C', str(SOURCE), 'rev-parse', 'HEAD'], text=True).strip()

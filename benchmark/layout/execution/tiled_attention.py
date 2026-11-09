@@ -373,11 +373,17 @@ class _TiledAttention(Emitter):
         if copy_v:
             self._copy(self.roots[2], tile_row, self.mma_tiles.v_offset, guard=prefix != TILE, prefix=prefix)
         self._publish()
+        return self._compute_scores(prefix, self.mma_tiles)
+
+    def _compute_scores(self, prefix, mma_tiles):
+        from attention_tile_mma import score_width_for_prefix
+
+        width = score_width_for_prefix(prefix) if self.narrow_tail and prefix < TILE else TILE
         scores = [self._value('mov.f32', _FP_ZERO, kind='f32') for _ in range(width // 2)]
         if width < TILE:
-            self.mma_tiles.emit_qk_prefix(self.emit, self.tmp, self.smem_base, scores, prefix)
+            mma_tiles.emit_qk_prefix(self.emit, self.tmp, self.smem_base, scores, prefix)
         else:
-            self.mma_tiles.emit_qk(self.emit, self.tmp, self.smem_base, scores)
+            mma_tiles.emit_qk(self.emit, self.tmp, self.smem_base, scores)
         scaled = [self._value('mul.rn.f32', reg, '0f3e000000', kind='f32') for reg in scores]
         return scaled + [self.zero] * (FRAGMENT_SLOTS - len(scaled))
 
@@ -449,14 +455,18 @@ class _TiledAttention(Emitter):
             value = self._value(opcode, left, right, kind='f32')
         return value
 
-    def _full_loop(self, label, body):
+    def _full_loop(self, label, body, *, iterations=None):
+        if iterations is None:
+            iterations = self.group_count
+        if type(iterations) is not int or not 1 <= iterations <= self.group_count:
+            raise ValueError('invalid full KV loop bound')
         tile = self._value('mov.u32', 0)
         self.emit(f'{label}_loop:')
         first = tile if self.group_tiles == 1 else self._value('shl.b32', tile, 1)
         row = self._value('shl.b32', first, 6)
         body(first, row)
         self.emit(f'add.u32 {tile}, {tile}, 1;')
-        again = self._value('setp.lt.u32', tile, self.group_count, kind='pred')
+        again = self._value('setp.lt.u32', tile, iterations, kind='pred')
         self.emit(f'@{again} bra.uni {label}_loop;')
 
     def _max_pass(self, maxima):
@@ -498,6 +508,9 @@ class _TiledAttention(Emitter):
             exp = self._value('ex2.approx.f32', base2, kind='f32')
             result.append(exp if guard is True else self._value('selp.b32', exp, self.zero, guard))
         return result
+
+    def _sum_boundary_scores(self):
+        return None
 
     def _sum_pass(self, maxima):
         levels = self.geometry['full_kv_tiles'].bit_length()
@@ -552,7 +565,20 @@ class _TiledAttention(Emitter):
         # Each loop iteration consumes an aligned dyadic subtree of one or
         # two original 64-key tiles. Join the remaining complete subtrees
         # right-to-left, with the odd full tile and guarded prefix at the end.
-        self._full_loop('row_sum', update)
+        boundary = self._sum_boundary_scores()
+        if boundary is None:
+            self._full_loop('row_sum', update)
+        else:
+            scores, plan = boundary
+            values = [value for value, _ in local(scores, TILE)]
+            self._full_loop('row_sum', update, iterations=plan['last_group'])
+            # The precomputed last leaf is still the right operand at every
+            # carry. Keep the same canonical merge and suffix order.
+            for level in plan['carry_levels']:
+                values = [self._value(add, previous, value, kind='f32')
+                          for previous, value in zip(stack[level], values, strict=True)]
+            for out, value in zip(stack[plan['store_level']], values, strict=True):
+                self.emit(f'mov.f32 {out}, {value};')
         covered = self.group_count * self.group_tiles
         if self.residual_row is None and not (covered & (covered - 1)):
             totals = list(stack[-1])
@@ -574,6 +600,9 @@ class _TiledAttention(Emitter):
             totals = [value for value, _ in suffix]
         return [self._warp_reduce(add, value, ordered=True) for value in totals]
 
+    def _emit_pv(self, packed, accum, prefix):
+        self.mma_tiles.emit_pv(self.emit, self.tmp, self.smem_base, packed, accum)
+
     def _value_pass(self, maxima, sums):
         accum = [self._value('mov.f32', _FP_ZERO, kind='f32') for _ in range(FRAGMENT_SLOTS)]
 
@@ -593,7 +622,7 @@ class _TiledAttention(Emitter):
                     probabilities.append(probability)
             packed = [self._value('cvt.rn.f16x2.f32', high, low) for low, high in
                       zip(probabilities[::2], probabilities[1::2], strict=True)]
-            self.mma_tiles.emit_pv(self.emit, self.tmp, self.smem_base, packed, accum)
+            self._emit_pv(packed, accum, prefix)
 
         def full(_, row):
             if self.group_tiles == 1:
@@ -697,7 +726,7 @@ def emit_tiled_attention(spec, *, tile_packet, copy_owner_policy='gf2', kv_width
                          simplify_tail_copy=False, retain_all_scores=False, factored_copy=False,
                          bulk_value_publish=False, retain_residual_scores=False,
                          streaming_bulk_values=False, shared_swizzle=128,
-                         fragment_layout=NATIVE_FRAGMENT):
+                         fragment_layout=NATIVE_FRAGMENT, k_stage_policy=None):
     fragment = checked_fragment_layout(fragment_layout)
     if type(tile_packet) is not dict or _FRAGMENT_REQUEST in tile_packet:
         raise ValueError('checked Attention requires the original execution replay packet')
@@ -711,6 +740,24 @@ def emit_tiled_attention(spec, *, tile_packet, copy_owner_policy='gf2', kv_width
         raise ValueError('checked Attention Shared swizzle must be 64 or 128')
     if shared_swizzle == 64 and (kv_width != TILE or retain_all_scores):
         raise ValueError('SW64 requires the checked streaming KV64 schedule')
+    if k_stage_policy in ('boundary-control', 'boundary-reuse'):
+        from attention_k_boundary_reuse import emit_boundary_k_attention
+
+        if (kv_width != TILE or shared_swizzle != 128 or fragment.name != NATIVE_FRAGMENT
+                or retain_tail_scores or narrow_tail or simplify_tail_copy or retain_all_scores
+                or bulk_value_publish or retain_residual_scores or streaming_bulk_values):
+            raise ValueError('boundary K-stage policy requires native SW128 KV64 without tail options')
+        return emit_boundary_k_attention(spec, policy=k_stage_policy, tile_packet=tile_packet,
+            copy_owner_policy=copy_owner_policy, vector_store=vector_store, factored_copy=factored_copy)
+    if k_stage_policy is not None:
+        from attention_k_stage_reuse import emit_short_k_stage_attention
+
+        if (kv_width != TILE or shared_swizzle != 128 or fragment.name != NATIVE_FRAGMENT
+                or not retain_tail_scores or narrow_tail or simplify_tail_copy or retain_all_scores
+                or bulk_value_publish or retain_residual_scores or streaming_bulk_values):
+            raise ValueError('short K-stage policy requires native SW128 KV64 with retained tail scores')
+        return emit_short_k_stage_attention(spec, policy=k_stage_policy, tile_packet=tile_packet,
+            copy_owner_policy=copy_owner_policy, vector_store=vector_store, factored_copy=factored_copy)
     if retain_all_scores:
         from attention_single_score import emit_single_score_attention
         from attention_single_score_bulk import emit_single_score_bulk_attention
