@@ -60,8 +60,10 @@ def carriers(rows, cols):
     return dict(A=carrier(2), B=carrier(1))
 
 
-def source(rows, cols, producer, consumer):
-    '''Emit complete checked witnesses with one explicit cut on shared E.'''
+def source(rows, cols, producer, consumer, graph='dual-softmax'):
+    '''Emit a complete checked graph with one possible cut on its shared value.'''
+    if graph not in ('dual-softmax', 'softmax-column-rms', 'rms-sigmoid'):
+        raise ValueError(f'unsupported fusion graph {graph}')
     choices = carriers(rows, cols)
     src, dst = choices[producer], choices[consumer]
     tile = f'4x{rows}x{cols}xf32'
@@ -80,23 +82,8 @@ def source(rows, cols, producer, consumer):
     root_names = ('scores', 'unused0', 'unused1', 'output')
     args = ', '.join(f'%{name}:{m}' for name in root_names)
     roots = '\n'.join(f'    frisk.storage_contract %{name} {{layout=#global}} : {m}' for name in root_names)
-    return f'''{storage}
-#producer = {src.attribute()}
-#consumer = {dst.attribute()}
-#row = {dst.project(2).attribute()}
-#col = {dst.project(1).attribute()}
-module attributes {{frisk.target = "sm_90a"}} {{
-  "frisk.kernel"() <{{sym_name="dual_softmax", function_type=({','.join([m]*4)})->()}}> ({{
-  ^bb0({args}):
-{roots}
-    "frisk.parallel"() <{{ranges=array<i64:1>,threads=128:i64}}> ({{
-    ^bb0(%i:index):
-      %iv = frisk.layout_view %scores : {m} -> {m}
-      %in = frisk.tile_load %iv : {m} -> {p}
-      %temperature = arith.constant dense<0.25> : {p}
-      %scaled = arith.mulf %in, %temperature : {p}
-      %weights = math.exp %scaled : {p}
-{exchange}      %row_sum = frisk.reduce_tensor {weights} {{kind="sum",dim=2:i64}} : {c} -> {row}
+    if graph == 'dual-softmax':
+        consumers = f'''      %row_sum = frisk.reduce_tensor {weights} {{kind="sum",dim=2:i64}} : {c} -> {row}
       %row_empty = tensor.empty() : {c}
       %row_bcast = linalg.broadcast ins(%row_sum : {row}) outs(%row_empty : {c}) dimensions = [2]
       %row_p = arith.divf {weights}, %row_bcast : {c}
@@ -105,7 +92,67 @@ module attributes {{frisk.target = "sm_90a"}} {{
       %col_bcast = linalg.broadcast ins(%col_sum : {col}) outs(%col_empty : {c}) dimensions = [1]
       %col_p = arith.divf {weights}, %col_bcast : {c}
       %matches = arith.mulf %row_p, %col_p : {c}
-      %ov = frisk.layout_view %output : {m} -> {m}
+'''
+    elif graph == 'softmax-column-rms':
+        consumers = f'''      %row_sum = frisk.reduce_tensor {weights} {{kind="sum",dim=2:i64}} : {c} -> {row}
+      %row_empty = tensor.empty() : {c}
+      %row_bcast = linalg.broadcast ins(%row_sum : {row}) outs(%row_empty : {c}) dimensions = [2]
+      %row_p = arith.divf {weights}, %row_bcast : {c}
+      %sq = arith.mulf {weights}, {weights} : {c}
+      %col_sum = frisk.reduce_tensor %sq {{kind="sum",dim=1:i64}} : {c} -> {col}
+      %col_factor = arith.constant dense<{1.0/rows:.8e}> : {col}
+      %col_mean = arith.mulf %col_sum, %col_factor : {col}
+      %col_eps = arith.constant dense<1.000000e-05> : {col}
+      %col_regular = arith.addf %col_mean, %col_eps : {col}
+      %col_inv = math.rsqrt %col_regular : {col}
+      %col_empty = tensor.empty() : {c}
+      %col_bcast = linalg.broadcast ins(%col_inv : {col}) outs(%col_empty : {c}) dimensions = [1]
+      %matches = arith.mulf %row_p, %col_bcast : {c}
+'''
+    elif graph == 'rms-sigmoid':
+        consumers = f'''      %sq = arith.mulf {weights}, {weights} : {c}
+      %row_sum = frisk.reduce_tensor %sq {{kind="sum",dim=2:i64}} : {c} -> {row}
+      %row_factor = arith.constant dense<{1.0/cols:.8e}> : {row}
+      %row_mean = arith.mulf %row_sum, %row_factor : {row}
+      %row_eps = arith.constant dense<1.000000e-05> : {row}
+      %row_regular = arith.addf %row_mean, %row_eps : {row}
+      %row_inv = math.rsqrt %row_regular : {row}
+      %row_empty = tensor.empty() : {c}
+      %row_bcast = linalg.broadcast ins(%row_inv : {row}) outs(%row_empty : {c}) dimensions = [2]
+      %row_normalized = arith.mulf {weights}, %row_bcast : {c}
+      %col_sum = frisk.reduce_tensor {weights} {{kind="sum",dim=1:i64}} : {c} -> {col}
+      %col_neg_factor = arith.constant dense<{-1.0/rows:.8e}> : {col}
+      %col_neg_mean = arith.mulf %col_sum, %col_neg_factor : {col}
+      %col_exp = math.exp %col_neg_mean : {col}
+      %col_one = arith.constant dense<1.0> : {col}
+      %col_den = arith.addf %col_one, %col_exp : {col}
+      %col_gate = arith.divf %col_one, %col_den : {col}
+      %col_empty = tensor.empty() : {c}
+      %col_bcast = linalg.broadcast ins(%col_gate : {col}) outs(%col_empty : {c}) dimensions = [1]
+      %matches = arith.mulf %row_normalized, %col_bcast : {c}
+'''
+    exponent = f'      %weights = math.exp %scaled : {p}\n' if graph != 'rms-sigmoid' else ''
+    if not exponent:
+        weights = '%transported' if exchange else '%scaled'
+        exchange = exchange.replace('%weights', '%scaled')
+        consumers = consumers.replace('%weights', weights)
+    kernel = graph.replace('-', '_') if graph != 'dual-softmax' else 'dual_softmax'
+    return f'''{storage}
+#producer = {src.attribute()}
+#consumer = {dst.attribute()}
+#row = {dst.project(2).attribute()}
+#col = {dst.project(1).attribute()}
+module attributes {{frisk.target = "sm_90a"}} {{
+  "frisk.kernel"() <{{sym_name="{kernel}", function_type=({','.join([m]*4)})->()}}> ({{
+  ^bb0({args}):
+{roots}
+    "frisk.parallel"() <{{ranges=array<i64:1>,threads=128:i64}}> ({{
+    ^bb0(%i:index):
+      %iv = frisk.layout_view %scores : {m} -> {m}
+      %in = frisk.tile_load %iv : {m} -> {p}
+      %temperature = arith.constant dense<0.25> : {p}
+      %scaled = arith.mulf %in, %temperature : {p}
+{exponent}{exchange}{consumers}      %ov = frisk.layout_view %output : {m} -> {m}
       frisk.tile_store %matches, %ov : {c}, {m}
       frisk.end
     }}) : () -> ()

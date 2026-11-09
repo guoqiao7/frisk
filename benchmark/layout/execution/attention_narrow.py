@@ -68,15 +68,8 @@ class _NarrowAttention(_TiledAttention):
     def _copy32(self, root, row, shared_offset):
         if self.factored_copy:
             from attention_copy_schedule import emit_factored_copy
-            from valid_domain import dense_copy_execution, plan_guarded_copy_owners
-            from attention_tile_mma import shared_offsets_64x64
-
             if 32 not in self.copy_plans:
-                self.copy_plans[32] = plan_guarded_copy_owners(
-                    dense_copy_execution((TILE, TILE)), valid_shape=(32, TILE),
-                    source_row_stride_bytes=128, source_span_bytes=4096,
-                    destination_offsets=shared_offsets_64x64(), destination_span_bytes=ROOT_BYTES,
-                    owner_policy=self.copy_owner_policy)
+                self.copy_plans[32] = self._checked_copy_plan(32)
             if emit_factored_copy(self, root, row, shared_offset, guard=False, prefix=32, storage_rows=32):
                 return
         tile = self._tile_pointer(root, row, TILE * 2)

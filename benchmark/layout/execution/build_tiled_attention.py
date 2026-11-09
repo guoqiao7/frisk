@@ -1,5 +1,5 @@
 
-"""Build a fixed one-slot D64 aligned/tail qualification on the pinned SM90 path."""
+"""Build fixed or layout-searched checked D64 Attention on the pinned SM90 path."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -55,12 +55,21 @@ def _build_case(triton, out, batch, heads, length, packet, **strategy):
 
 
 def build_native_image(triton, dest, case, spec, packet, **strategy):
-    from triton.backends.compiler import GPUTarget
-
-    dest.mkdir(parents=True)
     start = perf_counter_ns()
     ttgir, proof = emit_tiled_attention(spec, tile_packet=packet, **strategy)
-    emission_ns = perf_counter_ns() - start
+    return compile_emitted_image(triton, dest, case, spec, ttgir, proof,
+                                 emission_ns=perf_counter_ns() - start)
+
+
+def compile_emitted_image(triton, dest, case, spec, ttgir, proof, *, emission_ns=0):
+    from triton.backends.compiler import GPUTarget
+
+    geometry = checked_geometry(spec, kv_width=proof['execution_kv_width'])
+    if any(proof.get(key) != value for key, value in geometry.items()):
+        raise ValueError('native image changed the checked Attention geometry')
+    if proof['ttgir_sha256'] != sha256(ttgir.encode()).hexdigest():
+        raise ValueError('checked TTGIR changed before native compilation')
+    dest.mkdir(parents=True)
     input_path = dest / 'kernel.ttgir'
     input_path.write_text(ttgir)
     proof_path = dest / 'proof.json'
@@ -93,6 +102,14 @@ def build_native_image(triton, dest, case, spec, packet, **strategy):
                 native_wall_ns=compile_ns)
 
 
+def parse_shape(value):
+    try:
+        batch, heads, length = map(int, value.split(','))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError('expected B,H,N') from error
+    return batch, heads, length
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', required=True, type=Path)
@@ -100,6 +117,10 @@ def main():
     parser.add_argument('--batch', type=int, default=2)
     parser.add_argument('--heads', type=int, default=8)
     parser.add_argument('--length', type=int, action='append')
+    parser.add_argument('--layout-search', choices=('J', 'LI', 'legacy', 'all'),
+                        help='use the checked whole-Attention K4 layout/schedule planner')
+    parser.add_argument('--shape', type=parse_shape, action='append', metavar='B,H,N',
+                        help='explicit shape list for --layout-search')
     parser.add_argument('--kv-width', type=int, choices=(32, 64, 128, 256), default=64)
     parser.add_argument('--retain-tail-scores', action='store_true')
     parser.add_argument('--vector-store', action='store_true')
@@ -111,6 +132,20 @@ def main():
     parser.add_argument('--retain-residual-scores', action='store_true')
     parser.add_argument('--streaming-bulk-values', action='store_true')
     args = parser.parse_args()
+    if args.layout_search:
+        from build_attention_layout_search import build_search
+
+        manual = (args.kv_width != 64 or args.retain_tail_scores or args.vector_store
+                  or args.retain_all_scores or args.narrow_tail or args.simplify_tail_copy
+                  or args.factored_copy or args.bulk_value_publish or args.retain_residual_scores
+                  or args.streaming_bulk_values)
+        if manual or (args.shape and args.length):
+            parser.error('layout search owns the execution strategy and accepts one shape list')
+        specs = args.shape or [(args.batch, args.heads, n) for n in (args.length or (512, 513))]
+        build_search(args.output, args.frisk_opt, specs, mode=args.layout_search)
+        return
+    if args.shape:
+        parser.error('--shape requires --layout-search')
     lengths = args.length or (512, 513)
     if len(set(lengths)) != len(lengths):
         parser.error('duplicate sequence length')

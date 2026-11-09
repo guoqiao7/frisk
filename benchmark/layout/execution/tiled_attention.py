@@ -3,6 +3,8 @@
 
 import hashlib
 
+from attention_copy_layout import (attention_copy_layout_evidence, derive_attention_copy_layouts,
+                                   native_copy_plan)
 from attention_tile_mma import (FRAGMENT_SLOTS, ROOT_BYTES, SHARED_ALIGNMENT, THREADS,
                                 TILE, build_d64_wgmma_tiles, fragment_coordinate,
                                 shared_offsets_64x64)
@@ -10,7 +12,7 @@ from attention_score_reuse import prove_score_prefix
 from backend import Emitter, render_inline_execution, splat_f32_bits
 from native_static_support import check_static_shared
 from reduction_plan import verified_warp_reduction_trees
-from valid_domain import dense_copy_execution, plan_guarded_copy_owners, plan_guarded_store
+from valid_domain import plan_guarded_store
 
 
 CONTRACT = 'frisk-sm90-strict-tiled-attention-v1'
@@ -78,7 +80,7 @@ def _checked_tile_layouts(packet):
         raise ValueError('expected the inferred D64 Attention tile graph')
     if any(op['name'] == 'frisk.convert_layout' for op in operations):
         raise ValueError('staged D64 Attention requires the inferred coherent fragment')
-    distribution = dense_copy_execution(_SHAPE)
+    distribution = None
     expected_copy = dict(version=1, path='vector', target='sm_90a', vector_bytes=16,
                          valid_shape=list(_SHAPE), guarded=0, issuer='execution-map',
                          completion='synchronous')
@@ -92,11 +94,17 @@ def _checked_tile_layouts(packet):
     copy_targets = []
     for op in copies:
         source, target = op['operands'][:2]
+        execution = op.get('execution')
         if (op['attrs'].get('frisk.copy_contract') != expected_copy
                 or op['attrs'].get('frisk.writer_policy') != 'first_owner'
-                or any(op['execution'].get(key) != distribution[key]
-                       for key in ('shape', 'topology', 'logical', 'first'))):
+                or type(execution) is not dict or execution.get('shape') != list(_SHAPE)
+                or execution.get('topology') != [TILE * TILE // THREADS, 32, 4, 1, 1]
+                or execution.get('replication', 1) != 1):
             raise ValueError('inferred Copy16 ownership differs from the staged layout')
+        if distribution is None:
+            distribution = execution
+        elif any(execution.get(key) != distribution.get(key) for key in ('logical', 'first')):
+            raise ValueError('staged Attention requires one tied Q/K/V Copy16 owner map')
         offsets(source, range(0, ROOT_BYTES, 2), alignment=16)
         offsets(target, shared_offsets_64x64(), alignment=SHARED_ALIGNMENT)
         copy_targets.append(target)
@@ -169,7 +177,7 @@ def _checked_tile_layouts(packet):
     if tuple(op['attrs'].get('frisk.mma_contract') for op in mmas) != expected:
         raise ValueError('inferred QK/PV descriptors differ from the staged WGMMA proof')
     offsets(stores[0]['operands'][1], range(0, TILE * TILE * 4, 4), alignment=16)
-    return copies[0]['execution'], values[pv['results'][0]]['distributed']
+    return distribution, values[pv['results'][0]]['distributed']
 
 
 def _row_fibers():
@@ -214,12 +222,9 @@ class _TiledAttention(Emitter):
         self.rows, self.row_index, self.columns = _row_fibers()
         self.copy_plans = {}
         self.store_plans = {}
-        distribution, output = _checked_tile_layouts(tile_packet)
+        self.copy_execution, output = _checked_tile_layouts(tile_packet)
         for rows in {TILE, self.geometry['final_rows']} - {0}:
-            self.copy_plans[rows] = plan_guarded_copy_owners(
-                distribution, valid_shape=(rows, TILE), source_row_stride_bytes=TILE * 2,
-                source_span_bytes=rows * TILE * 2, destination_offsets=shared_offsets_64x64(),
-                destination_span_bytes=ROOT_BYTES, owner_policy=copy_owner_policy)
+            self.copy_plans[rows] = self._checked_copy_plan(rows)
             self.store_plans[rows] = plan_guarded_store(
                 output, valid_shape=(rows, TILE), destination_row_stride_bytes=TILE * 4,
                 destination_span_bytes=rows * TILE * 4)
@@ -267,6 +272,9 @@ class _TiledAttention(Emitter):
             self.roots.append(self._value('add.u64', f'${i+1}', head_offset, kind='b64'))
         self.zero = self._value('mov.b32', 0)
         self.tail_guards = {}
+
+    def _checked_copy_plan(self, rows):
+        return native_copy_plan(self.copy_execution, rows, owner_policy=self.copy_owner_policy)
 
     def _value(self, opcode, *args, kind='b32'):
         out = self.tmp(kind)
