@@ -8,11 +8,15 @@ import re
 from time import perf_counter_ns
 
 from attention_copy_layout import attention_copy_layout_evidence, derive_attention_copy_layouts
-from attention_tile_mma import TILE, score_width_for_prefix
+from attention_fragment_layout import NATIVE_FRAGMENT, ROW_LANE_REGISTER, checked_fragment_layout
+from attention_residency_cost import DRIVER_SHARED_PER_CTA, score
+from attention_tile_mma import TILE, score_width_for_prefix, shared_offsets_64x64
 from tiled_attention import checked_geometry, emit_tiled_attention
 
 
 K4 = 4
+PREVIEW_CAP = 32
+LAYOUT_CONTROL = 'kv64-factored'
 MODES = ('J', 'LI', 'legacy')
 CONTRACT_FIELDS = (
     'contract', 'grid', 'block', 'entry', 'alignment_bytes', 'head_bytes', 'root_spans',
@@ -117,7 +121,15 @@ def _emitted_work(text):
     return dict(counts)
 
 
-def _features(text, proof, copies):
+def _output_work(proof):
+    output = proof.get('output_store', {})
+    full = proof['q_tiles'] - bool(proof['final_rows'])
+    weighted = ((full, output.get(TILE)), (1, output.get(proof['final_rows'])))
+    return sum(count * (sum(row['global_sectors32']) / 16 + row['warp_issues'])
+               for count, row in weighted if row) / proof['q_tiles']
+
+
+def _features(text, proof, copies, query_copies):
     work = Counter(_emitted_work(text))
     full = copies[TILE]
     tail = copies.get(proof['final_rows'])
@@ -127,59 +139,82 @@ def _features(text, proof, copies):
     # charged here. The scope does not model dynamic memory overlap.
     read = sum(full['global_sectors32']) / 8 * work['copy_loads']
     publication = (16 + full['shared_excess_wavefronts'] / 4) * work['copy_stores']
+    # There is exactly one Q publication per CTA. Charge its actual
+    # Shared destination wavefronts when a logical row layout remaps Q.
+    query_full = query_copies[TILE]
+    publication += query_full['shared_excess_wavefronts'] - full['shared_excess_wavefronts']
     tail_issue = 0
     if tail and proof.get('narrow_tail'):
         load_warps = sum(group['load_warps'] for group in tail['groups'])
         ideal_warps = (proof['final_rows'] * 8 + 31) // 32
         tail_issue = max(0, load_warps - ideal_warps) + tail['shared_excess_wavefronts']
-    cache = max(proof.get('score_cache_slots', 0), proof.get('residual_score_cache_slots', 0),
-                len(proof.get('retain_tail_score_slots', ())))
     width = proof['execution_kv_width']
-    registers = 72 + max(cache, min(width, 128) // 2)
-    registers = (registers + 7) // 8 * 8
+    if proof.get('retain_all_scores'):
+        registers = 48 + proof['score_cache_slots'] + 12 * (not proof.get('value_publications') == 1)
+    else:
+        registers = {32: 60, 64: 72, 128: 80}[width] + width // 2
+        if proof.get('retain_residual_scores'):
+            # The residual score carrier survives statistics and overlaps the
+            # native fragment of subsequent complete groups.
+            registers += max(0, proof['residual_score_cache_slots'] - 12)
+        else:
+            retained = len(proof.get('retain_tail_score_slots', ()))
+            registers += (3 * retained // 4) if width == 64 else (retained // 2)
     shared = proof['static_shared_bytes']
-    ctas_per_sm = min(16, 65536 // (128 * registers), 228 * 1024 // (shared + 1024))
-    if not ctas_per_sm:
-        raise ValueError('static Attention plan exceeds an SM90 resource limit')
-    resident = proof['grid'][0] / 114 / ctas_per_sm
-    pressure = 1 + max(0, resident - 0.75) * 0.10
-    cost = pressure * (work['mma_n8_units'] / 2 + 2 * work['mma_issue'] + 4 * work['sync']
-                       + read / 8 + publication / 8 + tail_issue + work['scalar_special'] / 2
-                       + work['scalar_issue'] / 16)
-    return dict(tracked_dynamic_issue_upper_bound=dict(work), copy_full=full, copy_tail=tail,
-                estimated_registers=registers, estimated_ctas_per_sm=ctas_per_sm, tail_issue_penalty=tail_issue,
-                static_shared_bytes=shared, cost=cost)
+    work_score = (work['mma_n8_units'] / 2 + 2 * work['mma_issue'] + 4 * work['sync']
+                  + read / 8 + publication / 8 + tail_issue + work['scalar_special'] / 2
+                  + work['scalar_issue'] / 16 + _output_work(proof) / 4)
+    resources = score(work_score, registers=registers, shared_bytes=shared + DRIVER_SHARED_PER_CTA,
+                      grid=proof['grid'][0], threads=proof['block'][0])
+    return dict(tracked_dynamic_issue_upper_bound=dict(work), copy_full=full, copy_tail=tail, query_copy_full=query_full,
+                estimated_residency=resources, estimated_registers=registers,
+                estimated_ctas_per_sm=resources['ctas_per_sm'], tail_issue_penalty=tail_issue,
+                static_shared_bytes=shared, work=work_score, cost=resources['cost'])
 
 
 def select_attention(spec, tile_packet, *, problem_sha256):
-    """Score one checked prepared graph. LI locks a producer-local layout.
+    """Project a common checked graph archive into three paid K4 queues.
 
-    J and LI use the same emitted pair costs, the same physical contract and
-    the same K4 projection. Legacy uses the previous fixed-layout schedule
-    order. All three receive the common bounded preview archive.
+    LI picks its locally preferred layout for each legal schedule, then uses
+    the same whole-kernel score as J to pick a schedule. This lets LI retain
+    the latest wide schedules even if their Shared layout domain is narrower.
     """
     if not re.fullmatch('[0-9a-f]{64}', problem_sha256):
         raise ValueError('a checked prepared Attention source digest is required')
     geometry = checked_geometry(spec)
     start = perf_counter_ns()
     legacy_options, common_options = schedules(spec['N'])
-    layouts = derive_attention_copy_layouts(tile_packet)
-    owners = {name: 'execution' for name in layouts}
-    if 'coalesced' not in layouts or len(layouts) < 2 or 'legacy' in layouts:
-        raise ValueError('checked Attention archive needs named GF(2) layout alternatives')
-    layouts = dict(layouts, legacy=tile_packet)
-    owners['legacy'] = 'gf2'
+    owner_packets = derive_attention_copy_layouts(tile_packet)
+    coalesced = owner_packets['coalesced']
+    layouts = {
+        'coalesced': (coalesced, 128, NATIVE_FRAGMENT),
+        'warp-interleaved': (owner_packets['warp-interleaved'], 128, NATIVE_FRAGMENT),
+        'shared-sw64': (coalesced, 64, NATIVE_FRAGMENT),
+        'mma-row': (coalesced, 128, ROW_LANE_REGISTER),
+        'shared-sw64-mma-row': (coalesced, 64, ROW_LANE_REGISTER),
+        'legacy': (tile_packet, 128, NATIVE_FRAGMENT),
+    }
     tail_rows = geometry['final_rows']
-    copy_features = {}
-    for name, packet in layouts.items():
-        # The legacy GF(2) optimizer's exact ownership is materialized by
-        # the coalesced checked replay.
-        explicit = layouts['coalesced'] if name == 'legacy' else packet
-        evidence = {TILE: attention_copy_layout_evidence(explicit)}
-        if tail_rows:
-            evidence[tail_rows] = attention_copy_layout_evidence(explicit, valid_rows=tail_rows,
-                                      storage_rows=score_width_for_prefix(tail_rows))
-        copy_features[name] = evidence
+    copy_features, query_features = {}, {}
+    copy_cache = {}
+    for name, (packet, swizzle, fragment_name) in layouts.items():
+        explicit = coalesced if name == 'legacy' else packet
+        key = (id(explicit), swizzle)
+        if key not in copy_cache:
+            evidence = {TILE: attention_copy_layout_evidence(explicit, shared_swizzle=swizzle)}
+            if tail_rows:
+                evidence[tail_rows] = attention_copy_layout_evidence(explicit, valid_rows=tail_rows,
+                    storage_rows=score_width_for_prefix(tail_rows), shared_swizzle=swizzle)
+            copy_cache[key] = evidence
+        copy_features[name] = copy_cache[key]
+        if fragment_name == NATIVE_FRAGMENT:
+            query_features[name] = copy_cache[key]
+        else:
+            query_offsets = checked_fragment_layout(fragment_name).query_offsets(
+                shared_offsets_64x64(swizzle))
+            query_features[name] = {rows: attention_copy_layout_evidence(explicit, valid_rows=rows,
+                shared_swizzle=swizzle, destination_offsets=query_offsets)
+                for rows in copy_cache[key]}
 
     def local_copy_work(copy):
         groups = copy['groups']
@@ -187,22 +222,24 @@ def select_attention(spec, tile_packet, *, problem_sha256):
                 + sum(bool(g['initialized_vectors']) for g in groups)
                 + copy['shared_excess_wavefronts'] + 2 * (not copy['carry_free_translates']))
 
-    def local_key(name):
-        evidence = copy_features[name]
+    def local_key(name, proof):
+        evidence, query = copy_features[name], query_features[name]
         full_work = local_copy_work(evidence[TILE])
         tail_work = local_copy_work(evidence[tail_rows]) if tail_rows else 0
-        return (geometry['full_kv_tiles'] * full_work + tail_work, name)
+        qwork = local_copy_work(query[TILE])
+        return (geometry['full_kv_tiles'] * full_work + tail_work + qwork + _output_work(proof), name)
 
-    local_keys = {name: local_key(name) for name in layouts.keys() - {'legacy'}}
-    local_layout = min(local_keys, key=local_keys.__getitem__)
     candidates = {}
     attempts = []
     contract = None
-    for name, packet in layouts.items():
+    for name, (packet, swizzle, fragment_name) in layouts.items():
         plans = legacy_options if name == 'legacy' else common_options
         for schedule, flags in plans.items():
+            if swizzle == 64 and (flags['kv_width'] != TILE or flags.get('retain_all_scores')):
+                continue
             start_preview = perf_counter_ns()
-            tuning = dict(flags, copy_owner_policy=owners[name])
+            tuning = dict(flags, copy_owner_policy='gf2' if name == 'legacy' else 'execution',
+                          shared_swizzle=swizzle, fragment_layout=fragment_name)
             row = dict(layout=name, schedule=schedule, tuning=tuning)
             try:
                 checked_geometry(spec, kv_width=tuning['kv_width'])
@@ -211,7 +248,11 @@ def select_attention(spec, tile_packet, *, problem_sha256):
                 if contract is not None and current != contract:
                     raise RuntimeError('Attention layout or schedule changed the physical or arithmetic contract')
                 contract = current
-                features = _features(text, proof, copy_features[name])
+                if (proof.get('shared_swizzle', 128) != swizzle
+                        or proof.get('fragment_layout', NATIVE_FRAGMENT) != fragment_name):
+                    raise RuntimeError('emitted Attention layout differs from its paid axes')
+                features = _features(text, proof, copy_features[name], query_features[name])
+                features['local_layout_key'] = local_key(name, proof)
             except ValueError as error:
                 row.update(status='rejected', reason=str(error))
             else:
@@ -224,49 +265,59 @@ def select_attention(spec, tile_packet, *, problem_sha256):
     if anchor is None:
         raise ValueError('checked legacy KV64 anchor is missing')
 
-    def project(layout_names):
-        order = sorted((item for item in candidates.values() if item.layout in layout_names),
-                       key=lambda item: (item.features['cost'], item.schedule, item.layout))
-        if not order:
-            raise ValueError('checked layout projection has no legal schedule')
-        unique = {}
-        for item in order:
-            unique.setdefault(item.proof['ttgir_sha256'], item)
-        ranked = list(unique.values())
-        result = [ranked[0]]
-        # Reserve at most one paid slot for a matched layout intervention
-        # on the fixed winner's schedule. LI uses the identical projection
-        # and spends that slot on another schedule if its layout is pinned.
-        fixed = ranked[0]
-        alternate = next((p for p in ranked if p.layout != fixed.layout
-                          and p.schedule == fixed.schedule), None)
-        limit = K4 - (alternate is not None)
-        used_schedules = {fixed.schedule}
-        for item in ranked:
-            if len(result) == limit:
-                break
-            if item.schedule not in used_schedules:
-                result.append(item)
-                used_schedules.add(item.schedule)
-        for item in ranked:
-            if len(result) == limit:
-                break
-            if item is not alternate and all(item is not chosen for chosen in result):
-                result.append(item)
-        if alternate is not None:
-            result.append(alternate)
-        return (result + [fixed] * K4)[:K4]
+    if len(attempts) > PREVIEW_CAP:
+        raise ValueError('Attention exhausted the common static preview budget')
 
-    eligible = layouts.keys() - {'legacy'}
-    choices = {'J': project(eligible), 'LI': project({local_layout}),
+    def project(pool):
+        ranked = sorted(pool, key=lambda item: (item.features['cost'], item.schedule, item.layout))
+        if not ranked:
+            raise ValueError('checked layout projection has no legal schedule')
+        result = []
+        identities = set()
+
+        def add(item):
+            if item is not None and len(result) < K4 and item.proof['ttgir_sha256'] not in identities:
+                result.append(item)
+                identities.add(item.proof['ttgir_sha256'])
+
+        add(ranked[0])
+        # Always pay for the KV64 occupancy control, and when this mode can
+        # change a layout, include each isolated intervention on that same
+        # KV64 control. No slot borrows another mode's paid budget.
+        control = next((p for p in ranked if p.layout == 'coalesced'
+                        and p.schedule == LAYOUT_CONTROL), None)
+        if control is None:
+            control = next((p for p in ranked if p.schedule == LAYOUT_CONTROL), None)
+        add(control)
+        if control is not None and control.layout == 'coalesced':
+            for alternate in ('shared-sw64', 'mma-row'):
+                add(next((p for p in ranked if p.layout == alternate and p.schedule == control.schedule),
+                         None))
+        for item in ranked:
+            if all(chosen.schedule != item.schedule for chosen in result):
+                add(item)
+        for item in ranked:
+            add(item)
+        return (result + [ranked[0]] * K4)[:K4]
+
+    joint = [item for item in candidates.values() if item.layout != 'legacy']
+    local = {}
+    for item in joint:
+        current = local.get(item.schedule)
+        if current is None or item.features['local_layout_key'] < current.features['local_layout_key']:
+            local[item.schedule] = item
+    choices = {'J': project(joint), 'LI': project(local.values()),
                'legacy': [candidates.get(('legacy', name)) for name in legacy_options]}
     # Unsupported legacy slots are kept as paid failures, even if another
     # checked candidate would fill the slot.
     audit = dict(problem_sha256=problem_sha256, prepared_instance_sha256=digest([problem_sha256, spec]),
                  input_packet_sha256=digest(tile_packet), layout_packet_sha256={
-                     name: digest(packet) for name, packet in layouts.items()},
-                 contract_sha256=digest(contract), local_layout=local_layout, local_layout_keys=local_keys,
+                     name: digest(packet) for name, (packet, _, _) in layouts.items()},
+                 contract_sha256=digest(contract), local_layout=local[LAYOUT_CONTROL].layout,
+                 local_layout_by_schedule={name: item.layout for name, item in local.items()},
+                 layout_axes={name: {'shared_swizzle': swizzle, 'fragment_layout': fragment}
+                              for name, (_, swizzle, fragment) in layouts.items()},
                  legacy_schedule_order=list(legacy_options), attempts=attempts,
-                 common_preview_attempts=len(attempts), paid_slots_per_mode=K4,
+                 common_preview_attempts=len(attempts), common_preview_cap=PREVIEW_CAP, paid_slots_per_mode=K4,
                  copy_layouts=copy_features, wall_ns=perf_counter_ns() - start)
     return choices, audit

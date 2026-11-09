@@ -24,7 +24,7 @@ class AttentionSearchBuildTests(TestCase):
 
         def compile_one(_triton, _out, _case, _spec, item):
             return dict(status='compiled', ttgir_sha256=item.proof['ttgir_sha256'],
-                        physical_compile_invoked=True)
+                        physical_compile_invoked=True, native_resources={})
 
         with (
             tempfile.TemporaryDirectory() as tmp,
@@ -33,6 +33,7 @@ class AttentionSearchBuildTests(TestCase):
             mock.patch.object(build, '_toolchain', return_value=(None, {})),
             mock.patch.object(build, '_sources', return_value={}),
             mock.patch.object(build, 'select_attention', return_value=(modes, audit)),
+            mock.patch.object(build, 'compiled_score', return_value={'local_or_stack': False, 'cost': 1.0}),
             mock.patch.object(build, '_compile', side_effect=compile_one) as native,
         ):
             result = build.build_search(Path(tmp)/'archive', sys.executable, [(1, 1, 64)], mode='all')

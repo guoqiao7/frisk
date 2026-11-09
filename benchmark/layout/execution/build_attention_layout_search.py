@@ -8,6 +8,7 @@ import subprocess
 from time import perf_counter_ns
 
 from attention_layout_search import K4, MODES, digest, select_attention
+from attention_residency_cost import compiled_score
 from build_tiled_attention import SOURCE, TILE_IR, _sha, _toolchain, _write, compile_emitted_image
 from tiled_attention import checked_geometry
 
@@ -113,7 +114,7 @@ def build_search(output, frisk_opt, shapes, *, mode):
                                    reason='paid legacy schedule outside checked domain',
                                    execution_kv_block=next(p['tuning']['kv_width'] for p in audit['attempts']
                                        if p['layout'] == 'legacy' and p['schedule'] == schedule))
-                        pending.append((row, None, None))
+                        pending.append((row, None, None, None))
                         continue
                     identity = item.proof['ttgir_sha256']
                     plan = dict(layout=item.layout, schedule=item.schedule, tuning=item.tuning,
@@ -131,11 +132,11 @@ def build_search(output, frisk_opt, shapes, *, mode):
                         dest = case_path/f'{engine}-c{slot}'
                         compiled[key] = (engine, slot, pool.submit(_compile, triton, dest, case, spec, item))
                     origin_engine, origin_slot, future = compiled[key]
-                    pending.append((row, future, (origin_engine, origin_slot)))
+                    pending.append((row, future, (origin_engine, origin_slot), item))
             print(case, audit['local_layout'], {e: [(p.layout, p.schedule) if p else None
                   for p in selected[e]] for e in modes}, flush=True)
         rows = []
-        for row, future, origin in pending:
+        for row, future, origin, item in pending:
             if future is not None:
                 built = future.result()
                 if built['status'] == 'compiled' and built['ttgir_sha256'] != row['ttgir_sha256']:
@@ -147,6 +148,7 @@ def build_search(output, frisk_opt, shapes, *, mode):
                     row['compile_alias_of'] = dict(engine=origin[0], slot=origin[1])
                 if row['status'] == 'compiled':
                     row['charged_slot'] = row['slot']
+                    row['compiled_score'] = compiled_score(item.features, item.proof, row['native_resources'])
                     # The candidate-specific proof is the sealed plan, even
                     # when another paid slot supplied the native image.
                     row['proof'] = row['candidate_proof']
@@ -156,8 +158,23 @@ def build_search(output, frisk_opt, shapes, *, mode):
     if sources != _sources():
         raise ValueError('Attention sources changed while creating native images')
     result = output/'programs.json'
-    _write(result, dict(cases=rows, fixed_choices={_case(spec): {engine: 0 for engine in modes}
-         for spec in specs}, registration_sha256=_sha(registration), native_budget_per_mode=K4,
+    fixed_choices = {}
+    for spec in specs:
+        case = _case(spec)
+        fixed_choices[case] = {}
+        for engine in modes:
+            paid = [row for row in rows if row['case'] == case and row['engine'] == engine
+                    and row['status'] == 'compiled']
+            # Legacy retains its previously frozen order; J and LI apply the
+            # identical timing-free native feedback to their paid queues.
+            def fixed_key(row):
+                cost = row['compiled_score']
+                return cost['local_or_stack'], cost['cost'], row['slot']
+
+            fixed_choices[case][engine] = (0 if engine == 'legacy' or not paid
+                                           else min(paid, key=fixed_key)['slot'])
+    _write(result, dict(cases=rows, fixed_choices=fixed_choices, fixed_choice_uses_gpu_timing=False,
+         registration_sha256=_sha(registration), native_budget_per_mode=K4,
          common_preview_attempts={case: audit['common_preview_attempts'] for case, audit in searches.items()},
          native_compiler_invocations=sum(row['native_compiler_invoked'] for row in rows),
          charged_slots=len(rows), gpu_launches=0, complete_wall_ns=perf_counter_ns()-start))

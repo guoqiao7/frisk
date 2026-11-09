@@ -8,6 +8,7 @@ from attention_copy_layout import (attention_copy_layout_evidence, derive_attent
 from attention_tile_mma import (FRAGMENT_SLOTS, ROOT_BYTES, SHARED_ALIGNMENT, THREADS,
                                 TILE, build_d64_wgmma_tiles, fragment_coordinate,
                                 shared_offsets_64x64)
+from attention_fragment_layout import NATIVE_FRAGMENT, checked_fragment_layout, output_store_evidence
 from attention_score_reuse import prove_score_prefix
 from backend import Emitter, render_inline_execution, splat_f32_bits
 from native_static_support import check_static_shared
@@ -21,6 +22,7 @@ _FP_ZERO = '0f00000000'
 _NEG_INF = '0fff800000'
 _SHAPE = (TILE, TILE)
 _ALL_THREADS = (1 << THREADS) - 1
+_FRAGMENT_REQUEST = '_checked_attention_fragment_layout'
 
 
 def checked_geometry(spec, *, kv_width=TILE):
@@ -203,7 +205,7 @@ def _row_fibers():
 class _TiledAttention(Emitter):
     def __init__(self, spec, *, tile_packet, copy_owner_policy, kv_width=TILE,
                  retain_tail_scores=False, vector_store=False, narrow_tail=False,
-                 simplify_tail_copy=False, factored_copy=False):
+                 simplify_tail_copy=False, factored_copy=False, shared_swizzle=128):
         super().__init__({'values': [], 'operations': []}, copy_owner_policy=copy_owner_policy)
         if any(type(flag) is not bool for flag in
                (retain_tail_scores, vector_store, narrow_tail, simplify_tail_copy, factored_copy)):
@@ -218,24 +220,40 @@ class _TiledAttention(Emitter):
         self.group_tiles = kv_width // TILE
         self.group_count, residual = divmod(self.geometry['full_kv_tiles'], self.group_tiles)
         self.residual_row = self.group_count * kv_width if residual else None
-        self.mma_tiles = build_d64_wgmma_tiles(kv_tile=kv_width)
+        self.shared_swizzle = shared_swizzle
+        self.mma_tiles = build_d64_wgmma_tiles(kv_tile=kv_width, shared_swizzle=shared_swizzle)
         self.rows, self.row_index, self.columns = _row_fibers()
         self.copy_plans = {}
         self.store_plans = {}
+        fragment_name = tile_packet.get(_FRAGMENT_REQUEST, NATIVE_FRAGMENT)
+        if _FRAGMENT_REQUEST in tile_packet:
+            tile_packet = dict(tile_packet)
+            tile_packet.pop(_FRAGMENT_REQUEST)
+        self.fragment = checked_fragment_layout(fragment_name)
         self.copy_execution, output = _checked_tile_layouts(tile_packet)
+        output = self.fragment.accumulator_distribution(output)
+        self.copy_offsets = shared_offsets_64x64(self.shared_swizzle)
+        alternate_fragment = fragment_name != NATIVE_FRAGMENT
+        self.query_copy_offsets = self.fragment.query_offsets(self.copy_offsets) if alternate_fragment else self.copy_offsets
+        self.query_copy_plans = {} if alternate_fragment else self.copy_plans
         for rows in {TILE, self.geometry['final_rows']} - {0}:
             self.copy_plans[rows] = self._checked_copy_plan(rows)
+            if alternate_fragment:
+                self.query_copy_plans[rows] = native_copy_plan(
+                    self.copy_execution, rows, owner_policy=self.copy_owner_policy,
+                    destination_offsets=self.query_copy_offsets)
             self.store_plans[rows] = plan_guarded_store(
                 output, valid_shape=(rows, TILE), destination_row_stride_bytes=TILE * 4,
                 destination_span_bytes=rows * TILE * 4)
         if any(group.owner_mask != _ALL_THREADS for plan in self.store_plans.values() for group in plan.groups):
             raise ValueError('D64 native output requires one physical owner per element')
         if self.geometry['final_rows']:
-            full = self.copy_plans[TILE].groups
-            tail = self.copy_plans[self.geometry['final_rows']].groups
-            for a, b in zip(full, tail, strict=True):
-                if (a.rows, a.source_offsets, a.destination_offsets) != (b.rows, b.source_offsets, b.destination_offsets):
-                    raise ValueError('boundary copy changed the physical ownership assignment')
+            for plans in (self.copy_plans, self.query_copy_plans) if alternate_fragment else (self.copy_plans,):
+                full = plans[TILE].groups
+                tail = plans[self.geometry['final_rows']].groups
+                for a, b in zip(full, tail, strict=True):
+                    if (a.rows, a.source_offsets, a.destination_offsets) != (b.rows, b.source_offsets, b.destination_offsets):
+                        raise ValueError('boundary copy changed the physical ownership assignment')
         self.tail_prefix = self.geometry['final_rows']
         self.tail_row = self.length - self.tail_prefix
         self.score_prefix = None
@@ -274,7 +292,8 @@ class _TiledAttention(Emitter):
         self.tail_guards = {}
 
     def _checked_copy_plan(self, rows):
-        return native_copy_plan(self.copy_execution, rows, owner_policy=self.copy_owner_policy)
+        return native_copy_plan(self.copy_execution, rows, owner_policy=self.copy_owner_policy,
+                                shared_swizzle=self.shared_swizzle)
 
     def _value(self, opcode, *args, kind='b32'):
         out = self.tmp(kind)
@@ -291,17 +310,28 @@ class _TiledAttention(Emitter):
         return self._value('setp.lt.u32', row, self.length, kind='pred')
 
     def _copy(self, root, tile_row, shared_offset, *, guard, prefix=TILE, storage_rows=TILE):
+        from attention_copy_schedule import copy_end
+
+        query = root == self.roots[0]
+        if query and (shared_offset != self.mma_tiles.q_offset or storage_rows != TILE):
+            raise ValueError('a checked query copy must publish its whole operand carrier')
+        plans = self.query_copy_plans if query else self.copy_plans
+        offsets = self.query_copy_offsets if query else self.copy_offsets
+        if type(storage_rows) is not int or storage_rows not in (8, 16, 32, TILE) or storage_rows < prefix:
+            raise ValueError('copy publication must cover the checked valid prefix')
+        plan = plans[prefix]
+        if shared_offset + copy_end(plan, storage_rows) > self.mma_tiles.shared_bytes:
+            raise ValueError('copy publication escapes its checked Shared allocation')
         if self.factored_copy:
             from attention_copy_schedule import emit_factored_copy
 
             if emit_factored_copy(self, root, tile_row, shared_offset, guard=guard,
-                                  prefix=prefix, storage_rows=storage_rows):
+                                  prefix=prefix, storage_rows=storage_rows,
+                                  plan=plan, native_offsets=offsets):
                 return
         tile = self._tile_pointer(root, tile_row, TILE * 2)
         shared = self._value('add.u32', self.smem_base, shared_offset)
-        if type(storage_rows) is not int or storage_rows not in (8, 16, 32, TILE) or storage_rows < prefix:
-            raise ValueError('copy publication must cover the checked valid prefix')
-        for group in self.copy_plans[prefix].groups:
+        for group in plan.groups:
             if min(group.rows) >= storage_rows:
                 continue
             group_guard = guard
@@ -584,6 +614,13 @@ class _TiledAttention(Emitter):
             update(self._tail_scores(copy_v=True), self.tail_prefix)
         return accum
 
+    def _fragment_evidence(self):
+        evidence = self.fragment.evidence(self.mma_tiles.fragment_columns,
+                                          self.mma_tiles.score_fragment_columns,
+                                          score_width=self.mma_tiles.kv_tile)
+        return dict(evidence, output_store=output_store_evidence(self.store_plans,
+                                                               vector_store=self.vector_store))
+
     def _write_output(self, accum):
         root = self._tile_pointer(self.roots[3], self.query_row, TILE * 4)
         groups = self.store_plans[TILE].groups
@@ -649,6 +686,8 @@ class _TiledAttention(Emitter):
                                             self.store_plans[self.geometry['final_rows']].groups)
                     if self.geometry['final_rows'] else 0,
                     ttgir_sha256=hashlib.sha256(text.encode()).hexdigest())
+        info.update(self.mma_tiles.shared_layout_evidence())
+        info.update(self._fragment_evidence())
         check_static_shared(info)
         return text, info
 
@@ -657,11 +696,21 @@ def emit_tiled_attention(spec, *, tile_packet, copy_owner_policy='gf2', kv_width
                          retain_tail_scores=False, vector_store=False, narrow_tail=False,
                          simplify_tail_copy=False, retain_all_scores=False, factored_copy=False,
                          bulk_value_publish=False, retain_residual_scores=False,
-                         streaming_bulk_values=False):
+                         streaming_bulk_values=False, shared_swizzle=128,
+                         fragment_layout=NATIVE_FRAGMENT):
+    fragment = checked_fragment_layout(fragment_layout)
+    if type(tile_packet) is not dict or _FRAGMENT_REQUEST in tile_packet:
+        raise ValueError('checked Attention requires the original execution replay packet')
+    if fragment.name != NATIVE_FRAGMENT:
+        tile_packet = dict(tile_packet, **{_FRAGMENT_REQUEST: fragment.name})
     if type(kv_width) is not int or any(type(flag) is not bool for flag in
             (retain_all_scores, retain_tail_scores, vector_store, narrow_tail, simplify_tail_copy,
              factored_copy, bulk_value_publish, retain_residual_scores, streaming_bulk_values)):
         raise ValueError('Attention requires an integer KV width and boolean strategy flags')
+    if type(shared_swizzle) is not int or shared_swizzle not in (64, 128):
+        raise ValueError('checked Attention Shared swizzle must be 64 or 128')
+    if shared_swizzle == 64 and (kv_width != TILE or retain_all_scores):
+        raise ValueError('SW64 requires the checked streaming KV64 schedule')
     if retain_all_scores:
         from attention_single_score import emit_single_score_attention
         from attention_single_score_bulk import emit_single_score_bulk_attention
@@ -703,4 +752,5 @@ def emit_tiled_attention(spec, *, tile_packet, copy_owner_policy='gf2', kv_width
     return _TiledAttention(spec, tile_packet=tile_packet, copy_owner_policy=copy_owner_policy,
                            kv_width=kv_width, retain_tail_scores=retain_tail_scores,
                            vector_store=vector_store, narrow_tail=narrow_tail,
-                           simplify_tail_copy=simplify_tail_copy, factored_copy=factored_copy).run()
+                           simplify_tail_copy=simplify_tail_copy, factored_copy=factored_copy,
+                           shared_swizzle=shared_swizzle).run()

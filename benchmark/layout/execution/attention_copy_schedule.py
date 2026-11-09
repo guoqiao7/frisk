@@ -36,7 +36,7 @@ def _carry_free_delta(base, target):
     return delta
 
 
-def prove_copy_schedule(plan):
+def prove_copy_schedule(plan, *, native_offsets=None):
     """Return a factorization only when every native address is preserved."""
     if (not isinstance(plan, GuardedCopyPlan)
             or plan.domain.carrier_shape != (TILE, TILE)
@@ -45,7 +45,8 @@ def prove_copy_schedule(plan):
             or len(plan.groups) != 4):
         return None
     first = plan.groups[0]
-    native_offsets = shared_offsets_64x64()
+    if native_offsets is None:
+        native_offsets = shared_offsets_64x64()
     prefix = plan.domain.valid_shape[0]
     translates = []
     sources, destinations = set(), set()
@@ -88,8 +89,15 @@ def _address(pointer, displacement):
     return f'[{pointer}+{displacement}]' if displacement else f'[{pointer}]'
 
 
+def copy_end(plan, storage_rows):
+    """Return the one-past byte of the last vector in the published rows."""
+    return max((offset + 16 for group in plan.groups
+                for row, offset in zip(group.rows, group.destination_offsets, strict=True)
+                if row < storage_rows), default=0)
+
+
 def emit_factored_copy(emitter, root, tile_row, shared_offset, *, guard,
-                       prefix=TILE, storage_rows=TILE):
+                       prefix=TILE, storage_rows=TILE, plan=None, native_offsets=None):
     """Emit a checked copy, or return False before emitting any instructions.
 
     Bases are local to this call. The caller retains its original publication
@@ -99,15 +107,16 @@ def emit_factored_copy(emitter, root, tile_row, shared_offset, *, guard,
             or type(storage_rows) is not int or storage_rows not in (8, 16, 32, TILE)
             or storage_rows < prefix):
         raise ValueError('copy publication must cover the checked valid prefix')
-    plan = emitter.copy_plans.get(prefix)
-    schedule = prove_copy_schedule(plan)
+    if plan is None:
+        plan = emitter.copy_plans.get(prefix)
+    schedule = prove_copy_schedule(plan, native_offsets=native_offsets)
     if schedule is None:
         return False
     if (type(guard) is not bool or type(emitter.length) is not int
             or not 64 <= emitter.length <= 1025
             or type(shared_offset) is not int or shared_offset < 0
             or shared_offset % 16
-            or shared_offset + storage_rows * _ROW_BYTES > emitter.mma_tiles.shared_bytes):
+            or shared_offset + copy_end(plan, storage_rows) > emitter.mma_tiles.shared_bytes):
         return False
     selected = [(group, translate) for group, translate in zip(plan.groups, schedule.translates, strict=True)
                 if min(group.rows) < storage_rows]

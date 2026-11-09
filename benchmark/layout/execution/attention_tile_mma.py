@@ -110,14 +110,22 @@ def score_width_for_prefix(valid_columns):
     return max(8, 1 << (valid_columns - 1).bit_length())
 
 
-def _swizzle128(offset):
-    return offset ^ (((offset >> 7) & 7) << 4)
+def _swizzle_offset(offset, swizzle):
+    return offset ^ (((offset >> 7) & (swizzle // 16 - 1)) << 4)
 
 
-@lru_cache(maxsize=1)
-def shared_offsets_64x64():
-    """Root-relative halfword offsets of the common Q/K/V SW128 carrier."""
-    table = tuple(_swizzle128(index * 2) for index in range(TILE * TILE))
+@lru_cache(maxsize=2)
+def shared_offsets_64x64(swizzle=128):
+    """Root-relative Copy16 targets for the checked SW64 and SW128 carriers."""
+    if type(swizzle) is not int or swizzle not in (64, 128):
+        raise ValueError("D64 Shared layout requires SW64 or SW128")
+    # SW64's two contiguous 32-column planes give both K-major and MN-major
+    # WGMMA descriptors their canonical atom strides.
+    plane_columns = swizzle // 2
+    raw = ((column // plane_columns) * TILE * swizzle + row * swizzle
+           + 2 * (column % plane_columns)
+           for row in range(TILE) for column in range(TILE))
+    table = tuple(_swizzle_offset(offset, swizzle) for offset in raw)
     linear(table)
     if set(table) != set(range(0, ROOT_BYTES, 2)):
         raise ValueError("D64 Shared layout must own every halfword exactly once")
@@ -144,8 +152,9 @@ class _Descriptor:
         return descriptor
 
 
-def _checked_descriptors(root, *, k_major, mn_extent=TILE, k_extent=TILE):
-    layout = shared_offsets_64x64()
+@lru_cache(maxsize=48)
+def _checked_descriptors(root, *, k_major, mn_extent=TILE, k_extent=TILE, swizzle=128):
+    layout = shared_offsets_64x64(swizzle)
     if (type(mn_extent) is not int or type(k_extent) is not int
             or k_extent not in (TILE // 2, TILE)):
         raise ValueError("D64 descriptor extent is not a supported carrier")
@@ -153,18 +162,25 @@ def _checked_descriptors(root, *, k_major, mn_extent=TILE, k_extent=TILE):
         if mn_extent not in (8, 16, 32, TILE, 2 * TILE, 4 * TILE) or k_extent != TILE:
             raise ValueError("D64 K-major descriptor requires native key width and D64")
         if mn_extent > TILE:
+            if swizzle != 128:
+                raise ValueError("SW64 wide QK requires nonadjacent depth-plane publication")
             layout = tuple(block * ROOT_BYTES + offset
                            for block in range(mn_extent // TILE) for offset in layout)
         else:
             layout = layout[:mn_extent * TILE]
     elif mn_extent == TILE:
+        if swizzle == 64 and k_extent != TILE:
+            raise ValueError("SW64 compact V requires a distinct root footprint")
         layout = layout[:k_extent * TILE]
     else:
         raise ValueError("D64 V descriptor requires a 64-column output")
-    extent_bytes = len(layout) * 2
+    extent_bytes = ROOT_BYTES if swizzle == 64 else len(layout) * 2
     if not 0 <= root <= (1 << 18) - extent_bytes:
         raise ValueError("D64 descriptor payload exceeds its address field")
-    leading, stride = (16, 1024) if k_major else (1024, 1024)
+    stride = 8 * swizzle
+    leading = 16 if k_major else (1024 if swizzle == 128 else TILE * swizzle)
+    mn_atom = swizzle // 2
+    mask = swizzle // 16 - 1
     descriptors = []
     for start_k in range(0, k_extent, _ATOM_K):
         start = layout[start_k if k_major else start_k * TILE]
@@ -174,16 +190,18 @@ def _checked_descriptors(root, *, k_major, mn_extent=TILE, k_extent=TILE):
         for mn in range(mn_extent):
             for k in range(_ATOM_K):
                 if k_major:
-                    relative = mn % 8 * 128 + mn // 8 * stride + k % 8 * 2 + k // 8 * 16
+                    relative = mn % 8 * swizzle + mn // 8 * stride + k % 8 * 2 + k // 8 * 16
                     logical = mn * TILE + start_k + k
                 else:
-                    relative = mn * 2 + k % 8 * 128 + k // 8 * stride
+                    relative = mn % mn_atom * 2 + mn // mn_atom * leading + k % 8 * swizzle + k // 8 * stride
                     logical = (start_k + k) * TILE + mn
-                unswizzled = (start ^ (phase << 4)) + relative
-                expected = _swizzle128(unswizzled)
+                # PTX canonical Shared layout, mirrored by getSM90DescriptorAddress.
+                unswizzled = (start ^ ((phase & mask) << 4)) + relative
+                expected = _swizzle_offset(unswizzled, swizzle)
                 if expected != layout[logical] or not 0 <= expected <= extent_bytes - 2:
                     raise ValueError("D64 descriptor differs from its checked Shared halfword")
-        fields = (leading // 16 << 16) | (stride // 16 << 32) | (phase << 49) | (1 << 62)
+        mode = {128: 1, 64: 2}[swizzle]
+        fields = (leading // 16 << 16) | (stride // 16 << 32) | (phase << 49) | (mode << 62)
         descriptors.append(_Descriptor(root + start, fields))
     return tuple(descriptors)
 
@@ -208,6 +226,14 @@ class D64TileMma:
     _v: tuple[_Descriptor, ...]
     _wide_k: tuple[_Descriptor, ...] | None = None
     kv_tile: int = TILE
+    shared_swizzle: int = 128
+
+    def shared_layout_evidence(self):
+        _, columns = linear(shared_offsets_64x64(self.shared_swizzle))
+        return dict(shared_swizzle=self.shared_swizzle, shared_copy_gf2_columns=columns,
+                    shared_qkv_descriptor_fields={name: [(d.offset, d.fields) for d in descriptors]
+                        for name, descriptors in zip(('q', 'k', 'v'),
+                                                     (self._q, self._k, self._v), strict=True)})
 
     @property
     def score_fragment_columns(self):
@@ -254,7 +280,8 @@ class D64TileMma:
             raise ValueError("score prefix exceeds the configured K0 carrier")
         if width < TILE:
             _narrow_fragment_columns(width)
-        descriptors = _checked_descriptors(self.k_offset, k_major=True, mn_extent=width)
+        descriptors = _checked_descriptors(self.k_offset, k_major=True, mn_extent=width,
+                                           swizzle=self.shared_swizzle)
         self._emit_qk(emit, tmp, smem, _register_group(score_regs, width // 2), descriptors)
 
     def _emit_qk(self, emit, tmp, smem, outputs, key):
@@ -279,7 +306,7 @@ class D64TileMma:
         self._emit_group(emit, tmp, outputs, args)
 
 
-def build_d64_wgmma_tiles(shared_offsets=None, *, kv_tile=64):
+def build_d64_wgmma_tiles(shared_offsets=None, *, kv_tile=64, shared_swizzle=128):
     """Check a four-warp QK carrier and its Shared operand lifetimes.
 
     Wide QK reads adjacent K64 roots. The caller must wait for all QK
@@ -289,6 +316,10 @@ def build_d64_wgmma_tiles(shared_offsets=None, *, kv_tile=64):
     """
     if type(kv_tile) is not int or kv_tile not in (TILE // 2, TILE, 2 * TILE, 4 * TILE):
         raise ValueError("D64 WGMMA requires a 32-, 64-, 128- or 256-key carrier")
+    if type(shared_swizzle) is not int or shared_swizzle not in (64, 128):
+        raise ValueError("D64 WGMMA requires SW64 or SW128")
+    if shared_swizzle == 64 and kv_tile != TILE:
+        raise ValueError("SW64 is checked for three complete KV64 Shared roots")
     wide = kv_tile > TILE
     key_bytes = kv_tile * TILE * 2
     value_bytes = min(kv_tile, TILE) * TILE * 2
@@ -300,7 +331,7 @@ def build_d64_wgmma_tiles(shared_offsets=None, *, kv_tile=64):
     q, k, v = (shared_offsets[name] for name in ("q", "k", "v"))
     if any(type(offset) is not int or offset < 0 or offset % SHARED_ALIGNMENT
            for offset in (q, k, v)):
-        raise ValueError("D64 SW128 roots require 1024-byte alignment")
+        raise ValueError("D64 Shared roots require 1024-byte alignment")
     if wide and v != k + key_bytes - ROOT_BYTES:
         raise ValueError("D64 wide schedule requires V to alias its last K64 root")
     spans = [(q, q + ROOT_BYTES), (k, k + key_bytes)]
@@ -317,7 +348,9 @@ def build_d64_wgmma_tiles(shared_offsets=None, *, kv_tile=64):
     elif kv_tile < TILE:
         _narrow_fragment_columns(kv_tile)
     return D64TileMma(q, k, v, shared_bytes, _fragment_columns(),
-                      _checked_descriptors(q, k_major=True),
-                      _checked_descriptors(k, k_major=True, mn_extent=min(kv_tile, TILE)),
-                      _checked_descriptors(v, k_major=False, k_extent=min(kv_tile, TILE)),
-                      wide_key, kv_tile)
+                      _checked_descriptors(q, k_major=True, swizzle=shared_swizzle),
+                      _checked_descriptors(k, k_major=True, mn_extent=min(kv_tile, TILE),
+                                           swizzle=shared_swizzle),
+                      _checked_descriptors(v, k_major=False, k_extent=min(kv_tile, TILE),
+                                           swizzle=shared_swizzle),
+                      wide_key, kv_tile, shared_swizzle)

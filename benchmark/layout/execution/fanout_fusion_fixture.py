@@ -1,4 +1,4 @@
-'''Checked GF(2) carrier cuts for four independent dual-softmax matrices.
+'''Checked GF(2) carrier cuts for reduction fan-out fusions.
 
 The same bounded grammar supplies the producer and consumer choices to J and
 LI. The producer's load, scale, and exponential share a carrier. Both
@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 CUTS = ('AA', 'AB', 'BA', 'BB')
 REDUCTION_POLICIES = ('auto', 'eager')
+FUSION_COST_ID = 'sm90-fanout-issued-work-v2'
 
 
 @dataclass(frozen=True)
@@ -44,8 +45,8 @@ class Carrier:
 
 def carriers(rows, cols):
     '''Adjacent coalesced layouts from one register/lane bit exchange.'''
-    if (rows, cols) not in ((64, 4), (32, 8), (16, 16)):
-        raise ValueError('registered matrix geometries are 64x4, 32x8, and 16x16')
+    if (rows, cols) not in ((64, 4), (32, 8), (16, 16), (8, 32), (4, 64)):
+        raise ValueError('expected a supported 256-element rectangular matrix')
     row = tuple((1, bit) for bit in range(rows.bit_length() - 1))
     col = tuple((2, bit) for bit in range(cols.bit_length() - 1))
     warps = ((0, 0), (0, 1))
@@ -160,6 +161,43 @@ module attributes {{frisk.target = "sm_90a"}} {{
   }}) : () -> ()
 }}
 '''
+
+
+def checked_pair_score(opcodes, features, trace):
+    """Price the work that the checked SM90 emitter actually issued.
+
+    Site counts already include repeated copies of a logical reduction or
+    expensive scalar operation. Reduction arithmetic and cross-lane exchange
+    receive an extra issue unit, while division and special-function sites
+    receive separate weights. These are ordering units, not predicted cycles.
+    """
+    reductions = []
+    for item in trace:
+        if item['operation'] == 'frisk.reduce_tensor':
+            axis, combines, shuffles = (item[field] for field in (
+                'reduction_axis', 'reduction_combines', 'shuffles'))
+            if any(type(value) is not int or value < 0 for value in (axis, combines, shuffles)):
+                raise ValueError('malformed checked reduction work')
+            reductions.append(dict(axis=axis, combines=combines, shuffles=shuffles))
+    arithmetic = sum(row['combines'] for row in reductions)
+    communication = sum(row['shuffles'] for row in reductions)
+    if (not reductions or arithmetic > opcodes.get('add.rn.f32', 0) + opcodes.get('max.f32', 0)
+            or communication != features['reduction_shuffles']):
+        raise ValueError('reduction work does not match the checked emission')
+    div = opcodes.get('div.rn.f32', 0)
+    exp = opcodes.get('ex2.approx.f32', 0)
+    rsqrt = opcodes.get('rsqrt.approx.f32', 0)
+    site_count = sum(opcodes.values())
+    weighted = site_count + arithmetic + communication + 12 * div + 3 * (exp + rsqrt)
+    sectors = features['global_sector_issues32_upper']
+    access_sites = features['global_load_sites'] + features['global_store_sites']
+    # A tied issue proxy does not prove that the exact-division dependency
+    # and its native expansion will be hidden. Prefer fewer division sites
+    # before comparing Global sectors or access issue counts.
+    return ((weighted, div, sectors, access_sites),
+            dict(model=FUSION_COST_ID, issue_units=weighted, ptx_sites=site_count,
+                 reduction_combines=arithmetic, reduction_shuffles=communication,
+                 by_reduction=reductions, fp32_div=div, exp2=exp, rsqrt=rsqrt))
 
 
 def select(previews):

@@ -1,6 +1,7 @@
 import unittest
 
-from fanout_fusion_fixture import CUTS, REDUCTION_POLICIES, carriers, select, source
+from fanout_fusion_fixture import (CUTS, REDUCTION_POLICIES, carriers, checked_pair_score,
+                                  select, source)
 
 
 class FanoutFusionTests(unittest.TestCase):
@@ -29,3 +30,37 @@ class FanoutFusionTests(unittest.TestCase):
         inventory['AB','auto']['local_score'] = (144,4)
         with self.assertRaisesRegex(ValueError, 'changed the own-producer score'):
             select(inventory)
+
+    def test_issued_work_penalizes_repeated_reduction_combines_and_divisions(self):
+        features = dict(reduction_shuffles=4, global_sector_issues32_upper=256,
+                        global_load_sites=2, global_store_sites=2)
+        arithmetic = {'add.rn.f32': 8, 'shfl.sync.bfly.b32': 4, 'div.rn.f32': 2,
+                      'ex2.approx.f32': 2, 'rsqrt.approx.f32': 2, 'mov.b32': 8}
+
+        def trace(combines):
+            return [dict(operation='frisk.reduce_tensor', reduction_axis=2,
+                         reduction_combines=combines, shuffles=4)]
+
+        baseline, proof = checked_pair_score(arithmetic, features, trace(4))
+        replicated, _ = checked_pair_score(arithmetic, features, trace(8))
+        shifted = dict(arithmetic, **{'div.rn.f32': 4, 'mov.b32': 6})
+        expensive, _ = checked_pair_score(shifted, features, trace(4))
+        self.assertEqual(proof['by_reduction'], [dict(axis=2, combines=4, shuffles=4)])
+        self.assertEqual(replicated[0] - baseline[0], 4)
+        self.assertEqual(expensive[0] - baseline[0], 24)
+        with self.assertRaisesRegex(ValueError, 'does not match the checked emission'):
+            checked_pair_score(arithmetic, features, trace(9))
+
+    def test_tied_issue_cost_prefers_fewer_exact_divisions(self):
+        trace = [dict(operation='frisk.reduce_tensor', reduction_axis=1,
+                      reduction_combines=4, shuffles=2)]
+        common = {'add.rn.f32': 4, 'shfl.sync.bfly.b32': 2}
+        slower = dict(common, **{'div.rn.f32': 2})
+        faster = dict(common, **{'div.rn.f32': 1, 'mov.b32': 13})
+        features = dict(reduction_shuffles=2, global_sector_issues32_upper=128,
+                        global_load_sites=2, global_store_sites=2)
+        higher_sector = dict(features, global_sector_issues32_upper=136)
+        more_divisions, _ = checked_pair_score(slower, features, trace)
+        fewer_divisions, _ = checked_pair_score(faster, higher_sector, trace)
+        self.assertEqual(more_divisions[0], fewer_divisions[0])
+        self.assertLess(fewer_divisions, more_divisions)

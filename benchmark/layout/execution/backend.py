@@ -1192,7 +1192,10 @@ class Emitter:
      publication_code[ordinal]=self.code[start:]
     if self.execution_trace is not None:
      code=self.code[start:]
-     self.execution_trace.append(dict(operation=n,
+     reduction_work = (dict(reduction_axis=o['attrs']['dim'],
+                            reduction_combines=sum(x.startswith(('add.rn.f32 ', 'max.f32 ')) for x in code))
+                       if n == 'frisk.reduce_tensor' else {})
+     self.execution_trace.append(dict(operation=n, **reduction_work,
           shuffles=sum(x.startswith('shfl.sync.') for x in code),
           barriers=sum(x.startswith('bar.sync') for x in code),
           wgmma=sum(x.startswith('wgmma.mma_async.') for x in code),

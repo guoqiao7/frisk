@@ -138,6 +138,7 @@ class _SingleScoreAttention(_TiledAttention):
                     ftz=False, fp_fusion=False, mask='query-and-kv-prefix',
                     tail_copy_active_groups=[], tail_store_elements=0,
                     ttgir_sha256=hashlib.sha256(text.encode()).hexdigest())
+        info.update(self._fragment_evidence())
         check_static_shared(info)
         return text, info
 
