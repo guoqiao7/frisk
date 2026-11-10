@@ -193,7 +193,7 @@ TEST_F(ExecutionExportTest, LargeProvenMapExportsCompactWithoutHolderTable) {
 TEST_F(ExecutionExportTest, UnsupportedDeadOperationHasTypedAtomicRejection) {
  auto m=selected();ASSERT_TRUE(m);Value first;
  m->walk([&](Operation *op){for(Value value:op->getResults())if(!first && isa<RankedTensorType>(value.getType()))first=value;});ASSERT_TRUE(first);
- OpBuilder b(first.getDefiningOp());b.setInsertionPointAfter(first.getDefiningOp());b.create<arith::AddFOp>(first.getLoc(),first,first);
+ OpBuilder b(first.getDefiningOp());b.setInsertionPointAfter(first.getDefiningOp());b.create<math::SqrtOp>(first.getLoc(),first);
  {std::error_code ec;llvm::raw_fd_ostream stream(path,ec);ASSERT_FALSE(bool(ec));stream<<"preserve";}
  std::string diagnostics;
  ScopedDiagnosticHandler capture(&context,[&](Diagnostic &diagnostic){llvm::raw_string_ostream stream(diagnostics);diagnostic.print(stream);return success();});

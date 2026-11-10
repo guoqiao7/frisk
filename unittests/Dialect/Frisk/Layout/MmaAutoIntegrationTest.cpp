@@ -489,8 +489,9 @@ TEST_F(MmaAutoIntegrationTest, BoundedAttemptsCountFailuresAndDiscardPartialTabl
     EXPECT_TRUE(c.instruction->tuples.empty());
     EXPECT_NE(message.find("unknown proof"),std::string::npos);
     EXPECT_NE(message.find("partial table discarded"),std::string::npos);
-    // Candidate overflow fails before any tuple build, preserving the hard seed.
-    auto &domain = graph->getVariable(c.vars[4]).candidates;
+    // Widen the result domain so one geometry exceeds the tuple budget.
+    // Geometry alternatives are evaluated separately within that same budget.
+    auto &domain = graph->getVariable(c.vars[3]).candidates;
     domain.push_back({Builder(&context).getI64IntegerAttr(4),kInvalidProvenanceID,4});
     counting.attempts = 0;
     EXPECT_TRUE(failed(prepareInstructionTuples(*graph,counting,module->getLoc())));
