@@ -1,11 +1,12 @@
 #include "Dialect/Frisk/Analysis/LayoutCostModel.h"
 #include "Dialect/Frisk/Analysis/LayoutProfile.h"
 #include "Dialect/Frisk/Analysis/LayoutAlgebra.h"
+#include "Dialect/Frisk/Analysis/ExecutionLayoutProof.h"
+#include "Dialect/Frisk/Analysis/LinearExecutionLayout.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
 #include "Dialect/Frisk/IR/FriskAttributes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
-#include "llvm/ADT/DenseSet.h"
 
 #include <algorithm>
 #include <limits>
@@ -21,8 +22,6 @@ constexpr uint64_t CostVector::*fields[] = {
     &CostVector::replication, &CostVector::codeSize,
     &CostVector::deterministicTieBreak};
 constexpr uint64_t maximum = std::numeric_limits<uint64_t>::max();
-constexpr uint64_t maximumLogicalElements = 65536;
-constexpr uint64_t maximumCarriers = 262144;
 uint64_t add(uint64_t a, uint64_t b, bool &saturated) {
   if (a > maximum - b) { saturated = true; return maximum; }
   return a + b;
@@ -41,6 +40,37 @@ LogicalResult validateDistributed(DistributedEncodingAttr encoding,
     if (extent <= 0) return failure();
   return encoding.verifyForType(type, UnknownLoc::get(type.getContext()));
 }
+// Only immutable (type, encoding) validation is reused. Resource aggregation,
+// alias-root ownership and observer order still execute for every assignment.
+// Failure diagnostics are never cached or suppressed.
+LogicalResult validateStaticCostCandidate(const LayoutConstraintGraph &graph,
+                                          Type type, Attribute candidate) {
+  std::optional<LayoutProfile::Scope> lookupProfile;
+  auto key = std::make_pair(type, candidate);
+  auto &cache = graph.getStaticCostValidationCache();
+  const bool enabled = graph.isCostQueryCacheEnabled();
+  if (enabled) {
+    lookupProfile.emplace(LayoutProfileKind::StaticCostValidationCache);
+    bool hit = cache.contains(key);
+    LayoutProfile::cacheLookup(LayoutProfileKind::StaticCostValidationCache, hit);
+    if (hit) return success();
+  }
+  LayoutProfile::Scope validationProfile(LayoutProfileKind::StaticCostValidation);
+  LogicalResult result = failure();
+  if (auto encoding = dyn_cast_or_null<DistributedEncodingAttr>(candidate)) {
+    result = validateDistributed(encoding, dyn_cast_or_null<ShapedType>(type));
+  } else if (auto layout = dyn_cast_or_null<StorageLayoutAttr>(candidate)) {
+    auto memref = dyn_cast_or_null<MemRefType>(type);
+    if (memref && memref.hasStaticShape())
+      result = layout.verifyForType(memref, UnknownLoc::get(type.getContext()));
+  }
+  if (succeeded(result) && enabled && cache.size() < graph.getCostQueryCacheCapacity()) {
+    if (cache.insert(key).second)
+      LayoutProfile::cacheInsertion(LayoutProfileKind::StaticCostValidationCache);
+  }
+  return result;
+}
+
 FailureOr<uint64_t> threads(DistributedEncodingAttr encoding) {
   auto topology = encoding.getTopology();
   if (topology[4] != 1) return failure();
@@ -52,69 +82,45 @@ FailureOr<uint64_t> threads(DistributedEncodingAttr encoding) {
   return count;
 }
 
-struct Owner {
-  uint64_t reg = 0, lane = 0, warp = 0, warpGroup = 0;
-};
-
-FailureOr<APInt> encodeOwner(BitLinearLayoutMapAttr map, const Owner &owner,
-                             unsigned bits) {
-  APInt encoded(bits, 0);
-  unsigned offset = 0;
-  for (auto [nameAttr, width] :
-       llvm::zip_equal(map.getInputNames(),
-                       map.getInputBitWidths().asArrayRef())) {
-    StringRef name = cast<StringAttr>(nameAttr).getValue();
-    uint64_t value;
-    if (name == "register") value = owner.reg;
-    else if (name == "lane") value = owner.lane;
-    else if (name == "warp") value = owner.warp;
-    else if (name == "warp_group") value = owner.warpGroup;
-    else if (name == "cta") value = 0;
-    else return failure();
-    encoded |= APInt(bits, value).shl(offset);
-    offset += width;
-  }
-  return encoded;
-}
-
-FailureOr<uint64_t> logicalSlot(BitLinearLayoutMapAttr map,
-                                const GF2Matrix &matrix, const Owner &owner,
-                                ArrayRef<int64_t> shape) {
-  auto encoded = encodeOwner(map, owner, matrix.getNumColumns());
-  if (failed(encoded)) return failure();
-  APInt output = matrix.apply(*encoded);
-  uint64_t slot = 0;
-  unsigned offset = 0;
-  for (auto [extent, width] :
-       llvm::zip_equal(shape, map.getOutputBitWidths().asArrayRef())) {
-    uint64_t coordinate = width ? output.extractBitsAsZExtValue(width, offset) : 0;
-    if (coordinate >= uint64_t(extent)) return failure();
-    slot = slot * uint64_t(extent) + coordinate;
-    offset += width;
-  }
-  return slot;
-}
-
-uint64_t physicalThread(const Owner &owner, ArrayRef<int64_t> topology) {
-  return (owner.warpGroup * uint64_t(topology[2]) + owner.warp) *
-             uint64_t(topology[1]) +
-         owner.lane;
-}
-
-uint64_t physicalWarp(const Owner &owner, ArrayRef<int64_t> topology) {
-  return owner.warpGroup * uint64_t(topology[2]) + owner.warp;
-}
-
-template <typename Callback>
-LogicalResult enumerateOwners(ArrayRef<int64_t> topology,
-                              Callback &&callback) {
-  for (uint64_t warpGroup = 0; warpGroup < uint64_t(topology[3]); ++warpGroup)
-    for (uint64_t warp = 0; warp < uint64_t(topology[2]); ++warp)
-      for (uint64_t lane = 0; lane < uint64_t(topology[1]); ++lane)
-        for (uint64_t reg = 0; reg < uint64_t(topology[0]); ++reg)
-          if (failed(callback(Owner{reg, lane, warp, warpGroup})))
-            return failure();
-  return success();
+// A conversion can stay in a scope iff every target logical value has a
+// source owner in the same physical scope. Let U be the image of source
+// registers (thread scope), or source registers and lanes (warp scope).
+// Target varying columns, and target/source differences for every fixed
+// carrier column, must all belong to U. This tests the complete affine family
+// by GF(2) image membership, including nonzero dependent/broadcast columns;
+// no logical coordinates or hardware holders are enumerated.
+FailureOr<bool> sourceScopeContains(const LinearExecutionLayout &source,
+                                    const LinearExecutionLayout &target,
+                                    unsigned freeCarriers) {
+  if (!source.logicalBits) return true;
+  unsigned freeBits = 0;
+  for (unsigned c = 0; c < freeCarriers; ++c)
+    freeBits += source.hardwareWidths[c];
+  // A zero-dimensional source image uses one zero column because GF2Matrix
+  // deliberately rejects empty axes. Otherwise use precisely the free columns.
+  SmallVector<APInt> rows;
+  for (const auto &row : source.rows)
+    rows.push_back(freeBits ? row.extractBits(freeBits, 0) : APInt(1, 0));
+  auto image = GF2Matrix::get(source.logicalBits, std::max(1u, freeBits), rows);
+  if (failed(image)) return failure();
+  // im(U) = ker(U^T)^perp. Eliminate once for the annihilator, then each
+  // membership query is only parity dot products. An empty annihilator proves
+  // that the source free image covers the whole logical bit space.
+  auto annihilator = image->transpose().kernelBasis();
+  if (annihilator.empty()) return true;
+  for (unsigned c = 0; c < 5; ++c)
+    for (unsigned bit = 0; bit < target.hardwareWidths[c]; ++bit) {
+      APInt column(source.logicalBits, 0);
+      for (unsigned r = 0; r < source.logicalBits; ++r) {
+        bool value = target.rows[r][target.hardwareOffsets[c] + bit];
+        if (c >= freeCarriers)
+          value ^= source.rows[r][source.hardwareOffsets[c] + bit];
+        column.setBitVal(r, value);
+      }
+      for (const auto &normal : annihilator)
+        if ((normal & column).popcount() & 1) return false;
+    }
+  return true;
 }
 
 FailureOr<ConversionExchangeKind>
@@ -127,69 +133,27 @@ classifyExchange(RankedTensorType type, DistributedEncodingAttr source,
       sourceTopology[1] != 32)
     return ConversionExchangeKind::Conservative;
 
-  uint64_t volume = 1;
-  for (int64_t extent : type.getShape()) {
-    if (extent <= 0 || uint64_t(extent) > maximumLogicalElements / volume)
-      return ConversionExchangeKind::Conservative;
-    volume *= uint64_t(extent);
-  }
-  uint64_t sourceCarriers = 1, targetCarriers = 1;
-  bool saturated = false;
-  for (int64_t extent : sourceTopology)
-    sourceCarriers = multiply(sourceCarriers, extent, saturated);
-  for (int64_t extent : targetTopology)
-    targetCarriers = multiply(targetCarriers, extent, saturated);
-  if (saturated || sourceCarriers > maximumCarriers ||
-      targetCarriers > maximumCarriers - sourceCarriers)
-    return ConversionExchangeKind::Conservative;
-
-  auto sourceCanonical = source.getCanonicalMap(type);
-  auto targetCanonical = target.getCanonicalMap(type);
-  if (failed(sourceCanonical) || failed(targetCanonical))
-    return ConversionExchangeKind::Conservative;
-  auto sourceMap = dyn_cast<BitLinearLayoutMapAttr>(*sourceCanonical);
-  auto targetMap = dyn_cast<BitLinearLayoutMapAttr>(*targetCanonical);
+  auto sourceMap = dyn_cast<BitLinearLayoutMapAttr>(source.getMap());
+  auto targetMap = dyn_cast<BitLinearLayoutMapAttr>(target.getMap());
   if (!sourceMap || !targetMap ||
       sourceMap.getOutputNames() != targetMap.getOutputNames() ||
       sourceMap.getOutputBitWidths() != targetMap.getOutputBitWidths())
     return ConversionExchangeKind::Conservative;
-  auto sourceMatrix = sourceMap.getMatrixValue();
-  auto targetMatrix = targetMap.getMatrixValue();
-  if (failed(sourceMatrix) || failed(targetMatrix))
+  LinearExecutionLayout sourceLinear, targetLinear;
+  if (analyzeLinearExecutionLayout(source, type, sourceLinear).status != ProofStatus::Proven ||
+      analyzeLinearExecutionLayout(target, type, targetLinear).status != ProofStatus::Proven ||
+      proveExecutionOwnership(source, type, "first_owner").status != ProofStatus::Proven ||
+      proveExecutionOwnership(target, type, "first_owner").status != ProofStatus::Proven)
     return ConversionExchangeKind::Conservative;
-
-  DenseSet<std::pair<uint64_t, uint64_t>> threadOwners;
-  DenseSet<std::pair<uint64_t, uint64_t>> warpOwners;
-  DenseSet<uint64_t> globalOwners;
-  if (failed(enumerateOwners(sourceTopology, [&](const Owner &owner) {
-        auto slot = logicalSlot(sourceMap, *sourceMatrix, owner,
-                                type.getShape());
-        if (failed(slot)) return failure();
-        threadOwners.insert({*slot, physicalThread(owner, sourceTopology)});
-        warpOwners.insert({*slot, physicalWarp(owner, sourceTopology)});
-        globalOwners.insert(*slot);
-        return success();
-      })))
-    return ConversionExchangeKind::Conservative;
-
-  ConversionExchangeKind result = ConversionExchangeKind::Register;
-  if (failed(enumerateOwners(targetTopology, [&](const Owner &owner) {
-        auto slot = logicalSlot(targetMap, *targetMatrix, owner,
-                                type.getShape());
-        if (failed(slot) || !globalOwners.contains(*slot)) return failure();
-        if (threadOwners.contains(
-                {*slot, physicalThread(owner, targetTopology)}))
-          return success();
-        if (warpOwners.contains({*slot, physicalWarp(owner, targetTopology)})) {
-          if (result == ConversionExchangeKind::Register)
-            result = ConversionExchangeKind::Shuffle;
-          return success();
-        }
-        result = ConversionExchangeKind::Shared;
-        return success();
-      })))
-    return ConversionExchangeKind::Conservative;
-  return result;
+  auto thread = sourceScopeContains(sourceLinear, targetLinear, 1);
+  if (failed(thread)) return ConversionExchangeKind::Conservative;
+  if (*thread) return ConversionExchangeKind::Register;
+  auto warp = sourceScopeContains(sourceLinear, targetLinear, 2);
+  if (failed(warp)) return ConversionExchangeKind::Conservative;
+  if (*warp) return ConversionExchangeKind::Shuffle;
+  // Both layouts cover the logical domain and use the same single CTA;
+  // a source exists globally even when neither narrower scope suffices.
+  return ConversionExchangeKind::Shared;
 }
 
 StringRef provenance(ConversionExchangeKind kind) {
@@ -197,11 +161,11 @@ StringRef provenance(ConversionExchangeKind kind) {
   case ConversionExchangeKind::Identity:
     return "bounded-owner-proof-v1/identity";
   case ConversionExchangeKind::Register:
-    return "bounded-owner-proof-v1/register";
+    return "symbolic-subspace-proof-v1/register";
   case ConversionExchangeKind::Shuffle:
-    return "bounded-owner-proof-v1/shuffle";
+    return "symbolic-subspace-proof-v1/shuffle";
   case ConversionExchangeKind::Shared:
-    return "bounded-owner-proof-v1/shared";
+    return "symbolic-subspace-proof-v1/shared";
   case ConversionExchangeKind::Conservative:
     return "cta-staging-upper-bound-v1";
   }
@@ -373,7 +337,7 @@ FailureOr<CostEstimate> mlir::frisk::evaluateStaticLayoutCost(
     if (var.kind == LayoutKind::Distributed) {
       auto type = dyn_cast_or_null<ShapedType>(var.shapedType);
       auto encoding = dyn_cast<DistributedEncodingAttr>(attr);
-      if (failed(validateDistributed(encoding, type))) return failure();
+      if (failed(validateStaticCostCandidate(graph, type, encoding))) return failure();
       CostEstimate charge;
       charge.cost.spillRiskAndRegisters = encoding.getTopology()[0];
       charge.cost.replication = encoding.getReplication().getValue().getLimitedValue() - 1;
@@ -384,7 +348,7 @@ FailureOr<CostEstimate> mlir::frisk::evaluateStaticLayoutCost(
     auto type = dyn_cast_or_null<MemRefType>(var.shapedType);
     auto layout = dyn_cast<StorageLayoutAttr>(attr);
     if (!type || !layout || !type.hasStaticShape() ||
-        failed(layout.verifyForType(type, UnknownLoc::get(type.getContext()))))
+        failed(validateStaticCostCandidate(graph, type, layout)))
       return failure();
     if (layout.getMemorySpace().getValue() != attr::MemorySpace::Shared) return success();
     std::optional<StorageAliasInfo> alias = var.storageAlias;

@@ -266,6 +266,7 @@ void LayoutTrace::setSummary(const LayoutTraceSummary &value) {
   summary.maxExpandedStates = value.maxExpandedStates;
   summary.refineBeamSolution = value.refineBeamSolution;
   summary.maxRefinementProbes = value.maxRefinementProbes;
+  summary.seedBeamSolution = value.seedBeamSolution;
   summary.hasFinalCost = value.hasFinalCost;
   summary.finalCost = {value.finalCost.cost, value.finalCost.saturated};
 }
@@ -276,6 +277,7 @@ void LayoutTrace::setSolverOptions(const SolverOptions &value) {
   summary.maxExpandedStates = value.maxExpandedStates;
   summary.refineBeamSolution = value.refineBeamSolution;
   summary.maxRefinementProbes = value.maxRefinementProbes;
+  summary.seedBeamSolution = value.seedBeamSolution;
 }
 std::string LayoutTrace::serialize() const {
   if (!enabled()) return {};
@@ -303,6 +305,7 @@ std::string LayoutTrace::serialize() const {
       {"finalCost", summary.hasFinalCost ? llvm::json::Value(layoutCostJSON(summary.finalCost))
                                          : llvm::json::Value(nullptr)},
       {"omittedCost", layoutCostJSON(omitted)}};
+  if (summary.seedBeamSolution) envelope.getObject("solver_options")->try_emplace("seedBeamSolution", true);
   if (!summary.costProfileSHA256.empty()) envelope["cost_profile_sha256"] = summary.costProfileSHA256;
   std::string result;
   llvm::raw_string_ostream stream(result);

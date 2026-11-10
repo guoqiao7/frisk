@@ -28,6 +28,12 @@ struct LayoutSolution {
     uint64_t deduplicated = 0;
     uint64_t peakFrontier = 0, mrvProbes = 0, expandedNodes = 0;
     uint64_t refinementProbes = 0, refinementSweeps = 0, refinementAccepted = 0;
+    // Constructive preference witnesses use the same total search budget.
+    uint64_t seedProbes = 0, seedScores = 0, seedWitnesses = 0;
+    CostEstimate seedStartCost;
+    // Whether the pre-refinement incumbent came from the seed portfolio.
+    bool seedSelected = false, beamBudgetFallback = false;
+    std::string seedStopReason = "disabled";
     CostEstimate refinementStartCost, refinementEndCost;
     std::string refinementStopReason = "no-incumbent";
     // Local refinement history is retained even when global saturation makes
@@ -48,6 +54,15 @@ struct LayoutSolution {
   SmallVector<CandidateRejection> rejections;
 };
 
+/// Optional receipt sink for already-paid, complete full-objective queries.
+/// It never scores, expands, or changes candidate legality. The caller owns it.
+class LayoutCompleteCandidateObserver {
+public:
+  virtual ~LayoutCompleteCandidateObserver() = default;
+  virtual void recordComplete(const LayoutConstraintGraph &, const CandidateAssignment &,
+      const CostEstimate &, const ExperimentPolicy &, const SharedSearchBudget &) = 0;
+};
+
 struct SolverOptions {
   uint64_t exactCombinationLimit = 256;
   unsigned beamWidth = 32;
@@ -56,6 +71,12 @@ struct SolverOptions {
   uint64_t maxRefinementProbes = 256;
   ExperimentPolicy policy;
   SharedSearchBudget *sharedBudget = nullptr;
+  // Computation reuse only: never changes candidates, scores or probe budgets.
+  bool memoizeCosts = true;
+  // Opt-in common-layout preference witnesses. No new candidates or budget.
+  // Seeds rank only complete verified assignments under the actual objective.
+  bool seedBeamSolution = false;
+  LayoutCompleteCandidateObserver *completeCandidateObserver = nullptr;
 };
 
 enum class LayoutSolveFailureKind {

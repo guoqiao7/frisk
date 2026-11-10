@@ -1,8 +1,12 @@
 #include "Conversion/FriskLayoutToGPU/LayoutConversionPlan.h"
 #include "Dialect/Frisk/Analysis/LayoutAlgebra.h"
+#include "Dialect/Frisk/Analysis/LinearExecutionLayout.h"
+#include "Dialect/Frisk/Analysis/ExecutionLayoutProof.h"
+#include <optional>
 #include "Dialect/Frisk/IR/FriskAttributes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/Support/MathExtras.h"
 #include <limits>
 
@@ -108,7 +112,7 @@ FailureOr<uint64_t> reserveScratch(uint64_t used, uint64_t bytes,
 
 FailureOr<RedistributionPlan> planRedistribution(RankedTensorType source,
                                                 RankedTensorType destination,
-                                                Location loc) {
+                                                Location loc,shuffle_network::Objective networkObjective) {
   if (!source.hasStaticShape() || !destination.hasStaticShape() ||
       source.getShape() != destination.getShape() ||
       source.getElementType() != destination.getElementType()) {
@@ -137,7 +141,7 @@ FailureOr<RedistributionPlan> planRedistribution(RankedTensorType source,
   }
   if (st[4] != 1) { unsupported(loc) << "cross-CTA/cluster communication is unsupported"; return failure(); }
   if (st[1] != 32) { unsupported(loc) << "requires lane extent 32"; return failure(); }
-  if (st[2] > 32 || st[3] > 32 || st[2] * st[3] > 32 || st[0] > 256 || dt[0] > 256) {
+  if (st[2] > 32 || st[3] > 32 || st[2] * st[3] > 32 || st[0] > 512 || dt[0] > 512) {
     unsupported(loc) << "adapter thread/register limit exceeded"; return failure();
   }
   RedistributionPlan p;
@@ -207,9 +211,117 @@ FailureOr<RedistributionPlan> planRedistribution(RankedTensorType source,
       p.destinations.push_back({o, slot});
     }
   if (p.mode == ExchangeMode::Shared) p.scratchBytes = p.volume * (p.payload.bits / 8);
-  if (p.mode == ExchangeMode::Shuffle &&
-      uint64_t(p.sourceRegisters) * p.destinationRegisters * p.payload.words.size() > 65536) {
-    unsupported(loc) << "adapter shuffle code-size limit exceeded"; return failure();
+  if (p.mode == ExchangeMode::Shuffle) {
+    if (p.threads == 128 && p.payload.bits == 32 &&
+        p.payload.words.size() == 1) {
+      std::vector<uint64_t> owners;
+      owners.reserve(p.destinations.size());
+      for (const auto &destination : p.destinations)
+        owners.push_back(uint64_t(p.thread(destination.source)) *
+                             p.sourceRegisters + destination.source.reg);
+      p.shuffleNetwork = shuffle_network::plan(
+          p.sourceRegisters, p.destinationRegisters, owners,networkObjective);
+    }
+    uint64_t work = 0;
+    for (unsigned r = 0; r < p.destinationRegisters; ++r) {
+      llvm::SmallBitVector support(p.sourceRegisters);
+      for (unsigned t = 0; t < p.threads; ++t)
+        support.set(p.destinations[t * p.destinationRegisters + r].source.reg);
+      work += uint64_t(support.count()) * p.payload.words.size();
+    }
+    // A network is bounded by its actual emitted SHFL calls. Unsupported
+    // maps retain the exact-support enumeration grammar and its original cap.
+    if (p.shuffleNetwork) work = p.shuffleNetwork->counts.shfl;
+    if (work > 65536) {
+      unsupported(loc) << "adapter shuffle emitted-work limit exceeded"; return failure();
+    }
+  }
+  return p;
+}
+
+namespace {
+struct SymbolicOwnerBasis {
+  SmallVector<uint64_t> pivots, owners;
+  SymbolicOwnerBasis(unsigned logicalBits):pivots(logicalBits,0),owners(logicalBits,0) {}
+  void insert(uint64_t value,uint64_t owner) {
+    for(unsigned bit=pivots.size();bit-- > 0;) {
+      if(!(value&(uint64_t{1}<<bit)))continue;
+      if(pivots[bit]) {value^=pivots[bit];owner^=owners[bit];}
+      else {pivots[bit]=value;owners[bit]=owner;return;}
+    }
+  }
+  std::optional<uint64_t> solve(uint64_t value) const {
+    uint64_t owner=0;
+    for(unsigned bit=pivots.size();bit-- > 0;)if(value&(uint64_t{1}<<bit)) {
+      if(!pivots[bit])return std::nullopt;
+      value^=pivots[bit];owner^=owners[bit];
+    }
+    return owner;
+  }
+};
+}
+
+FailureOr<RedistributionPlan> planSymbolicRegisterRedistribution(
+    RankedTensorType source,RankedTensorType destination,Location loc) {
+  if(!source.hasStaticShape() || !destination.hasStaticShape() ||
+     source.getShape()!=destination.getShape() || source.getElementType()!=destination.getElementType()) {
+    unsupported(loc)<<"symbolic Register route requires identical static shape/type";return failure();
+  }
+  auto se=dyn_cast_or_null<DistributedEncodingAttr>(source.getEncoding());
+  auto de=dyn_cast_or_null<DistributedEncodingAttr>(destination.getEncoding());
+  if(!se || !de || failed(se.verifyForType(source,loc)) || failed(de.verifyForType(destination,loc)))return failure();
+  LinearExecutionLayout sl,dl;
+  auto sp=analyzeLinearExecutionLayout(se,source,sl),dp=analyzeLinearExecutionLayout(de,destination,dl);
+  auto so=proveExecutionOwnership(se,source,"first_owner"),dof=proveExecutionOwnership(de,destination,"first_owner");
+  if(sp.status!=ProofStatus::Proven || dp.status!=ProofStatus::Proven ||
+     so.status!=ProofStatus::Proven || dof.status!=ProofStatus::Proven) {
+    unsupported(loc)<<"symbolic Register ownership/representation is not Proven";return failure();
+  }
+  auto st=se.getTopology().asArrayRef(),dt=de.getTopology().asArrayRef();
+  if(st.drop_front()!=dt.drop_front() || st[1]!=32 || st[4]!=1 ||
+     st[2]>32 || st[3]>32 || st[2]*st[3]>32 ||
+     sl.logicalBits>16 || sl.hardwareBits>=63 || dl.hardwareBits>16) {
+    unsupported(loc)<<"symbolic Register route exceeds finite destination/topology domain";return failure();
+  }
+  auto sm=cast<BitLinearLayoutMapAttr>(se.getMap()),dm=cast<BitLinearLayoutMapAttr>(de.getMap());
+  if(sm.getOutputNames()!=dm.getOutputNames() || sm.getOutputBitWidths()!=dm.getOutputBitWidths()) {
+    unsupported(loc)<<"symbolic Register logical output names/order differ";return failure();
+  }
+  RedistributionPlan p;
+  p.threads=32*st[2]*st[3];p.warps=st[2];p.sourceRegisters=st[0];p.destinationRegisters=dt[0];
+  p.volume=uint64_t{1}<<sl.logicalBits;p.symbolicSource=true;
+  auto payload=planPayload(source.getElementType(),loc);if(failed(payload))return failure();p.payload=*payload;
+  SymbolicOwnerBasis all(sl.logicalBits),local(sl.logicalBits);
+  for(unsigned bit=0;bit<sl.hardwareBits;++bit) {
+    APInt unit(std::max(1u,sl.hardwareBits),0);unit.setBit(bit);
+    uint64_t column=sl.apply(unit).getZExtValue();all.insert(column,uint64_t{1}<<bit);
+    if(bit<sl.hardwareWidths[0])local.insert(column,uint64_t{1}<<bit);
+  }
+  for(uint64_t slot=0;slot<p.volume;++slot) {
+    auto owner=all.solve(bitsOfSlot(slot,source.getShape(),std::max(1u,sl.logicalBits)).getZExtValue());
+    if(!owner){(void)counterexample(loc,"symbolic global source coverage",slot,source.getShape());return failure();}
+    auto coordinates=sl.hardwareCoordinate(APInt(std::max(1u,sl.hardwareBits),*owner));
+    p.globalWriters.push_back(Owner{unsigned(coordinates[4]),unsigned(coordinates[3]),unsigned(coordinates[2]),unsigned(coordinates[1])});
+  }
+  // Only destination holders are visited. A source Register solution is the
+  // smallest source register in the SAME physical thread, not a global owner.
+  for(unsigned thread=0;thread<p.threads;++thread) {
+    uint64_t fixed=uint64_t(thread)*p.sourceRegisters;
+    uint64_t fixedLogical=sl.apply(APInt(std::max(1u,sl.hardwareBits),fixed)).getZExtValue();
+    for(unsigned reg=0;reg<p.destinationRegisters;++reg) {
+      APInt input(std::max(1u,dl.hardwareBits),uint64_t(thread)*p.destinationRegisters+reg);
+      APInt logical=dl.apply(input);
+      auto selected=local.solve(logical.getZExtValue()^fixedLogical);
+      uint64_t slot=slotOf(dm,logical,destination.getShape());
+      if(!selected || *selected>=p.sourceRegisters) {
+        (void)counterexample(loc,"large-source non-Register communication remains unsupported",slot,source.getShape());return failure();
+      }
+      auto owner=p.owner(thread,*selected);
+      if(sl.apply(APInt(std::max(1u,sl.hardwareBits),fixed+*selected))!=logical) {
+        (void)counterexample(loc,"symbolic Register composition mismatch",slot,source.getShape());return failure();
+      }
+      p.destinations.push_back({owner,slot});
+    }
   }
   return p;
 }

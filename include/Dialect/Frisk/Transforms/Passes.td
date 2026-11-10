@@ -17,6 +17,9 @@ def FriskInferLayouts : Pass<"frisk-infer-layouts", "::mlir::ModuleOp"> {
   let options = [
     Option<"costProfileFile", "cost-profile", "std::string", "\"\"", "Read an explicit SM90 calibrated cost profile JSON">,
     Option<"boundaryFrequency", "boundary-frequency", "std::string", "\"legacy\"", "Boundary frequency: legacy or static-trip-count">,
+    Option<"memoizeCosts", "memoize-costs", "bool", "true", "Reuse bounded graph-local pure cost queries">,
+    Option<"seedBeamSolution", "seed-beam-solution", "bool", "false", "Generate budgeted coherent-layout witnesses before beam search">,
+    Option<"conversionPolicy", "conversion-policy", "std::string", "\"full\"", "Conversion policy: full, shared-only or independent">,
     Option<"profileFile", "profile-file", "std::string", "\"\"", "Atomically write invocation-local inclusive layout profile JSON">,
     Option<"traceFile", "trace-file", "std::string", "\"\"", "Atomically write layout decision trace JSON">,
     Option<"traceMaxEvents", "trace-max-events", "uint64_t", "4096", "Maximum trace events">,
@@ -58,7 +61,9 @@ def TestLowerLayoutConversions : Pass<"frisk-test-lower-layout-conversions", "::
 def ExportExecution : Pass<"frisk-export-execution", "::mlir::ModuleOp"> {
  let summary = "Export bounded checked execution maps and reduction proofs";
  let constructor = "mlir::frisk::createExportExecutionPass()";
- let options = [Option<"output", "output", "std::string", "\"\"", "Atomic JSON output path">];
+ let options = [Option<"output", "output", "std::string", "\"\"", "Atomic JSON output path">,
+   Option<"minify", "minify", "bool", "false", "Write execution JSON without indentation">,
+   Option<"networkObjective", "network-objective", "std::string", "\"min-shfl\"", "Verified Shuffle objective: min-shfl or min-work">];
 }
 
 #endif // FRISK_PASSES

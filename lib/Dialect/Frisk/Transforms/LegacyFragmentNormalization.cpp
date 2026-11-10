@@ -65,6 +65,16 @@ LogicalResult verifyImportAttributes(Operation *scope, bool allowLegacyThreads) 
       }
       StringRef name = named.getName().getValue();
       if (!name.starts_with("frisk.")) continue;
+      // The scalar executor domain is a module-wide capability contract shared
+      // by every objective. Do not drop it during legacy normalization.
+      if (name == "frisk.execution_domain") {
+        auto domain = dyn_cast<StringAttr>(named.getValue());
+        if (isa<ModuleOp>(op) && domain &&
+            domain.getValue() == "sm90-scalar-f32-dag-v1")
+          continue;
+        op->emitError("execution-domain-contract: expected module-level sm90-scalar-f32-dag-v1");
+        return WalkResult::interrupt();
+      }
       if (name == "frisk.target" || name == "frisk.legacy_semantics" ||
           name == "frisk.execution_threads" || name == "frisk.execution_layout" ||
           name == "frisk.writer_policy" || name == "frisk.vector_bytes" ||

@@ -2,6 +2,7 @@
 #define FRISK_ANALYSIS_LAYOUTALIASANALYSIS_H
 
 #include "Dialect/Frisk/Analysis/LayoutCommon.h"
+#include "Dialect/Frisk/IR/ContiguousStorageLayout.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Value.h"
@@ -45,6 +46,10 @@ FailureOr<StorageAliasInfo> analyzeStorageAlias(Value endpoint);
 /// Checked coordinate evaluation shared by alias and execution proofs.
 FailureOr<SmallVector<int64_t>> evaluateStorageViewCoordinates(
     const StorageAliasInfo &info, ArrayRef<int64_t> point);
+/// Also requires actual root/type/identity-transform/span agreement.
+/// This proof never replaces a populated data-consuming footprint.
+std::optional<ContiguousIdentityStorage> matchContiguousIdentityStorageAlias(
+    const StorageAliasInfo &info, StorageLayoutAttr candidate);
 LayoutProof verifyStorageAliasCandidate(const StorageAliasInfo &info,
                                         StorageLayoutAttr candidate);
 LayoutProof proveStorageAliasCompatible(const StorageAliasInfo &a,

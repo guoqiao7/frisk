@@ -132,7 +132,8 @@ public:
     pipeline.addPass(createFriskInferLayoutsPass(options, true, &report, LayoutStatisticsScope::Pipeline,
                                                trace ? &*trace : nullptr, &profile, mode, calibration ? &*calibration : nullptr));
     pipeline.addPass(std::make_unique<PreserveRootContractsPass>());
-    pipeline.addPass(createOptimizeLayoutConversionsPass(mode, calibration ? &*calibration : nullptr));
+    if (options.policy.conversion == ConversionPolicy::Full)
+      pipeline.addPass(createOptimizeLayoutConversionsPass(mode, calibration ? &*calibration : nullptr));
     bool failedPipeline = failed(pipeline.run(*staged));
     auto verificationStart = LayoutClock::now();
     bool failedFinalVerification = false;
@@ -150,7 +151,7 @@ public:
       report.status = "committed";
       if (irDiagnostics) {
         report.actualIRDiagnostics = llvm::json::Object{
-            {"stage", "post-conversion-optimization"},
+            {"stage", options.policy.conversion == ConversionPolicy::Full ? "post-conversion-optimization" : "post-inference-selected-conversion-policy"},
             {"arithmetic", collectLayoutIRArithmetic(*staged)},
             {"resources", collectLayoutIRResources(*staged)}};
         if (trace) trace->recordEvent([&] {
@@ -224,6 +225,9 @@ void registerFriskLayoutPipelines() {
     Option<std::string> costProfileFile{*this, "cost-profile", llvm::cl::desc("Explicit SM90 calibrated cost profile JSON"), llvm::cl::init("")};
     Option<std::string> boundaryFrequency{*this, "boundary-frequency", llvm::cl::desc("Boundary frequency: legacy or static-trip-count"), llvm::cl::init("legacy")};
     Option<bool> irDiagnostics{*this, "ir-diagnostics", llvm::cl::desc("Collect post-optimization static logical arithmetic and resource diagnostics"), llvm::cl::init(false)};
+    Option<bool> memoizeCosts{*this, "memoize-costs", llvm::cl::desc("Reuse bounded graph-local pure cost queries"), llvm::cl::init(true)};
+    Option<bool> seedBeamSolution{*this, "seed-beam-solution", llvm::cl::desc("Budgeted coherent-layout witnesses before beam search"), llvm::cl::init(false)};
+    Option<std::string> conversionPolicy{*this, "conversion-policy", llvm::cl::desc("Conversion policy: full, shared-only or independent"), llvm::cl::init("full")};
     Option<std::string> profileFile{*this, "profile-file", llvm::cl::desc("Invocation-local inclusive layout profile JSON"), llvm::cl::init("")};
     Option<std::string> traceFile{*this, "trace-file", llvm::cl::desc("Layout decision trace JSON"), llvm::cl::init("")};
     Option<uint64_t> traceMaxEvents{*this, "trace-max-events", llvm::cl::desc("Maximum trace events"), llvm::cl::init(4096)};
@@ -250,9 +254,14 @@ void registerFriskLayoutPipelines() {
           pm.addPass(std::move(pass));
           return;
         }
-        buildFriskLayoutPipeline(pm, {options.exactCombinationLimit,
+        SolverOptions solverOptions{options.exactCombinationLimit,
                                     options.beamWidth, options.maxExpandedStates,
-                                    options.refineBeamSolution, options.maxRefinementProbes}, options.statsFile, nullptr,
+                                    options.refineBeamSolution, options.maxRefinementProbes};
+        solverOptions.memoizeCosts = options.memoizeCosts;
+        solverOptions.seedBeamSolution = options.seedBeamSolution;
+        if (options.conversionPolicy != "full" && options.conversionPolicy != "shared-only" && options.conversionPolicy != "independent") llvm::report_fatal_error("unknown conversion-policy");
+        solverOptions.policy.conversion = options.conversionPolicy == "independent" ? ConversionPolicy::Independent : options.conversionPolicy == "shared-only" ? ConversionPolicy::SharedOnly : ConversionPolicy::Full;
+        buildFriskLayoutPipeline(pm, solverOptions, options.statsFile, nullptr,
                                  {options.traceFile, options.traceMaxEvents, options.traceMaxBytes}, options.profileFile, options.irDiagnostics, options.boundaryFrequency == "legacy" ? LayoutBoundaryFrequencyMode::Legacy : LayoutBoundaryFrequencyMode::StaticTripCount, options.costProfileFile);
       });
   (void)registration;

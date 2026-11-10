@@ -54,8 +54,12 @@ public:
     maxExpandedStates = options.maxExpandedStates;
     refineBeamSolution = options.refineBeamSolution;
     maxRefinementProbes = options.maxRefinementProbes;
+    memoizeCosts = options.memoizeCosts;
+    seedBeamSolution = options.seedBeamSolution;
+    conversionPolicy = options.policy.conversion == ConversionPolicy::Independent ? "independent" : options.policy.conversion == ConversionPolicy::SharedOnly ? "shared-only" : "full";
   }
   void runOnOperation() override {
+    if (conversionPolicy != "full" && conversionPolicy != "shared-only" && conversionPolicy != "independent") { getOperation().emitError("unknown conversion-policy"); signalPassFailure(); return; }
     LayoutProfile ownedProfile(!profileFile.empty());
     auto *activeProfile = ownedProfile.enabled() ? &ownedProfile : profile;
     LayoutProfile::Invocation profileInvocation(activeProfile);
@@ -90,8 +94,12 @@ public:
     report.staticTripCountFrequency = mode == LayoutBoundaryFrequencyMode::StaticTripCount;
     auto initializeTrace = [&](LayoutTrace *recorder) {
       if (!recorder) return;
-      recorder->setSolverOptions({exactCombinationLimit, beamWidth, maxExpandedStates,
-                                 refineBeamSolution, maxRefinementProbes});
+      SolverOptions traceSolver{exactCombinationLimit, beamWidth, maxExpandedStates,
+                                refineBeamSolution, maxRefinementProbes};
+      traceSolver.seedBeamSolution = seedBeamSolution;
+      traceSolver.memoizeCosts = memoizeCosts;
+      traceSolver.policy.conversion = conversionPolicy == "independent" ? ConversionPolicy::Independent : conversionPolicy == "shared-only" ? ConversionPolicy::SharedOnly : ConversionPolicy::Full;
+      recorder->setSolverOptions(traceSolver);
       auto summary = recorder->getSummary();
       summary.target = "SM90";
       summary.costCoverage = target->costCoverage().str();
@@ -193,10 +201,14 @@ public:
     SmallVector<RelaxationRecord, 0> relaxations;
     LayoutSolveFailure why;
     auto solveStart = LayoutClock::now();
+    SolverOptions solverOptions{exactCombinationLimit, beamWidth, maxExpandedStates,
+                                refineBeamSolution, maxRefinementProbes};
+    solverOptions.memoizeCosts = memoizeCosts;
+    solverOptions.seedBeamSolution = seedBeamSolution;
+    solverOptions.policy.conversion = conversionPolicy == "independent" ? ConversionPolicy::Independent : conversionPolicy == "shared-only" ? ConversionPolicy::SharedOnly : ConversionPolicy::Full;
     FailureOr<LayoutSolution> solution =
-        attemptControlledRelaxation(*graph, target,
-            {exactCombinationLimit, beamWidth, maxExpandedStates,
-             refineBeamSolution, maxRefinementProbes}, relaxations, &why, &report, activeTrace);
+        attemptControlledRelaxation(*graph, target, solverOptions,
+                                    relaxations, &why, &report, activeTrace);
     report.timings["propagation_search_retries_ns"] = layoutElapsedNS(solveStart);
     if (dumpAnalysis) printRelaxationRecords(relaxations, llvm::errs());
     if (failed(solution)) {
@@ -204,7 +216,7 @@ public:
       return failure();
     }
     auto proofStart = LayoutClock::now();
-    auto proof = verifySolvedLayoutGraph(*graph, *solution, target, module.getLoc());
+    auto proof = verifySolvedLayoutGraph(*graph, *solution, target, module.getLoc(), solverOptions.policy.conversion);
     report.timings["verification_ns"] += layoutElapsedNS(proofStart);
     if (failed(proof)) {
       if (activeTrace) {
@@ -245,7 +257,7 @@ public:
     if (analysisOnly) return success();
     auto materializeStart = LayoutClock::now();
     auto materialized = materializeLayouts(module, *graph, *solution,
-                                           authorizeInternalOptimization, &target);
+                                           authorizeInternalOptimization, &target, solverOptions.policy.conversion);
     report.timings["materialization_ns"] = layoutElapsedNS(materializeStart);
     auto verificationStart = LayoutClock::now();
     auto verified = succeeded(materialized) ? verifyMaterializedLayouts(module, target) : failure();

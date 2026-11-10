@@ -11,6 +11,8 @@
 #include "Dialect/Frisk/Analysis/ReductionLayoutConstraints.h"
 #include "mlir/IR/Diagnostics.h"
 #include <map>
+#include <functional>
+#include <optional>
 
 namespace mlir::frisk {
 namespace {
@@ -20,7 +22,13 @@ Location getVariableLoc(const LayoutVar &var) {
 }
 
 SmallVector<SmallVector<LayoutVarID>>
-getHardConstraintComponents(const LayoutConstraintGraph &graph) {
+getHardConstraintComponents(const LayoutConstraintGraph &graph,
+                            bool needsCompleteAssignment) {
+  if (needsCompleteAssignment) {
+    SmallVector<LayoutVarID> all;
+    for (const auto &v : graph.getVariables()) all.push_back(v.id);
+    return {std::move(all)};
+  }
   SmallVector<SmallVector<LayoutVarID>> adjacency(graph.getVariables().size());
   for (const LayoutConstraint &constraint : graph.getConstraints()) {
     if (constraint.strength != ConstraintStrength::Hard ||
@@ -65,6 +73,14 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
                  LayoutAttemptStatistics *statistics, LayoutTrace *trace,
                  bool diagnostic) {
   if (trace && !trace->enabled()) trace = nullptr;
+  const bool needsWholeAssignment =
+      (options.seedBeamSolution && options.policy.scope.fullGraph) ||
+      (options.completeCandidateObserver && options.policy.scope.fullGraph) ||
+      target.needsCompleteAssignmentCost() ||
+      target.needsCompleteAssignmentValidation(graph);
+  const bool strictTotalBudget = options.sharedBudget || options.seedBeamSolution ||
+                                needsWholeAssignment;
+  const bool ownsSharedBudget = !options.sharedBudget && strictTotalBudget;
   if (trace) {
     trace->setSolverOptions(options);
     auto summary = trace->getSummary();
@@ -81,6 +97,8 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
       {"exactCombinationLimit", options.exactCombinationLimit},
       {"beamWidth", options.beamWidth}, {"maxExpandedStates", options.maxExpandedStates},
       {"refineBeamSolution", options.refineBeamSolution},
+      {"seedBeamSolution", options.seedBeamSolution},
+      {"strictTotalBudget", strictTotalBudget}, {"ownedSharedBudget", ownsSharedBudget},
       {"maxRefinementProbes", options.maxRefinementProbes},
       {"costCoverage", target.costCoverage()}}; });
   bool solved = false;
@@ -141,6 +159,7 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
   // Public callers may supply a valid but not yet canonical graph. Avoid
   // re-finalizing production graphs: that would erase propagation statistics.
   if (!graph.isFinalized() && failed(graph.finalize(loc))) return failure();
+  graph.setCostQueryCacheOptions(options.memoizeCosts);
   for (const auto &c : graph.getConstraints())
     if (c.strength == ConstraintStrength::Hard &&
         (!isSupportedHardLayoutConstraint(c.kind) ||
@@ -161,6 +180,34 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
     }
     return value * factor;
   };
+  SharedSearchBudget ownedBudget;
+  if (ownsSharedBudget) {
+    ownedBudget.limit = ownedBudget.stageLimit = options.maxExpandedStates;
+    ownedBudget.refinementLimit = ownedBudget.stageRefinementLimit =
+        options.maxRefinementProbes;
+    options.sharedBudget = &ownedBudget;
+  }
+  uint64_t seedWorkUsed = 0;
+  uint64_t seedAvailable = options.maxExpandedStates;
+  if (options.sharedBudget) {
+    const auto &b = *options.sharedBudget;
+    uint64_t cap = std::min(b.limit, b.stageLimit);
+    seedAvailable = b.used < cap ? cap - b.used : 0;
+  }
+  const uint64_t seedWorkLimit = std::min<uint64_t>(8192, seedAvailable / 8);
+  auto finishBudget = llvm::make_scope_exit([&] {
+    if (!trace || !strictTotalBudget || !options.sharedBudget) return;
+    const auto &b = *options.sharedBudget;
+    trace->recordEvent([&] { return llvm::json::Object{
+        {"event", "search-budget-summary"}, {"strictTotalBudget", true},
+        {"ownedSharedBudget", ownsSharedBudget}, {"limit", b.limit},
+        {"stageLimit", b.stageLimit}, {"used", b.used},
+        {"refinementLimit", b.refinementLimit},
+        {"refinementUsed", b.refinementUsed},
+        {"seedWorkLimit", seedWorkLimit}, {"seedWorkUsed", seedWorkUsed},
+        {"relationshipProbes", b.relationshipProbes},
+        {"completeScores", b.completeScores}, {"refinementProbes", b.refinementProbes}}; });
+  });
   bool refinementEvaluation = false;
   bool sharedBudgetExhausted = false;
   auto debit = [&](bool refinement, bool completeScore) {
@@ -179,6 +226,10 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
     auto *observer = edges && !diagnostic ? trace : nullptr;
     auto cost = scoreExperimentAssignment(graph, assignment, target, options.policy, observer);
     if (failed(cost)) return failure();
+    if (!edges && options.completeCandidateObserver && options.policy.scope.fullGraph &&
+        assignment.values.size() == graph.getVariables().size() && !cost->saturated)
+      options.completeCandidateObserver->recordComplete(graph, assignment, *cost,
+          options.policy, *options.sharedBudget);
     if (edges) {
       auto choices=chooseLayoutConversions(graph,assignment,target,nullptr,options.policy.conversion);
       if(failed(choices))return failure();
@@ -192,7 +243,7 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
     size_t solutionIndex, statisticsIndex;
   };
   SmallVector<PendingComponent, 1> pending;
-  for (auto component : getHardConstraintComponents(graph)) {
+  for (auto component : getHardConstraintComponents(graph, needsWholeAssignment)) {
     bool emptyComponent = false;
     bool selectedComponent = false;
     LayoutSolution::ComponentStatistics stats;
@@ -223,6 +274,11 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
         {"expanded", stats.expanded}, {"peakFrontier", stats.peakFrontier},
         {"mrvProbes", stats.mrvProbes}, {"expandedNodes", stats.expandedNodes},
         {"refinementProbes", stats.refinementProbes},
+        {"seedProbes", stats.seedProbes}, {"seedScores", stats.seedScores},
+        {"seedWitnesses", stats.seedWitnesses}, {"seedSelectedBeforeRefinement", stats.seedSelected},
+        {"seedStartCost", stats.seedWitnesses ? llvm::json::Value(layoutCostJSON(stats.seedStartCost)) : llvm::json::Value(nullptr)},
+        {"seedStopReason", stats.seedStopReason},
+        {"beamBudgetFallback", stats.beamBudgetFallback},
         {"refinementSweeps", stats.refinementSweeps},
         {"refinementAccepted", stats.refinementAccepted},
         {"refinementStartCost", stats.refinementStopReason == "no-incumbent" ? llvm::json::Value(nullptr) : llvm::json::Value(layoutCostJSON(stats.refinementStartCost))},
@@ -467,6 +523,22 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
           return false;
         }
       }
+      // This is the common, explicitly declared backend support domain, not a
+      // model-specific cost shortcut. Incomplete assignments may only reject
+      // an already known counterexample; uncertainty is never hard emptiness.
+      auto execution = target.verifyExecutionSupport(graph, s.assignment);
+      if (execution.status != ProofStatus::Proven) {
+        bool unknown = execution.status == ProofStatus::Unknown;
+        unknownRelation |= unknown;
+        if (status) *status = unknown ? "ExecutionUnknown" : "ExecutionUnsupported";
+        if (rejected) *rejected = UINT32_MAX;
+        if (trace) trace->recordEvent([&] { return llvm::json::Object{
+            {"event", "execution-support-rejection"}, {"component", stats.root},
+            {"proof", unknown ? "Unknown" : "Disproven"},
+            {"reason", execution.reason},
+            {"kind", "common-backend-domain-not-cost-pruning"}}; });
+        return false;
+      }
       return true;
     };
     auto evaluate = [&](State &s, bool complete,
@@ -503,11 +575,143 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
       return std::lexicographical_compare(a.key.begin(), a.key.end(),
                                           b.key.begin(), b.key.end());
     };
+    std::optional<State> seedWitness, incumbent;
+    // A preference is a value ordering, never a new candidate or a constraint.
+    // Try a common layout throughout the region, completing hard-related
+    // variables together before the actual complete-objective comparison.
+    if (options.seedBeamSolution && stats.usedBeam && !emptyComponent &&
+        options.policy.scope.fullGraph) {
+      SmallVector<Attribute> preferences;
+      for (auto id : component) {
+        if (graph.getVariable(id).kind != LayoutKind::Distributed) continue;
+        for (const auto &candidate : graph.getVariable(id).candidates)
+          if (!llvm::is_contained(preferences, candidate.value))
+            preferences.push_back(candidate.value);
+      }
+      llvm::sort(preferences, [](Attribute a, Attribute b) {
+        return layoutCandidateKey(a) < layoutCandidateKey(b);
+      });
+      if (preferences.size() > 8) preferences.resize(8);
+      uint64_t remaining = options.maxExpandedStates - stats.expanded;
+      if (options.sharedBudget) {
+        const auto &b = *options.sharedBudget;
+        uint64_t cap = std::min(b.limit, b.stageLimit);
+        remaining = std::min(remaining, b.used < cap ? cap - b.used : 0);
+      }
+      const uint64_t quota = std::min(seedWorkLimit - seedWorkUsed, remaining / 8);
+      const uint64_t perPreference = preferences.empty() ? 0 : quota / preferences.size();
+      SmallVector<size_t> order;
+      for (size_t i = 0; i < component.size(); ++i) order.push_back(i);
+      llvm::sort(order, [&](size_t a, size_t b) {
+        auto x = component[a], y = component[b];
+        auto nx = graph.getVariable(x).candidates.size();
+        auto ny = graph.getVariable(y).candidates.size();
+        if (nx != ny) return nx < ny;
+        if (degree[x] != degree[y]) return degree[x] > degree[y];
+        return x < y;
+      });
+      bool costFailure = false;
+      stats.seedStopReason = preferences.empty() ? "no-distributed-preference" :
+          perPreference < component.size() + 1 ? "insufficient-seed-quota" : "completed-preferences";
+      if (trace) trace->recordEvent([&] { return llvm::json::Object{
+          {"event", "seed-start"}, {"component", stats.root},
+          {"quota", quota}, {"perPreferenceQuota", perPreference},
+          {"preferences", preferences.size()},
+          {"ordering", "canonical-common-layout-with-hard-completion"},
+          {"budgetKind", "same-total-budget-including-complete-scores"}}; });
+      if (perPreference >= component.size() + 1) {
+        for (Attribute preference : preferences) {
+          uint64_t spent = 0;
+          State seed;
+          seed.key.assign(component.size(), UINT32_MAX);
+          std::function<bool(size_t)> witness = [&](size_t depth) {
+            if (costFailure || spent >= perPreference) return false;
+            if (depth == order.size()) {
+              // The complete score is a search probe, not free certificate work.
+              if (stats.expanded == options.maxExpandedStates) return false;
+              ++spent; ++seedWorkUsed; ++stats.expanded; ++stats.seedScores;
+              auto cost = evaluateComplete(seed.assignment);
+              if (failed(cost)) {
+                costFailure = true;
+                return false;
+              }
+              seed.bound = *cost;
+              ++stats.seedWitnesses;
+              if (!seedWitness || less(seed, *seedWitness)) seedWitness = seed;
+              if (trace) trace->recordEvent([&] { return llvm::json::Object{
+                  {"event", "seed-witness"}, {"component", stats.root},
+                  {"preference", LayoutTrace::candidateID(preference)},
+                  {"cost", layoutCostJSON(seed.bound)},
+                  {"probes", stats.seedProbes}, {"scores", stats.seedScores}}; });
+              return true;
+            }
+            size_t index = order[depth];
+            auto id = component[index];
+            const auto &domain = graph.getVariable(id).candidates;
+            SmallVector<unsigned> values;
+            for (unsigned ci = 0; ci < domain.size(); ++ci)
+              if (domain[ci].value == preference) values.push_back(ci);
+            for (unsigned ci = 0; ci < domain.size(); ++ci)
+              if (domain[ci].value != preference) values.push_back(ci);
+            for (unsigned ci : values) {
+              if (spent >= perPreference || stats.expanded == options.maxExpandedStates)
+                return false;
+              if (!debit(false, false)) return false;
+              ++spent; ++seedWorkUsed; ++stats.expanded; ++stats.seedProbes;
+              seed.key[index] = ci;
+              seed.assignment.values[id] = domain[ci].value;
+              StringRef status = "Proven";
+              LayoutConstraintID rejected = UINT32_MAX;
+              bool legal = viable(seed, &status, &rejected);
+              if (!legal) ++stats.hardRejected;
+              if (trace) trace->recordEvent([&] { return llvm::json::Object{
+                  {"event", "seed-probe"}, {"component", stats.root},
+                  {"preference", LayoutTrace::candidateID(preference)},
+                  {"depth", depth}, {"variable", id},
+                  {"candidate", LayoutTrace::candidateID(domain[ci].value)},
+                  {"legal", legal}, {"status", status},
+                  {"constraint", rejected}, {"probe", stats.seedProbes}}; });
+              if (legal && witness(depth + 1)) return true;
+              seed.assignment.values.erase(id);
+              seed.key[index] = UINT32_MAX;
+              if (costFailure) return false;
+            }
+            return false;
+          };
+          bool foundWitness = witness(0);
+          if (!foundWitness && spent >= perPreference)
+            stats.seedStopReason = "preference-quota";
+          if (trace) trace->recordEvent([&] { return llvm::json::Object{
+              {"event", "seed-preference-stop"}, {"component", stats.root},
+              {"preference", LayoutTrace::candidateID(preference)},
+              {"spent", spent}, {"quota", perPreference},
+              {"witnessed", foundWitness},
+              {"reason", costFailure ? "cost-failure" : foundWitness ? "witness-found" :
+                  spent >= perPreference ? "preference-quota" : "no-complete-supported-witness"}}; });
+          if (costFailure) break;
+        }
+      }
+      if (costFailure) {
+        *why = {sharedBudgetExhausted ? LayoutSolveFailureKind::SearchBudget : LayoutSolveFailureKind::CostFailure,
+                stats.root, UINT32_MAX, sharedBudgetExhausted ? "seed complete-score budget exhausted" : "seed complete cost evaluation failed"};
+        return failure();
+      }
+      if (seedWitness) {
+        incumbent = seedWitness;
+        stats.seedStartCost = seedWitness->bound;
+      }
+      if (trace) trace->recordEvent([&] { return llvm::json::Object{
+          {"event", "seed-stop"}, {"component", stats.root},
+          {"reason", stats.seedStopReason}, {"probes", stats.seedProbes},
+          {"scores", stats.seedScores}, {"witnesses", stats.seedWitnesses},
+          {"bestCost", seedWitness ? llvm::json::Value(layoutCostJSON(seedWitness->bound)) : llvm::json::Value(nullptr)}}; });
+    }
     State initial;
     initial.key.assign(component.size(), UINT32_MAX);
     SmallVector<State> frontier;
     frontier.push_back(std::move(initial));
     stats.peakFrontier = 1;
+    bool interruptedBeam = false;
     for (size_t depth = 0; depth < component.size(); ++depth) {
       const auto probesBefore = stats.mrvProbes, expandedBefore = stats.expandedNodes;
       const auto rejectedBefore = stats.hardRejected;
@@ -543,6 +747,12 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
           const auto &domain = graph.getVariable(id).candidates;
           for (unsigned ci = 0; ci < domain.size(); ++ci) {
             if (stats.expanded == options.maxExpandedStates || !debit(false,false)) {
+              if (incumbent) {
+                interruptedBeam = true;
+                stats.beamBudgetFallback = true;
+                why->reason = "search-budget-reached; verified incumbent retained";
+                break;
+              }
               *why = {LayoutSolveFailureKind::SearchBudget, stats.root,
                       UINT32_MAX, "search-budget-exceeded"};
               emitError(getVariableLoc(graph.getVariable(stats.root)))
@@ -558,6 +768,7 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
             if (viable(child)) probes.push_back(std::move(child));
             else ++stats.hardRejected;
           }
+          if (interruptedBeam) break;
           if (chosen == component.size() || probes.size() < children.size() ||
               (probes.size() == children.size() &&
                degree[id] > degree[component[chosen]])) {
@@ -566,19 +777,40 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
           }
           if (children.empty()) break;
         }
+        if (interruptedBeam) break;
         if (trace && trace->acceptingEvents() && chosen != component.size())
           ++selections[component[chosen]];
         for (auto &child : children) {
           ++stats.expandedNodes;
           if (failed(evaluate(child, !emptyComponent &&
                                      depth + 1 == component.size()))) {
+            if (sharedBudgetExhausted && incumbent) {
+              interruptedBeam = true;
+              stats.beamBudgetFallback = true;
+              why->reason = "complete-score-budget-reached; verified incumbent retained";
+              break;
+            }
             *why = {sharedBudgetExhausted ? LayoutSolveFailureKind::SearchBudget : LayoutSolveFailureKind::CostFailure, stats.root,
                     UINT32_MAX, sharedBudgetExhausted ? "search-budget-exceeded in complete score" : "layout cost evaluation failed"};
             emitError(loc) << "layout cost evaluation failed; not a free solution";
             return failure();
           }
+          if ((options.seedBeamSolution || needsWholeAssignment) &&
+              depth + 1 == component.size() &&
+              (!incumbent || less(child, *incumbent))) incumbent = child;
           next.push_back(std::move(child));
         }
+        if (interruptedBeam) break;
+      }
+      if (interruptedBeam) {
+        frontier.assign(1, *incumbent);
+        if (trace) trace->recordEvent([&] { return llvm::json::Object{
+            {"event", "incumbent-budget-fallback"}, {"component", stats.root},
+            {"cost", layoutCostJSON(incumbent->bound)},
+            {"expanded", stats.expanded},
+            {"sharedUsed", options.sharedBudget ? options.sharedBudget->used : 0},
+            {"legalCompleteWitness", true}, {"searchComplete", false}}; });
+        break;
       }
       llvm::sort(next, less);
       if (trace) trace->recordEvent([&] {
@@ -616,7 +848,13 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
       stats.peakFrontier = std::max<uint64_t>(stats.peakFrontier, frontier.size());
       if (frontier.empty()) break;
     }
-    stats.exhaustive = stats.beamDiscarded == 0;
+    stats.exhaustive = stats.beamDiscarded == 0 && !interruptedBeam && !unknownRelation;
+    if (incumbent && (frontier.empty() || less(*incumbent, frontier.front()))) {
+      if (frontier.empty()) {
+        frontier.push_back(*incumbent);
+        stats.exhaustive = false;
+      } else frontier.front() = *incumbent;
+    }
     if (frontier.empty()) {
       *why = {unknownRelation ? LayoutSolveFailureKind::Unsupported
                 : stats.exhaustive ? LayoutSolveFailureKind::HardConflict
@@ -637,6 +875,7 @@ solveLayoutGraph(LayoutConstraintGraph &graph, LayoutTarget &target,
     // are meaningful. The deferred EmptyDomain still rejects the original graph.
     if (emptyComponent) continue;
     auto &best = frontier.front();
+    stats.seedSelected = seedWitness && best.key == seedWitness->key;
     bool mayRefine = stats.usedBeam && options.refineBeamSolution && options.maxRefinementProbes;
     CandidateAssignment original;
     if (mayRefine) original = best.assignment;
@@ -850,6 +1089,9 @@ void printLayoutSolutionStatistics(const LayoutConstraintGraph &graph,
     os << "] expanded=" << s.expanded << " hard-rejected=" << s.hardRejected
        << " beam-discarded=" << s.beamDiscarded
        << " deduplicated=" << s.deduplicated
+       << " seed-probes=" << s.seedProbes << " seed-scores=" << s.seedScores
+       << " seed-witnesses=" << s.seedWitnesses << " seed-selected=" << s.seedSelected
+       << " beam-budget-fallback=" << s.beamBudgetFallback
        << " exhaustive=" << s.exhaustive << " cost=["
        << c.instructionPathAndWork << ',' << c.memoryTransactions << ','
        << c.bankConflictDegree << ',' << c.conversionBytesAndSync << ','

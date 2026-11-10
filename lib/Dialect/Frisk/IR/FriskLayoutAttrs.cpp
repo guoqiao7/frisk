@@ -1,4 +1,6 @@
 #include "Dialect/Frisk/IR/FriskAttributes.h"
+#include "Dialect/Frisk/IR/ContiguousStorageLayout.h"
+#include <array>
 
 #include <cstdint>
 #include <limits>
@@ -1475,8 +1477,108 @@ FailureOr<uint64_t> getMemRefStaticCapacityBytes(MemRefType type) {
   return llvm::divideCeil((maximumElement + 1) * elementBits, uint64_t{8});
 }
 
+namespace {
+// Positive ASTs cannot hide overflowing intermediates through cancellation:
+// every node is nonnegative and bounded by the final expression.
+using PositiveCoefficients = std::array<uint64_t, 3>;
+std::optional<PositiveCoefficients> positiveCoefficients(AffineExpr expr,
+                                                       unsigned &remaining) {
+  if (!remaining) return std::nullopt;
+  --remaining;
+  PositiveCoefficients out{};
+  if (auto dim = dyn_cast<AffineDimExpr>(expr)) {
+    if (dim.getPosition() >= 2) return std::nullopt;
+    out[dim.getPosition()] = 1;
+    return out;
+  }
+  if (auto constant = dyn_cast<AffineConstantExpr>(expr)) {
+    if (constant.getValue() < 0) return std::nullopt;
+    out[2] = constant.getValue();
+    return out;
+  }
+  auto binary = dyn_cast<AffineBinaryOpExpr>(expr);
+  if (!binary || (expr.getKind() != AffineExprKind::Add &&
+                  expr.getKind() != AffineExprKind::Mul)) return std::nullopt;
+  auto lhs = positiveCoefficients(binary.getLHS(), remaining);
+  auto rhs = positiveCoefficients(binary.getRHS(), remaining);
+  if (!lhs || !rhs) return std::nullopt;
+  constexpr uint64_t limit = std::numeric_limits<int64_t>::max();
+  if (expr.getKind() == AffineExprKind::Add) {
+    for (unsigned i = 0; i < 3; ++i) {
+      if ((*lhs)[i] > limit - (*rhs)[i]) return std::nullopt;
+      out[i] = (*lhs)[i] + (*rhs)[i];
+    }
+  } else {
+    auto literal = dyn_cast<AffineConstantExpr>(binary.getLHS());
+    auto value = rhs;
+    if (!literal) { literal = dyn_cast<AffineConstantExpr>(binary.getRHS()); value = lhs; }
+    if (!literal || literal.getValue() <= 0) return std::nullopt;
+    uint64_t scale = literal.getValue();
+    for (unsigned i = 0; i < 3; ++i) {
+      if ((*value)[i] > limit / scale) return std::nullopt;
+      out[i] = (*value)[i] * scale;
+    }
+  }
+  return out;
+}
+} // namespace
+
+std::optional<ContiguousIdentityStorage>
+matchContiguousIdentityStorage(StorageLayoutAttr layout, MemRefType type) {
+  if (!layout || !type || type.getRank() != 2 || !type.hasStaticShape() ||
+      !type.getElementType().isF32() || !layout.getMemorySpace() ||
+      layout.getMemorySpace().getValue() != attr::MemorySpace::Global ||
+      getFriskMemorySpace(type) != attr::MemorySpace::Global ||
+      !layout.getAlignment() || layout.getAlignment().getInt() != 1 ||
+      !layout.getVectorGranularity() || layout.getVectorGranularity().getInt() != 1)
+    return std::nullopt;
+  int64_t m = type.getDimSize(0), n = type.getDimSize(1);
+  if (m <= 0 || n <= 0 || uint64_t(m) > 65536 / uint64_t(n)) return std::nullopt;
+  uint64_t elements = uint64_t(m) * uint64_t(n);
+  SmallVector<int64_t> strides;
+  int64_t offset;
+  if (failed(type.getStridesAndOffset(strides, offset)) || offset != 0 ||
+      strides != SmallVector<int64_t>({n, 1})) return std::nullopt;
+  auto map = dyn_cast<AffineLayoutMapAttr>(layout.getMap());
+  if (!map || !map.getInputNames() || !map.getInputExtents() ||
+      !map.getOutputNames() || !map.getOutputExtents() || !map.getAffineMap())
+    return std::nullopt;
+  auto affine = map.getAffineMap().getValue();
+  auto inputs = map.getInputNames(), outputs = map.getOutputNames();
+  if (inputs.size() != 2 || outputs.size() != 2 || affine.getNumDims() != 2 ||
+      affine.getNumSymbols() || affine.getNumResults() != 2 ||
+      map.getInputExtents().asArrayRef() != type.getShape() ||
+      map.getOutputExtents().asArrayRef() != ArrayRef<int64_t>({int64_t(elements * 4), 8}))
+    return std::nullopt;
+  auto i0 = dyn_cast<StringAttr>(inputs[0]), i1 = dyn_cast<StringAttr>(inputs[1]);
+  auto o0 = dyn_cast<StringAttr>(outputs[0]), o1 = dyn_cast<StringAttr>(outputs[1]);
+  // The compact wire reader accepts ordinary ASCII dimension identifiers.
+  // Other valid MLIR labels retain the full original dense proof/export path.
+  auto identifier = [](StringRef name) {
+    auto alpha = [](char c) { return (c >= 'a' && c <= 'z') ||
+                                   (c >= 'A' && c <= 'Z') || c == '_'; };
+    if (name.empty() || !alpha(name.front())) return false;
+    return llvm::all_of(name.drop_front(), [&](char c) {
+      return alpha(c) || (c >= '0' && c <= '9');
+    });
+  };
+  if (!i0 || !i1 || !identifier(i0.getValue()) || !identifier(i1.getValue()) ||
+      i0 == i1 || !o0 || !o1 || o0.getValue() != "byte_offset" ||
+      o1.getValue() != "bit_offset")
+    return std::nullopt;
+  auto bit = dyn_cast<AffineConstantExpr>(affine.getResult(1));
+  if (!bit || bit.getValue() != 0) return std::nullopt;
+  unsigned remaining = 4095; // The literal bit result consumes one node too.
+  auto bytes = positiveCoefficients(affine.getResult(0), remaining);
+  if (!bytes || *bytes != PositiveCoefficients{uint64_t(n) * 4, 4, 0})
+    return std::nullopt;
+  return ContiguousIdentityStorage{m, n, elements, elements * 4};
+}
+
 FailureOr<uint64_t> getStorageFootprintBytes(StorageLayoutAttr layout,
                                              MemRefType type) {
+  if (auto contiguous = matchContiguousIdentityStorage(layout, type))
+    return contiguous->bytes;
   if (!type.hasStaticShape() || !type.getElementType().isIntOrFloat())
     return failure();
   if (failed(verifyLayoutOutputBounds(layout.getMap(), type.getShape())))
@@ -1527,6 +1629,9 @@ LogicalResult StorageLayoutAttr::verifyForType(ShapedType type,
               "element types";
   if (failed(verifyMapDomainMatchesType(getMap(), type, loc)))
     return failure();
+
+  if (matchContiguousIdentityStorage(*this, memref))
+    return success();
 
   LayoutProof injective = checkInjectivity(getMap(), type.getShape());
   if (injective.status != ProofStatus::Proven)

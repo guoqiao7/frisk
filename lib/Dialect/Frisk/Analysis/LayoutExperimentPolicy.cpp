@@ -9,7 +9,16 @@ SmallVector<LayoutVarID> experimentInstructionDependencies(
   // Versioned SM90 MMA work is gM*gN*mRepeat*nRepeat*kRepeat. Shapes and
   // execution threads are fixed; the selected geometry alone determines it.
   // Storage descriptors affect legality, not this work charge.
-  if((target.costModelID()=="sm90-layout-lex9-legacy-v1" || target.costModelID().starts_with("sm90-layout-calibrated-v2")) && c.instruction &&
+  // Symbolic conversion proofs change route costs, but not MMA geometry work.
+  // Retain both published semantic versions for experiment/replay targets.
+  StringRef model = target.costModelID();
+  bool geometryOnly = model == "sm90-layout-lex9-legacy-v1" ||
+      model == "sm90-layout-lex9-legacy-v2" ||
+      model == "sm90-layout-lex9-static-trip-count-v1" ||
+      model == "sm90-layout-lex9-static-trip-count-v2" ||
+      model.starts_with("sm90-layout-calibrated-v2-") ||
+      model.starts_with("sm90-layout-calibrated-v3-");
+  if(geometryOnly && c.instruction &&
      c.instruction->source->getName().getStringRef()=="frisk.mma" && c.vars.size()==5)
     return {c.vars[4]};
   return SmallVector<LayoutVarID>(c.vars);
@@ -161,6 +170,9 @@ public:
 };}
 std::string experimentPolicyUnsupportedReason(const LayoutConstraintGraph &graph,
     const ExperimentPolicy &policy) {
+  if(!policy.scope.fullGraph && policy.scope.informedLocal &&
+     policy.scope.producers.empty() && policy.scope.producerInstructions.empty())
+    return "informed local support preflight: empty producer and instruction scope";
   if(policy.scope.fullGraph || !policy.scope.informedLocal ||
      policy.conversion==ConversionPolicy::Independent)return {};
   for(auto id:policy.scope.producers)if(id>=graph.getVariables().size())
@@ -199,6 +211,43 @@ FailureOr<CostEstimate> scoreExperimentAssignment(const LayoutConstraintGraph &g
     }
   }
   if(!experimentPolicyUnsupportedReason(graph,policy).empty())return failure();
+  // A complete direct score must obey the same explicitly declared execution
+  // domain as solver and oracle witnesses. Partial component scores retain
+  // their existing contract; complete-validation targets merge their search.
+  if (target.needsCompleteAssignmentValidation(graph) &&
+      llvm::all_of(graph.getVariables(), [&](const auto &v) {
+        return assignment.values.count(v.id);
+      }) && target.verifyExecutionSupport(graph, assignment).status != ProofStatus::Proven)
+    return failure();
+  if (target.needsCompleteAssignmentCost()) {
+    if (assignment.values.size() != graph.getVariables().size()) return failure();
+    for (const auto &v : graph.getVariables())
+      if (!assignment.values.count(v.id)) return failure();
+    // The target evaluates a backward demand rooted in this scope, rather
+    // than calculating future-consumer costs and filtering their owners.
+    class ExecutionObserver final : public LayoutCostObserver {
+      const LayoutConstraintGraph &g;
+      const SelectionScope &scope;
+      LayoutCostObserver *next;
+      llvm::json::Array *rows;
+    public:
+      ExecutionObserver(const LayoutConstraintGraph &g,const SelectionScope &s,
+          LayoutCostObserver *n,llvm::json::Array *r):g(g),scope(s),next(n),rows(r){}
+      void recordCost(StringRef kind,uint64_t owner,const CostEstimate &cost) override {
+        if(next)next->recordCost(kind,owner,cost);
+        if(!rows)return;
+        llvm::json::Array dependencies;
+        for(const auto &v:g.getVariables())dependencies.push_back(llvm::json::Object{{"id",v.id},{"stable_name",v.stableName}});
+        rows->push_back(llvm::json::Object{{"kind",kind.str()},{"owner",owner},
+          {"owner_kind","execution-demand"},{"stable_owner",std::to_string(owner)},
+          {"dependencies",std::move(dependencies)},{"included",true},{"known",true},
+          {"local_objective",scope.fullGraph?"full-execution-demand-v1":"producer-rooted-execution-demand-v1"},
+          {"reason",scope.fullGraph?"complete graph execution demand":"own producer roots and necessary upstream computation; future consumers excluded"},
+          {"cost",layoutCostJSON(cost)}});
+      }
+    } sink(graph,policy.scope,observer,contributions);
+    return target.evaluateExecutionCost(graph,assignment,policy,&sink);
+  }
   ScopedObserver scoped(graph,policy.scope,target,observer,contributions);
   auto *sink=policy.scope.fullGraph && !contributions?observer:&scoped;
   auto cost=target.evaluate(graph,assignment,sink);

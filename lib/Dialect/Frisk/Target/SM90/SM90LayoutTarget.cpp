@@ -1,5 +1,7 @@
 #include "Dialect/Frisk/Target/SM90/SM90LayoutTarget.h"
 #include "Dialect/Frisk/Analysis/LayoutCostModel.h"
+#include "Dialect/Frisk/Analysis/LayoutExperimentPolicy.h"
+#include "Dialect/Frisk/Analysis/LayoutDemand.h"
 #include "Dialect/Frisk/Target/SM90/SM90GemmConstraints.h"
 #include "Dialect/Frisk/Target/SM90/SM90ReduceConstraints.h"
 #include "Dialect/Frisk/Target/SM90/SM90CopyConstraints.h"
@@ -289,15 +291,125 @@ public:
     return storage.verifyForType(type, loc);
   }
 
+  bool needsCompleteAssignmentValidation(const LayoutConstraintGraph &graph) const override {
+    if(graph.getVariables().empty())return false;
+    const auto &v=graph.getVariables().front();Operation *root=v.anchor;Value value=v.value;
+    if(!root && value)root=value.getParentBlock()->getParentOp();
+    while(root && root->getParentOp())root=root->getParentOp();
+    return root && root->hasAttr("frisk.execution_domain");
+  }
+  LayoutProof verifyExecutionSupport(const LayoutConstraintGraph &graph,
+      const CandidateAssignment &assignment) const override {
+    if (graph.getVariables().empty()) return {ProofStatus::Proven, {}, "empty graph"};
+    const auto &v=graph.getVariables().front();
+    Operation *root=v.anchor;
+    Value anchorValue=v.value;
+    if(!root && anchorValue)root=anchorValue.getParentBlock()->getParentOp();
+    while(root && root->getParentOp())root=root->getParentOp();
+    Attribute declared = root ? root->getAttr("frisk.execution_domain") : Attribute{};
+    if(!declared)return {ProofStatus::Proven, {}, "no additional execution domain"};
+    auto policy = dyn_cast<StringAttr>(declared);
+    if(!policy)return {ProofStatus::Unknown, {}, "execution domain must be a recognized string contract"};
+    if(policy.getValue()!="sm90-scalar-f32-dag-v1")
+      return {ProofStatus::Unknown, {}, "unrecognized execution domain"};
+    return verifyLayoutDemandBackendSupport(graph,assignment);
+  }
+  bool needsCompleteAssignmentCost() const override {
+    return profile && profile->executionDemand;
+  }
+  FailureOr<CostEstimate> evaluateExecutionCost(const LayoutConstraintGraph &graph,
+      const CandidateAssignment &assignment,const ExperimentPolicy &policy,
+      LayoutCostObserver *observer) const override {
+    if (!needsCompleteAssignmentCost()) return failure();
+    bool pure = policy.conversion == ConversionPolicy::Independent &&
+                policy.scope.producerInstructions.empty();
+    Block *producerBlock = nullptr;
+    for (const auto &v : graph.getVariables()) {
+      if (v.kind != LayoutKind::Distributed || v.use) continue;
+      auto ty = dyn_cast<RankedTensorType>(v.shapedType);
+      Operation *op = v.value ? v.value.getDefiningOp() : nullptr;
+      if (!ty || !ty.getElementType().isF32() || !op) { pure = false; break; }
+      // A DAG belongs to one function or kernel body block. In particular, tensor
+      // arithmetic nested in scf regions is a whole-graph carrier fallback,
+      // rather than an assignment-dependent demand-analysis failure.
+      Operation *parent = op->getParentOp();
+      bool bodyContainer = parent &&
+          (parent->getName().getStringRef() == "func.func" ||
+           parent->getName().getStringRef() == "frisk.kernel");
+      if (auto parallel = dyn_cast_or_null<ParallelOp>(parent))
+        bodyContainer = parallel.getThreads() == 128 &&
+            llvm::all_of(parallel.getRanges(), [](int64_t n) { return n == 1; });
+      if (!bodyContainer || parent->getNumRegions() != 1 ||
+          !parent->getRegion(0).hasOneBlock() ||
+          (producerBlock && producerBlock != op->getBlock())) {
+        pure = false; break;
+      }
+      unsigned parallelDepth = 0;
+      for (Operation *ancestor = parent; ancestor; ancestor = ancestor->getParentOp()) {
+        StringRef container = ancestor->getName().getStringRef();
+        if (container == "frisk.parallel") ++parallelDepth;
+        if ((container != "builtin.module" && container != "func.func" &&
+             container != "frisk.kernel" && container != "frisk.parallel") ||
+            parallelDepth > 1) { pure = false; break; }
+      }
+      if (!pure) break;
+      producerBlock = op->getBlock();
+      StringRef name = op->getName().getStringRef();
+      if (name == "arith.constant") {
+        auto value = op->getAttrOfType<DenseElementsAttr>("value");
+        if (!value || !value.isSplat()) { pure = false; break; }
+      }
+      if (!llvm::is_contained(ArrayRef<StringRef>{"frisk.tile_load", "frisk.convert_layout",
+            "arith.constant", "arith.mulf", "arith.subf", "arith.divf", "math.exp"}, name)) {
+        pure = false; break;
+      }
+    }
+    if (pure)
+      return evaluateSM90DemandLayoutCost(graph, assignment, policy, &*profile, observer, mode);
+    // Graph/policy-wide fallback, never an assignment-dependent free price.
+    // MMA/reduction/control-flow and O remain the published carrier objective.
+    // A bank-only demand profile is valid on pure DAGs, but supplies no
+    // carrier objective. Fail the profile/scope combination explicitly; zero
+    // carrier coefficients must never turn unsupported graphs into free work.
+    // v6 requires a positive BAR fee on pure DAGs. That mandatory fee is
+    // not an arithmetic/access carrier objective for unsupported graphs.
+    bool hasCarrierObjective = false;
+    for (unsigned i = 0; i < profile->coefficients.size(); ++i)
+      if ((!profile->survivingDemand || i != 14) && profile->coefficients[i])
+        hasCarrierObjective = true;
+    if (!hasCarrierObjective) {
+      for (const auto &v : graph.getVariables())
+        if (v.anchor) {
+          v.anchor->emitError("execution-demand-profile-scope: carrier fallback requires a nonzero carrier coefficient");
+          break;
+        }
+      return failure();
+    }
+    auto carrier = *profile;
+    carrier.executionDemand = false;
+    carrier.executionOrder = false;
+    carrier.survivingDemand = false;
+    carrier.networkProxy = false;
+    carrier.networkObjective = shuffle_network::Objective::MinShuffle;
+    carrier.communicationCoefficients.fill(0);
+    carrier.loadIssueGroupCoefficient = 0;
+    carrier.demandBankCoefficients.fill(0);
+    SM90LayoutTarget fallback(mode, carrier);
+    return scoreExperimentAssignment(graph, assignment, fallback, policy, observer);
+  }
   FailureOr<CostVector>
-  evaluate(const CandidateAssignment &) const override { return CostVector{}; }
+  evaluate(const CandidateAssignment &) const override {
+    return needsCompleteAssignmentCost() ? FailureOr<CostVector>(failure()) : FailureOr<CostVector>(CostVector{});
+  }
   FailureOr<CostEstimate> evaluate(const LayoutConstraintGraph &graph,
       const CandidateAssignment &assignment) const override {
+    if (needsCompleteAssignmentCost()) { ExperimentPolicy p; p.conversion=ConversionPolicy::Independent; return evaluateExecutionCost(graph,assignment,p,nullptr); }
     return profile ? evaluateSM90CalibratedLayoutCost(graph, assignment, *profile, nullptr, mode)
                    : evaluateSM90LayoutCost(graph, assignment, nullptr, mode);
   }
   FailureOr<CostEstimate> evaluate(const LayoutConstraintGraph &graph,
       const CandidateAssignment &assignment, LayoutCostObserver *observer) const override {
+    if (needsCompleteAssignmentCost()) { ExperimentPolicy p; p.conversion=ConversionPolicy::Independent; return evaluateExecutionCost(graph,assignment,p,observer); }
     return profile ? evaluateSM90CalibratedLayoutCost(graph, assignment, *profile, observer, mode)
                    : evaluateSM90LayoutCost(graph, assignment, observer, mode);
   }
@@ -318,25 +430,31 @@ public:
     return profile ? adjustSM90CalibratedCloneCost(proxy, result, encoding, op, at, *profile, mode) : proxy;
   }
   bool requiresRematerializationTrafficReduction() const override { return !profile; }
-  StringRef costModelID() const override { if (profile) return calibratedID; return mode == LayoutBoundaryFrequencyMode::Legacy ? getSM90LegacyCostModelID() : "sm90-layout-lex9-static-trip-count-v1"; }
+  StringRef costModelID() const override { if (profile) return calibratedID; return mode == LayoutBoundaryFrequencyMode::Legacy ? getSM90LegacyCostModelID() : "sm90-layout-lex9-static-trip-count-v2"; }
   StringRef costCoverage() const override {
+    if(profile && profile->networkProxy)return "sm90-network-surviving-proxy-v1; ordered-actual-network-grammar; explicit-min-shfl-or-min-work; migrated20weights-not-refit; structural-temporary-definitions-not-physical-registers; physical-resources-and-schedule=separate-compiler-driver-feedback";
+    if (needsCompleteAssignmentCost() && profile->survivingDemand)
+      return "sm90-surviving-demand-v1; emitted-and-surviving-query-ledgers; dead-pure-SSA-closure; actual-communication-roots-retained; positive-communication-issue-fees; no-emitter-load-group-price; graph-policy-fallback=carrier-v3-MMA-control-O; native-schedule=separate-bounded-compiler-feedback";
+    if (needsCompleteAssignmentCost() && profile->executionOrder)
+      return "sm90-affine-demand-v2; exact=f32-pure-DAG-splat-C128; producer-rooted-LI; full-assignment-dependencies; ordered-global-load-issue-groups; address-and-mux-ALU; graph-policy-fallback=carrier-v3-MMA-control-O; physical-registers=compiler-feedback; schedule-groups-are-not-measured-hardware-concurrency";
+    if (needsCompleteAssignmentCost()) return "sm90-affine-demand-v1; exact=f32-pure-DAG-splat-C128; producer-rooted-LI; full-assignment-dependencies; address-and-mux-ALU; graph-policy-fallback=carrier-v3-MMA-control-O; physical-registers=compiler-feedback";
     if (profile)
-      return "sm90-calibrated-features-v2; nonnegative-integer-score-ticks-not-cycles; "
+      return "sm90-calibrated-features-v3; nonnegative-integer-score-ticks-not-cycles; symbolic-subspace-proof-v1; "
              "tensor-arithmetic-warp-issues-f16-f32-i1-i32; route-specific-conversion-bytes; "
              "CTA-barriers=conversion-and-global-to-shared-Copy-only; explicit-copy-setup-MMA-and-reduction-proxies; "
              "alignment-aware-32B-sectors-and-shared-bank-excess; frequency-weighted; "
              "physical-registers-occupancy-and-SSA-peaks=post-materialization-diagnostics; "
-             "unmodeled=cache,overlap,dependency-latency,MMA-shared-read-bank-behavior,scalar-control";
+             "symbolic-access-cosets-v1 (logical<=65536; non-dyadic bounded fallback); unmodeled=cache,overlap,dependency-latency,MMA-shared-read-bank-behavior,scalar-control";
     if (mode == LayoutBoundaryFrequencyMode::StaticTripCount)
-      return "bounded-owner-proof-v1 with cta-staging-upper-bound-v1 fallback; "
+      return "symbolic-subspace-proof-v1 with cta-staging-upper-bound-v1 fallback; "
              "pure-slice-byte-work-v1; static signed trip counts with unknown-loop factor-2 proxy; "
              "register/replication slots; shared root spans; "
              "sm90-shape-work-v1; warp-issue-32B-sectors-v1 (unknown base phase upper bound); "
-             "shared-128B-phase-32x4B-distinct-word-conflicts-v2; unmodeled=latency,cache,overlap";
-    return "bounded-owner-proof-v1 with cta-staging-upper-bound-v1 fallback; "
+             "shared-128B-phase-32x4B-distinct-word-conflicts-v2; symbolic-access-cosets-v1 (logical<=65536; non-dyadic bounded fallback); unmodeled=latency,cache,overlap";
+    return "symbolic-subspace-proof-v1 with cta-staging-upper-bound-v1 fallback; "
            "pure-slice-byte-work-v1; loop-depth proxy; register/replication slots; shared root spans; "
            "sm90-shape-work-v1; warp-issue-32B-sectors-v1 (unknown base phase upper bound); "
-           "shared-128B-phase-32x4B-distinct-word-conflicts-v2; unmodeled=latency,cache,overlap";
+           "shared-128B-phase-32x4B-distinct-word-conflicts-v2; symbolic-access-cosets-v1 (logical<=65536; non-dyadic bounded fallback); unmodeled=latency,cache,overlap";
   }
 };
 

@@ -464,8 +464,24 @@ FailureOr<StorageAliasInfo> mlir::frisk::analyzeStorageAlias(Value endpoint) {
   return result;
 }
 
+std::optional<ContiguousIdentityStorage>
+mlir::frisk::matchContiguousIdentityStorageAlias(const StorageAliasInfo &info,
+                                                StorageLayoutAttr candidate) {
+  if (!info.root || !info.rootType || !info.viewType || !info.viewToRoot ||
+      info.root.getType() != info.rootType || info.rootType != info.viewType ||
+      info.viewToRoot.getNumDims() != 2 || info.viewToRoot.getNumResults() != 2 ||
+      info.viewToRoot.getNumSymbols() || !info.viewToRoot.isIdentity() ||
+      !info.rootAlignment) return std::nullopt;
+  auto contiguous = matchContiguousIdentityStorage(candidate, info.viewType);
+  if (!contiguous || info.lowerBit != 0 || info.upperBit != contiguous->elements * 32)
+    return std::nullopt;
+  return contiguous;
+}
+
 LayoutProof mlir::frisk::verifyStorageAliasCandidate(const StorageAliasInfo &info,
                                                    StorageLayoutAttr candidate) {
+  if (matchContiguousIdentityStorageAlias(info, candidate))
+    return proof(ProofStatus::Proven, "exact contiguous identity bit intervals");
   return buildStorageAliasFootprint(info, candidate).proof;
 }
 
@@ -483,6 +499,10 @@ StorageAliasFootprint mlir::frisk::buildStorageAliasFootprint(
 LayoutProof mlir::frisk::proveStorageAliasCompatible(
     const StorageAliasInfo &a, StorageLayoutAttr ca,
     const StorageAliasInfo &b, StorageLayoutAttr cb) {
+  if (a.root == b.root && a.rootType == b.rootType &&
+      matchContiguousIdentityStorageAlias(a, ca) &&
+      matchContiguousIdentityStorageAlias(b, cb))
+    return proof(ProofStatus::Proven, "same-root exact contiguous identity bit functions agree");
   return proveStorageAliasFootprints(buildStorageAliasFootprint(a, ca),
                                      buildStorageAliasFootprint(b, cb));
 }

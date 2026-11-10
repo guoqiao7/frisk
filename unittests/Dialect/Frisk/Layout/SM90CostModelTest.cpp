@@ -2,9 +2,14 @@
 #include "Dialect/Frisk/Target/SM90/SM90LayoutTarget.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
+#include "Dialect/Frisk/Analysis/ExecutionLayoutProof.h"
 #include "Dialect/Frisk/Analysis/LayoutAliasAnalysis.h"
+#include "Dialect/Frisk/Analysis/LayoutRelations.h"
 #include "Dialect/Frisk/Analysis/LayoutTrace.h"
+#include "Dialect/Frisk/Analysis/LayoutProfile.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "Dialect/Frisk/Analysis/LayoutCostModel.h"
@@ -15,19 +20,24 @@
 #include "mlir/Parser/Parser.h"
 #include "gtest/gtest.h"
 #include "LayoutCostObserverTestSupport.h"
+#include <array>
+#include <map>
+#include <set>
 using namespace mlir;
 using namespace mlir::frisk;
 namespace {
 TEST(SM90CostModelTest, CompleteModelIdentityIsIndependentOfCoverage) {
   auto target = createSM90LayoutTarget();
-  EXPECT_EQ(getSM90LegacyCostModelID(), "sm90-layout-lex9-legacy-v1");
+  EXPECT_EQ(getSM90LegacyCostModelID(), "sm90-layout-lex9-legacy-v2");
   EXPECT_EQ(target->costModelID(), getSM90LegacyCostModelID());
   EXPECT_NE(target->costCoverage(), target->costModelID());
   constexpr StringLiteral legacyCoverage =
-      "bounded-owner-proof-v1 with cta-staging-upper-bound-v1 fallback; "
+      "symbolic-subspace-proof-v1 with cta-staging-upper-bound-v1 fallback; "
       "pure-slice-byte-work-v1; loop-depth proxy; register/replication slots; shared root spans; "
       "sm90-shape-work-v1; warp-issue-32B-sectors-v1 (unknown base phase upper bound); "
-      "shared-128B-phase-32x4B-distinct-word-conflicts-v2; unmodeled=latency,cache,overlap";
+      "shared-128B-phase-32x4B-distinct-word-conflicts-v2; "
+      "symbolic-access-cosets-v1 (logical<=65536; non-dyadic bounded fallback); "
+      "unmodeled=latency,cache,overlap";
   EXPECT_EQ(target->costCoverage(), legacyCoverage);
   auto staticTarget = createSM90LayoutTarget(LayoutBoundaryFrequencyMode::StaticTripCount);
   StringRef staticCoverage = staticTarget->costCoverage();
@@ -271,6 +281,8 @@ TEST(SM90CalibratedCostTest, StrictProfileRoundtripAndParameterIdentity) {
   EXPECT_EQ(serializeSM90CostProfile(*parsed), text);
   EXPECT_EQ(getSM90CostProfileSHA256(*parsed).size(), 64u);
   auto id = getSM90CalibratedCostModelID(profile);
+  EXPECT_TRUE(StringRef(id).starts_with("sm90-layout-calibrated-v3-"));
+  EXPECT_TRUE(StringRef(serializeSM90CostProfile(profile)).contains("sm90-layout-calibrated-v2"));
   EXPECT_EQ(normalizeLayoutCostModelID(id), id);
   auto staticID = getSM90CalibratedCostModelID(profile, LayoutBoundaryFrequencyMode::StaticTripCount);
   EXPECT_NE(id, staticID);
@@ -395,5 +407,668 @@ TEST(SM90CalibratedCostTest, ArithmeticDefinitionIsChargedOnceWithVariableOwner)
   ASSERT_TRUE(logarithm);
   graph.getVariable(id).value = logarithm.getResult();
   EXPECT_TRUE(failed(target->evaluate(graph, assignment)));
+}
+} // namespace
+
+
+namespace {
+// Minimal actual Copy graph for scorer/cache tests. The selected bindings
+// exercise scoring dependencies; instruction-contract legality has its own
+// tests. Every graph passes finalize, including actual SSA role identities.
+struct AccessCacheFixture {
+  OwningOpRef<ModuleOp> module;
+  LayoutConstraintGraph graph;
+  CandidateAssignment assignment;
+  Attribute sourceLayout, targetLayout, encoding;
+  SmallVector<Attribute> bindings;
+  LayoutVarID source = 0, destination = 0, execution = 0, path = 0;
+  LayoutConstraintID access = 0;
+  bool initialize(MLIRContext &context, unsigned bits = 32,
+      unsigned alignment = 1, unsigned warps = 1, bool loop = false,
+      unsigned rows = 8, unsigned columns = 16) {
+    Builder b(&context);
+    std::string shape = std::to_string(rows) + "x" + std::to_string(columns);
+    std::string element = "i" + std::to_string(bits);
+    std::string src = "memref<" + shape + "x" + element + ",1>";
+    std::string dst = "memref<" + shape + "x" + element + ",3>";
+    std::string copy = "\"frisk.copy\"(%s,%d) <{srcMap=affine_map<()->()>,dstMap=affine_map<()->()>,srcExtents=array<i64:" +
+        std::to_string(rows) + "," + std::to_string(columns) +
+        ">,dstExtents=array<i64:" + std::to_string(rows) + "," + std::to_string(columns) +
+        ">}> {operandSegmentSizes=array<i32:1,1,0,0>} : (" + src + "," + dst + ")->()\n";
+    std::string body = "func.func @cache() { %s=memref.alloc() {alignment=128:i64}:" + src +
+        " %d=memref.alloc() {alignment=128:i64}:" + dst + "\n";
+    if (loop) body += "%c0=arith.constant 0:index %c1=arith.constant 1:index %c3=arith.constant 3:index "
+                      "scf.for %i=%c0 to %c3 step %c1 {\n";
+    body += copy;
+    if (loop) body += "}\n";
+    body += "return }";
+    module = parseSourceString<ModuleOp>(body, &context);
+    if (!module) return false;
+    Operation *op = nullptr;
+    module->walk([&](Operation *candidate) {
+      if (candidate->getName().getStringRef() == "frisk.copy") op = candidate;
+    });
+    if (!op) return false;
+    auto sourceAlias = analyzeStorageAlias(op->getOperand(0));
+    auto targetAlias = analyzeStorageAlias(op->getOperand(1));
+    if (failed(sourceAlias) || failed(targetAlias)) return false;
+    sourceAlias->rootKey = "source";
+    targetAlias->rootKey = "target";
+    // Keep this a truthful, possibly weaker guarantee than the actual 128B
+    // allocation. Upgrading the query to 32B later does not invent alignment.
+    sourceAlias->rootAlignment = alignment;
+    auto srcLayout = buildRootLinearStorageCandidate(*sourceAlias);
+    auto dstLayout = buildRootLinearStorageCandidate(*targetAlias);
+    if (failed(srcLayout) || failed(dstLayout)) return false;
+    sourceLayout = *srcLayout;
+    targetLayout = *dstLayout;
+    unsigned registers = rows * columns / 32;
+    unsigned registerBits = llvm::Log2_64(registers);
+    unsigned rowBits = llvm::Log2_64(rows), columnBits = llvm::Log2_64(columns);
+    unsigned warpBits = llvm::Log2_64(warps);
+    SmallVector<APInt> matrix;
+    for (unsigned row = 0; row < rowBits + columnBits; ++row)
+      for (unsigned column = 0; column < registerBits + 5 + warpBits; ++column)
+        matrix.emplace_back(1, row == column);
+    SmallVector<StringRef> inputNames = {"register", "lane"};
+    SmallVector<int64_t> inputBits = {int64_t(registerBits), 5};
+    if (warpBits) { inputNames.push_back("warp"); inputBits.push_back(warpBits); }
+    auto map = BitLinearLayoutMapAttr::get(&context, b.getStrArrayAttr(inputNames),
+        b.getDenseI64ArrayAttr(inputBits), b.getStrArrayAttr({"dim0", "dim1"}),
+        b.getDenseI64ArrayAttr({rowBits, columnBits}), DenseIntElementsAttr::get(
+            RankedTensorType::get({rowBits + columnBits, registerBits + 5 + warpBits}, b.getI1Type()), matrix));
+    encoding = DistributedEncodingAttr::get(&context, map,
+        b.getDenseI64ArrayAttr({registers, 32, warps, 1, 1}), b.getI64IntegerAttr(warps));
+    auto tensor = RankedTensorType::get({rows, columns}, b.getIntegerType(bits));
+    source = graph.addVariable(LayoutKind::Storage, op->getOperand(0).getType(), "source", op);
+    destination = graph.addVariable(LayoutKind::Storage, op->getOperand(1).getType(), "target", op);
+    execution = graph.addVariable(LayoutKind::Distributed, tensor, "execution", op);
+    path = graph.addVariable(LayoutKind::Instruction, tensor, "path", op);
+    graph.getVariable(source).value = op->getOperand(0);
+    graph.getVariable(source).storageAlias = *sourceAlias;
+    graph.getVariable(destination).value = op->getOperand(1);
+    graph.getVariable(destination).storageAlias = *targetAlias;
+    graph.getVariable(execution).operationExecution = OperationExecutionBinding{32, 1, "first_owner"};
+    graph.getVariable(execution).requiredThreads = 32;
+    graph.getVariable(path).requiredThreads = 32;
+    graph.getVariable(path).instructionRole = true;
+    auto instruction = graph.addConstraint(ConstraintKind::InstructionContract,
+        ConstraintStrength::Hard, {source, destination, execution, path}, op, "cache-test", "selected Copy");
+    graph.getConstraints()[instruction].instruction = InstructionLayoutContract{op, {}, {}};
+    for (auto [name, width] : {std::pair{StringRef("vector"), 1u},
+                              std::pair{StringRef("vector"), 16u},
+                              std::pair{StringRef("tma"), 16u}}) {
+      auto binding = b.getDictionaryAttr({b.getNamedAttr("path", b.getStringAttr(name)),
+          b.getNamedAttr("vector_bytes", b.getI64IntegerAttr(width))});
+      bindings.push_back(binding);
+      graph.getConstraints()[instruction].instruction->tuples.push_back(
+          {{sourceLayout, targetLayout, encoding, binding}, binding});
+      graph.getVariable(path).candidates.push_back({binding});
+    }
+    graph.getVariable(source).candidates.push_back({sourceLayout});
+    graph.getVariable(destination).candidates.push_back({targetLayout});
+    graph.getVariable(execution).candidates.push_back({encoding});
+    access = graph.addConstraint(ConstraintKind::StorageAccess,
+        ConstraintStrength::Hard, {source, execution}, op, "cache-test", "source access");
+    if (failed(graph.finalize(op->getLoc()))) return false;
+    rebind();
+    select(0);
+    return true;
+  }
+  void rebind() {
+    source = *graph.lookupVariable("source");
+    destination = *graph.lookupVariable("target");
+    execution = *graph.lookupVariable("execution");
+    path = *graph.lookupVariable("path");
+    for (const auto &c : graph.getConstraints())
+      if (c.kind == ConstraintKind::StorageAccess) access = c.id;
+  }
+  void select(unsigned which, bool complete = true) {
+    assignment.values.clear();
+    assignment.values[source] = sourceLayout;
+    assignment.values[execution] = encoding;
+    if (complete) {
+      assignment.values[destination] = targetLayout;
+      assignment.values[path] = bindings[which];
+    }
+  }
+};
+class SM90AccessCacheTest : public testing::Test {
+protected:
+  MLIRContext context;
+  SM90AccessCacheTest() {
+    context.loadDialect<FriskDialect, func::FuncDialect, memref::MemRefDialect,
+                        arith::ArithDialect, scf::SCFDialect>();
+  }
+  void sameEstimate(const CostEstimate &a, const CostEstimate &b) {
+    EXPECT_EQ(a.cost, b.cost);
+    EXPECT_EQ(a.saturated, b.saturated);
+    EXPECT_EQ(a.features, b.features);
+  }
+  void sameParts(const TestCostObserver &a, const TestCostObserver &b) {
+    ASSERT_EQ(a.parts.size(), b.parts.size());
+    for (auto [x, y] : llvm::zip_equal(a.parts, b.parts)) {
+      EXPECT_EQ(x.kind, y.kind); EXPECT_EQ(x.owner, y.owner);
+      sameEstimate(x.cost, y.cost);
+    }
+  }
+};
+TEST_F(SM90AccessCacheTest, ColdWarmAndDisabledReplayIdenticalContributions) {
+  AccessCacheFixture f;
+  ASSERT_TRUE(f.initialize(context));
+  auto target = createSM90LayoutTarget();
+  LayoutProfile profile(true);
+  LayoutProfile::Invocation invocation(&profile);
+  TestCostObserver coldParts, warmParts, offParts;
+  auto cold = target->evaluate(f.graph, f.assignment, &coldParts);
+  auto warm = target->evaluate(f.graph, f.assignment, &warmParts);
+  ASSERT_TRUE(succeeded(cold)); ASSERT_TRUE(succeeded(warm));
+  sameEstimate(*cold, *warm); sameParts(coldParts, warmParts);
+  warmParts.expectSum(*warm);
+  EXPECT_EQ(f.graph.getAccessCostCache().size(), 1u);
+  EXPECT_EQ(profile.get(LayoutProfileKind::AccessCostCache).misses, 1u);
+  EXPECT_EQ(profile.get(LayoutProfileKind::AccessCostCache).hits, 1u);
+  EXPECT_EQ(profile.get(LayoutProfileKind::AccessCostCache).entries, 1u);
+  f.graph.setCostQueryCacheOptions(false);
+  EXPECT_TRUE(f.graph.getAccessCostCache().empty());
+  auto off = target->evaluate(f.graph, f.assignment, &offParts);
+  ASSERT_TRUE(succeeded(off)); sameEstimate(*warm, *off); sameParts(warmParts, offParts);
+  EXPECT_EQ(profile.get(LayoutProfileKind::AccessCostCache).count, 2u);
+}
+TEST_F(SM90AccessCacheTest, CopyWidthBulkAndMissingBindingRemainDistinct) {
+  AccessCacheFixture f;
+  ASSERT_TRUE(f.initialize(context));
+  auto target = createSM90LayoutTarget();
+  LayoutProfile profile(true);
+  LayoutProfile::Invocation invocation(&profile);
+  SmallVector<CostEstimate> first;
+  for (unsigned which = 0; which != 4; ++which) {
+    f.select(which % 3, which != 3);
+    auto cost = target->evaluate(f.graph, f.assignment);
+    ASSERT_TRUE(succeeded(cost)); first.push_back(*cost);
+  }
+  EXPECT_EQ(f.graph.getAccessCostCache().size(), 4u);
+  EXPECT_EQ(profile.get(LayoutProfileKind::AccessCostCache).misses, 4u);
+  EXPECT_LT(first[1].cost.instructionPathAndWork, first[0].cost.instructionPathAndWork);
+  for (unsigned which = 0; which != 4; ++which) {
+    f.select(which % 3, which != 3);
+    auto cost = target->evaluate(f.graph, f.assignment);
+    ASSERT_TRUE(succeeded(cost)); sameEstimate(*cost, first[which]);
+  }
+  EXPECT_EQ(profile.get(LayoutProfileKind::AccessCostCache).hits, 4u);
+  f.graph.setCostQueryCacheOptions(false);
+  for (unsigned which = 0; which != 4; ++which) {
+    f.select(which % 3, which != 3);
+    auto cost = target->evaluate(f.graph, f.assignment);
+    ASSERT_TRUE(succeeded(cost)); sameEstimate(*cost, first[which]);
+  }
+}
+TEST_F(SM90AccessCacheTest, ReadWriteAndAlignmentFactsDoNotAlias) {
+  AccessCacheFixture f;
+  ASSERT_TRUE(f.initialize(context, 32, 1, 2));
+  auto target = createSM90LayoutTarget();
+  auto read = target->evaluate(f.graph, f.assignment);
+  ASSERT_TRUE(succeeded(read));
+  f.graph.getConstraints()[f.access].access = AccessKind::Write;
+  auto write = target->evaluate(f.graph, f.assignment);
+  ASSERT_TRUE(succeeded(write));
+  EXPECT_LT(write->cost.instructionPathAndWork, read->cost.instructionPathAndWork);
+  EXPECT_EQ(f.graph.getAccessCostCache().size(), 2u);
+  // A defensive alignment key prevents the stronger valid guarantee from
+  // reusing the unknown-phase upper bound. Addresses/layout stay unchanged.
+  f.graph.getVariable(f.source).storageAlias->rootAlignment = 32;
+  auto aligned = target->evaluate(f.graph, f.assignment);
+  ASSERT_TRUE(succeeded(aligned));
+  EXPECT_LT(aligned->cost.memoryTransactions, write->cost.memoryTransactions);
+  EXPECT_EQ(f.graph.getAccessCostCache().size(), 3u);
+  f.graph.setCostQueryCacheOptions(false);
+  auto reference = target->evaluate(f.graph, f.assignment);
+  ASSERT_TRUE(succeeded(reference)); sameEstimate(*aligned, *reference);
+}
+TEST_F(SM90AccessCacheTest, IndependentGraphsAndElementTypesHaveIndependentEntries) {
+  AccessCacheFixture a, b;
+  ASSERT_TRUE(a.initialize(context, 16)); ASSERT_TRUE(b.initialize(context, 32));
+  auto target = createSM90LayoutTarget();
+  auto first = target->evaluate(a.graph, a.assignment);
+  auto second = target->evaluate(b.graph, b.assignment);
+  ASSERT_TRUE(succeeded(first)); ASSERT_TRUE(succeeded(second));
+  EXPECT_NE(first->cost.memoryTransactions, second->cost.memoryTransactions);
+  EXPECT_EQ(a.graph.getAccessCostCache().size(), 1u);
+  EXPECT_EQ(b.graph.getAccessCostCache().size(), 1u);
+  auto again = target->evaluate(a.graph, a.assignment);
+  ASSERT_TRUE(succeeded(again)); sameEstimate(*first, *again);
+  b.graph.setCostQueryCacheOptions(false);
+  auto off = target->evaluate(b.graph, b.assignment);
+  ASSERT_TRUE(succeeded(off)); sameEstimate(*second, *off);
+}
+TEST_F(SM90AccessCacheTest, CapacityBypassAndStructuralInvalidationPreserveResults) {
+  AccessCacheFixture f;
+  ASSERT_TRUE(f.initialize(context));
+  auto target = createSM90LayoutTarget();
+  f.graph.setCostQueryCacheOptions(true, 1);
+  LayoutProfile profile(true);
+  LayoutProfile::Invocation invocation(&profile);
+  auto first = target->evaluate(f.graph, f.assignment);
+  f.select(1);
+  auto second = target->evaluate(f.graph, f.assignment);
+  auto repeated = target->evaluate(f.graph, f.assignment);
+  ASSERT_TRUE(succeeded(first)); ASSERT_TRUE(succeeded(second)); ASSERT_TRUE(succeeded(repeated));
+  sameEstimate(*second, *repeated);
+  EXPECT_EQ(f.graph.getAccessCostCache().size(), 1u);
+  EXPECT_EQ(profile.get(LayoutProfileKind::AccessCostCache).misses, 3u);
+  EXPECT_EQ(profile.get(LayoutProfileKind::AccessCostCache).entries, 1u);
+  f.graph.setCostQueryCacheOptions(true, 0);
+  auto zero = target->evaluate(f.graph, f.assignment);
+  ASSERT_TRUE(succeeded(zero)); sameEstimate(*second, *zero);
+  EXPECT_TRUE(f.graph.getAccessCostCache().empty());
+  f.graph.setCostQueryCacheOptions(true, UINT32_MAX);
+  EXPECT_EQ(f.graph.getCostQueryCacheCapacity(), 4096u);
+  ASSERT_TRUE(succeeded(target->evaluate(f.graph, f.assignment)));
+  ASSERT_FALSE(f.graph.getAccessCostCache().empty());
+  auto type = f.graph.getVariable(f.execution).shapedType;
+  f.graph.addVariable(LayoutKind::Distributed, type, "added");
+  EXPECT_FALSE(f.graph.isCostQueryCacheEnabled());
+  EXPECT_TRUE(f.graph.getAccessCostCache().empty());
+  ASSERT_TRUE(succeeded(f.graph.finalize(UnknownLoc::get(&context))));
+  f.rebind(); f.select(1);
+  ASSERT_TRUE(succeeded(target->evaluate(f.graph, f.assignment)));
+  ASSERT_FALSE(f.graph.getAccessCostCache().empty());
+  ASSERT_TRUE(succeeded(f.graph.finalize(UnknownLoc::get(&context))));
+  EXPECT_TRUE(f.graph.getAccessCostCache().empty());
+  f.rebind(); f.select(1);
+  auto final = target->evaluate(f.graph, f.assignment);
+  ASSERT_TRUE(succeeded(final)); sameEstimate(*second, *final);
+  f.graph.getVariable(f.source).stableName = "execution";
+  ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
+  EXPECT_TRUE(failed(f.graph.finalize(UnknownLoc::get(&context))));
+  EXPECT_FALSE(f.graph.isFinalized());
+  EXPECT_TRUE(f.graph.getAccessCostCache().empty());
+}
+TEST_F(SM90AccessCacheTest, UnknownFootprintIsNeverCachedAsAFreeCost) {
+  AccessCacheFixture f;
+  ASSERT_TRUE(f.initialize(context));
+  // The type/layout are small and independently valid. This unsupported
+  // symbolic alias transform reaches accessCost's footprint proof, rather
+  // than failing the earlier immutable type/layout decoder on a large domain.
+  f.graph.getVariable(f.source).storageAlias->viewToRoot = AffineMap::get(2, 1,
+      {getAffineDimExpr(0, &context) + getAffineSymbolExpr(0, &context),
+       getAffineDimExpr(1, &context)}, &context);
+  ASSERT_TRUE(succeeded(f.graph.finalize(UnknownLoc::get(&context))));
+  f.rebind(); f.select(0, false); // Avoid unrelated Shared-root/setup terms.
+  LayoutProfile profile(true);
+  LayoutProfile::Invocation invocation(&profile);
+  auto target = createSM90LayoutTarget();
+  EXPECT_TRUE(failed(target->evaluate(f.graph, f.assignment)));
+  EXPECT_TRUE(failed(target->evaluate(f.graph, f.assignment)));
+  EXPECT_EQ(getStorageAliasFootprint(f.graph, f.source,
+      cast<StorageLayoutAttr>(f.sourceLayout)).proof.status, ProofStatus::Unknown);
+  EXPECT_TRUE(f.graph.getAccessCostCache().empty());
+  EXPECT_EQ(profile.get(LayoutProfileKind::AccessCostCache).misses, 2u);
+  EXPECT_EQ(profile.get(LayoutProfileKind::AccessCostCache).entries, 0u);
+  f.graph.setCostQueryCacheOptions(false);
+  EXPECT_TRUE(failed(target->evaluate(f.graph, f.assignment)));
+}
+TEST_F(SM90AccessCacheTest, CalibratedProfilesAndFrequencyAreAppliedAfterRawReplay) {
+  AccessCacheFixture f;
+  ASSERT_TRUE(f.initialize(context, 32, 1, 1, true));
+  f.select(2);
+  auto firstProfile = unitProfile();
+  auto secondProfile = firstProfile;
+  secondProfile.coefficients[0] = 7;
+  secondProfile.coefficients[1] = 11;
+  auto legacy = createSM90LayoutTarget();
+  ASSERT_TRUE(succeeded(legacy->evaluate(f.graph, f.assignment)));
+  auto first = createSM90LayoutTarget(LayoutBoundaryFrequencyMode::Legacy, firstProfile);
+  auto second = createSM90LayoutTarget(LayoutBoundaryFrequencyMode::StaticTripCount, secondProfile);
+  TestCostObserver warmParts, offParts;
+  auto warm = second->evaluate(f.graph, f.assignment, &warmParts);
+  auto different = first->evaluate(f.graph, f.assignment);
+  ASSERT_TRUE(succeeded(warm)); ASSERT_TRUE(succeeded(different));
+  EXPECT_NE(warm->cost.instructionPathAndWork, different->cost.instructionPathAndWork);
+  EXPECT_EQ(f.graph.getAccessCostCache().size(), 1u);
+  f.graph.setCostQueryCacheOptions(false);
+  auto off = second->evaluate(f.graph, f.assignment, &offParts);
+  ASSERT_TRUE(succeeded(off)); sameEstimate(*warm, *off); sameParts(warmParts, offParts);
+  warmParts.expectSum(*warm);
+}
+} // namespace
+
+
+namespace {
+// Independent small-domain oracle: retain the original concrete hardware
+// traversal and integer issue/phase partitioning. It deliberately does not use
+// the symbolic implementation's bases, quotient classes or elected section.
+struct SymbolicAccessFixture {
+  OwningOpRef<ModuleOp> module;
+  LayoutConstraintGraph graph;
+  CandidateAssignment assignment;
+  DistributedEncodingAttr encoding;
+  StorageLayoutAttr storage;
+  RankedTensorType type;
+  LayoutVarID storageID = 0;
+  unsigned bits = 32, width = 1, alignment = 32;
+  bool global = true;
+  StringRef path = "vector";
+  AccessKind access = AccessKind::Read;
+
+  bool initialize(MLIRContext &context, uint64_t logical,
+      ArrayRef<int64_t> topology, ArrayRef<uint64_t> images,
+      unsigned elementBits = 32, unsigned vectorBytes = 1,
+      bool globalMemory = true, AccessKind kind = AccessKind::Read,
+      unsigned stride = 1, unsigned rootAlignment = 32,
+      StringRef copyPath = "vector", bool reverseInputs = false,
+      bool omitUnused = false, uint64_t actual = 0) {
+    Builder b(&context);
+    bits = elementBits; width = vectorBytes; global = globalMemory;
+    alignment = rootAlignment; access = kind; path = copyPath;
+    if (!actual) actual = logical;
+    std::string memref = "memref<" + std::to_string(actual) + "xi" +
+        std::to_string(bits) + ",strided<[" + std::to_string(stride) +
+        "]>," + (global ? "1" : "3") + ">";
+    module = parseSourceString<ModuleOp>("func.func @symbolic() { %a=memref.alloc() "
+        "{alignment=" + std::to_string(alignment) + ":i64}:" + memref +
+        " return }", &context);
+    if (!module) return false;
+    memref::AllocOp allocation;
+    module->walk([&](memref::AllocOp op) { allocation = op; });
+    auto alias = analyzeStorageAlias(allocation.getResult());
+    if (failed(alias)) return false;
+    alias->rootKey = "symbolic-access-root";
+    auto layout = buildRootLinearStorageCandidate(*alias);
+    if (failed(layout)) return false;
+    storage = *layout;
+    constexpr const char *names[] = {"register", "lane", "warp", "warp_group", "cta"};
+    std::array<unsigned, 5> offsets{}, widths{};
+    unsigned hardwareBits = 0;
+    for (unsigned i = 0; i < 5; ++i) {
+      offsets[i] = hardwareBits;
+      widths[i] = llvm::Log2_64(topology[i]);
+      hardwareBits += widths[i];
+    }
+    if (images.size() != hardwareBits) return false;
+    SmallVector<StringRef> inputNames;
+    SmallVector<int64_t> inputWidths;
+    SmallVector<unsigned> columns;
+    for (unsigned n = 0; n < 5; ++n) {
+      unsigned c = reverseInputs ? 4 - n : n;
+      // Unit carriers are represented by omission, never a zero input width.
+      if (!widths[c]) continue;
+      bool used = false;
+      for (unsigned j = 0; j < widths[c]; ++j) used |= images[offsets[c]+j] != 0;
+      if (omitUnused && !used) continue;
+      inputNames.push_back(names[c]); inputWidths.push_back(widths[c]);
+      for (unsigned j = 0; j < widths[c]; ++j) columns.push_back(offsets[c]+j);
+    }
+    unsigned outputBits = llvm::Log2_64(logical);
+    SmallVector<APInt> values;
+    for (unsigned r = 0; r < outputBits; ++r)
+      for (unsigned c : columns) values.emplace_back(1, (images[c] >> r) & 1);
+    auto map = BitLinearLayoutMapAttr::get(&context, b.getStrArrayAttr(inputNames),
+        b.getDenseI64ArrayAttr(inputWidths), b.getStrArrayAttr({"x"}),
+        b.getDenseI64ArrayAttr({int64_t(outputBits)}), DenseIntElementsAttr::get(
+            RankedTensorType::get({outputBits, int64_t(columns.size())}, b.getI1Type()), values));
+    if (hardwareBits < outputBits || hardwareBits - outputBits >= 63) return false;
+    encoding = DistributedEncodingAttr::get(&context, map, b.getDenseI64ArrayAttr(topology),
+        b.getI64IntegerAttr(int64_t(1) << (hardwareBits-outputBits)));
+    type = RankedTensorType::get({int64_t(logical)}, b.getIntegerType(bits));
+    storageID = graph.addVariable(LayoutKind::Storage, allocation.getType(), "storage");
+    graph.getVariable(storageID).storageAlias = *alias;
+    auto execution = graph.addVariable(LayoutKind::Distributed, type, "execution", allocation);
+    graph.getVariable(execution).operationExecution = OperationExecutionBinding{};
+    auto plan = graph.addVariable(LayoutKind::Instruction, allocation.getType(), "plan");
+    auto binding = b.getDictionaryAttr({b.getNamedAttr("path", b.getStringAttr(path)),
+        b.getNamedAttr("vector_bytes", b.getI64IntegerAttr(width))});
+    auto instruction = graph.addConstraint(ConstraintKind::InstructionContract,
+        ConstraintStrength::Hard, {storageID, execution, plan}, allocation,
+        "symbolic-cost-test", "selected score-only width");
+    // Like SM90AddressCostTest, test scoring dependencies independently of the
+    // instruction legality decoder. This source is not a real Copy operation.
+    graph.getConstraints()[instruction].instruction = InstructionLayoutContract{
+        allocation, {}, {{{storage, encoding, binding}, binding}}};
+    auto id = graph.addConstraint(ConstraintKind::StorageAccess,
+        ConstraintStrength::Hard, {storageID, execution}, allocation,
+        "symbolic-cost-test", "address cost");
+    graph.getConstraints()[id].access = access;
+    assignment.values[storageID] = storage;
+    assignment.values[execution] = encoding;
+    assignment.values[plan] = binding;
+    return true;
+  }
+  FailureOr<CostEstimate> evaluate() {
+    return evaluateSM90LayoutCost(graph, assignment);
+  }
+  FailureOr<CostVector> oracle() {
+    ExecutionEnumeration points;
+    if (enumerateExecutionLayout(encoding, type, points).status != ProofStatus::Proven)
+      return failure();
+    const auto &footprint = getStorageAliasFootprint(graph, storageID, storage);
+    if (footprint.proof.status != ProofStatus::Proven) return failure();
+    std::map<SmallVector<int64_t>, std::pair<uint64_t,uint64_t>> addresses;
+    for (const auto &p : footprint.entries)
+      addresses.emplace(p.view, std::make_pair(p.begin/8, llvm::divideCeil(p.end,uint64_t{8})));
+    using Groups = std::map<SmallVector<int64_t>, std::vector<std::pair<uint64_t,uint64_t>>>;
+    Groups issues, phases;
+    unsigned chunk = std::max(1u, width*8/bits);
+    unsigned phaseBytes = std::max(width, llvm::divideCeil(bits,8u));
+    unsigned lanesPerPhase = std::max(1u,std::min(32u,128u/phaseBytes));
+    for (uint64_t h = 0; h < points.logical.size(); ++h) {
+      auto logical = points.logical[h];
+      if (access == AccessKind::Write && points.first[logical] != h) continue;
+      auto address = addresses.find(points.coordinate(logical));
+      if (address == addresses.end()) continue;
+      auto hw = points.hardware(h);
+      SmallVector<int64_t> key = path == "tma" ? SmallVector<int64_t>{0} :
+          SmallVector<int64_t>{hw[0],hw[1],hw[2],hw[4]/chunk};
+      issues[key].push_back(address->second);
+      key.push_back(hw[3]/lanesPerPhase);
+      phases[key].push_back(address->second);
+    }
+    uint64_t worstSectors = 0, worstBanks = 0;
+    for (uint64_t phase = 0; phase < 32; phase += std::min(32u,alignment)) {
+      uint64_t sectors = 0, banks = 0;
+      for (const auto &[key,ranges] : issues) {
+        std::set<uint64_t> touched;
+        for (auto [begin,end] : ranges)
+          for (uint64_t s=(begin+phase)/32; s<=(end-1+phase)/32; ++s) touched.insert(s);
+        sectors += touched.size();
+      }
+      for (const auto &[key,ranges] : phases) {
+        std::map<unsigned,std::set<uint64_t>> words;
+        for (auto [begin,end] : ranges)
+          for (uint64_t w=(begin+phase)/4; w<=(end-1+phase)/4; ++w) words[w%32].insert(w);
+        uint64_t degree = 1;
+        for (const auto &[bank,touched] : words) degree = std::max<uint64_t>(degree,touched.size());
+        banks += degree-1;
+      }
+      worstSectors = std::max(worstSectors,sectors);
+      worstBanks = std::max(worstBanks,banks);
+    }
+    CostVector cost;
+    if (global) cost.memoryTransactions = worstSectors;
+    if (!global && path != "tma") cost.bankConflictDegree = worstBanks;
+    if (path != "tma" && (path == "vector" || access == AccessKind::Read))
+      cost.instructionPathAndWork = issues.size();
+    return cost;
+  }
+};
+class SM90SymbolicAccessTest : public testing::Test {
+protected:
+  MLIRContext context;
+  SM90SymbolicAccessTest() {
+    context.loadDialect<FriskDialect,func::FuncDialect,memref::MemRefDialect>();
+  }
+  void expectOracle(SymbolicAccessFixture &f) {
+    auto expected = f.oracle(); auto actual = f.evaluate();
+    ASSERT_TRUE(succeeded(expected)); ASSERT_TRUE(succeeded(actual));
+    EXPECT_EQ(actual->cost.instructionPathAndWork,expected->instructionPathAndWork);
+    EXPECT_EQ(actual->cost.memoryTransactions,expected->memoryTransactions);
+    EXPECT_EQ(actual->cost.bankConflictDegree,expected->bankConflictDegree);
+    EXPECT_FALSE(actual->saturated);
+  }
+};
+TEST_F(SM90SymbolicAccessTest, MixedGF2MatricesMatchConcreteAddressOracle) {
+  // Column swaps/XORs preserve full row rank but create actual mixed GF2 maps,
+  // including lane/register/warp interactions rather than only permutations.
+  uint32_t state = 0x91a2b3c4;
+  auto next = [&] { state ^= state<<13; state ^= state>>17; state ^= state<<5; return state; };
+  for (unsigned trial = 0; trial < 12; ++trial) {
+    SmallVector<uint64_t> images(9,0);
+    for (unsigned i = 0; i < 6; ++i) images[i] = uint64_t(1)<<i;
+    for (unsigned i = 0; i < 30; ++i) {
+      unsigned a=next()%9,b=next()%9;
+      if (a != b) { if (next()&1) std::swap(images[a],images[b]); else images[a] ^= images[b]; }
+    }
+    for (auto access : {AccessKind::Read,AccessKind::Write})
+      for (bool global : {false,true}) {
+        SCOPED_TRACE(testing::Message()<<trial<<','<<int(access)<<','<<global);
+        SymbolicAccessFixture f;
+        ASSERT_TRUE(f.initialize(context,64,{4,32,2,2,1},images,
+            trial%3==0 ? 64 : 32,trial%2 ? 16 : 1,global,access,
+            trial%2 ? 7 : 1,trial%3 ? 32 : 1,"vector",trial%2));
+        expectOracle(f);
+      }
+  }
+}
+TEST_F(SM90SymbolicAccessTest, FirstOwnerUsesCanonicalHardwareOrder) {
+  // register bit0 and lane bit0 have identical output images: the first owner
+  // must use the cheaper low hardware bit, independent of attribute input order.
+  for (bool reverse : {false,true}) {
+    SymbolicAccessFixture f;
+    ASSERT_TRUE(f.initialize(context,4,{2,32,2,1,1},{1,1,2,0,0,0,0},
+        32,1,true,AccessKind::Write,8,32,"vector",reverse));
+    expectOracle(f);
+    auto cost=f.evaluate(); ASSERT_TRUE(succeeded(cost));
+    EXPECT_EQ(cost->cost.instructionPathAndWork,2u);
+  }
+}
+TEST_F(SM90SymbolicAccessTest, BroadcastsRemainSeparateAcrossPhysicalWarpGroups) {
+  SmallVector<uint64_t> images(8,0); images[0]=1;
+  for (auto access : {AccessKind::Read,AccessKind::Write}) {
+    SymbolicAccessFixture f;
+    ASSERT_TRUE(f.initialize(context,2,{2,32,2,2,1},images,
+        32,1,true,access,1,32,"vector",false,true));
+    expectOracle(f);
+    auto cost=f.evaluate(); ASSERT_TRUE(succeeded(cost));
+    EXPECT_EQ(cost->cost.instructionPathAndWork,access==AccessKind::Read ? 8u : 2u);
+  }
+}
+TEST_F(SM90SymbolicAccessTest, NonPowerOfTwoPartitionsKeepConcreteSemantics) {
+  for (unsigned bits : {24u,40u,48u,80u}) {
+    // i24 + 16B binding has floor chunk=5; i40/i48/i80 have non-power-of-two
+    // native bank phase lane counts. These score-only bindings test the exact
+    // legacy bounded fallback, not the separate Copy legality contract.
+    SmallVector<uint64_t> images(8,0);
+    for (unsigned i=0;i<6;++i) images[i]=uint64_t(1)<<i;
+    for (auto access : {AccessKind::Read,AccessKind::Write}) {
+      SymbolicAccessFixture f;
+      ASSERT_TRUE(f.initialize(context,64,{4,32,2,1,1},images,bits,
+          bits==24 ? 16 : 1,false,access,3,1));
+      expectOracle(f);
+    }
+  }
+}
+TEST_F(SM90SymbolicAccessTest, GuardedTailsCountOnlyNonemptyActiveIssues) {
+  for (auto access : {AccessKind::Read,AccessKind::Write}) {
+    SymbolicAccessFixture f;
+    ASSERT_TRUE(f.initialize(context,8,{2,32,2,1,1},{1,2,4,0,0,0,0},
+        32,1,true,access,1,1,"vector",false,false,3));
+    expectOracle(f);
+  }
+}
+TEST_F(SM90SymbolicAccessTest, BulkAndAsyncBindingsMatchConcreteGrouping) {
+  SmallVector<uint64_t> images(9,0);
+  for (unsigned i=0;i<7;++i) images[i]=uint64_t(1)<<i;
+  for (StringRef path : {StringRef("vector"),StringRef("cp.async"),StringRef("tma")})
+    for (auto access : {AccessKind::Read,AccessKind::Write}) {
+      SymbolicAccessFixture f;
+      ASSERT_TRUE(f.initialize(context,128,{8,32,2,1,1},images,
+          32,16,true,access,1,1,path));
+      expectOracle(f);
+    }
+}
+TEST_F(SM90SymbolicAccessTest, HardwareBudgetBoundaryAndLargeReplication) {
+  for (unsigned registers : {512u,1024u}) {
+    unsigned registerBits=llvm::Log2_64(registers);
+    SmallVector<uint64_t> images(registerBits+7,0);
+    for (unsigned i=0;i<registerBits;++i) images[i]=uint64_t(1)<<i;
+    for (auto access : {AccessKind::Read,AccessKind::Write}) {
+      SymbolicAccessFixture f;
+      ASSERT_TRUE(f.initialize(context,registers,{registers,32,4,1,1},images,
+          32,1,true,access));
+      auto cost=f.evaluate(); ASSERT_TRUE(succeeded(cost));
+      uint64_t issues=uint64_t(registers)*(access==AccessKind::Read ? 4 : 1);
+      EXPECT_EQ(cost->cost.instructionPathAndWork,issues);
+      EXPECT_EQ(cost->cost.memoryTransactions,issues);
+      EXPECT_EQ(cost->cost.bankConflictDegree,0u);
+      EXPECT_FALSE(cost->saturated);
+      if (registers==512) expectOracle(f);
+      else {
+        ExecutionEnumeration points;
+        EXPECT_EQ(enumerateExecutionLayout(f.encoding,f.type,points).status,ProofStatus::Unknown);
+      }
+    }
+  }
+}
+TEST_F(SM90SymbolicAccessTest, UnitLogicalDomainSupportsUniqueAndReplicatedHardware) {
+  for (unsigned lanes : {1u,32u})
+    for (auto access : {AccessKind::Read,AccessKind::Write}) {
+      SymbolicAccessFixture f;
+      SmallVector<uint64_t> images(llvm::Log2_64(lanes),0);
+      ASSERT_TRUE(f.initialize(context,1,{1,lanes,1,1,1},images,
+          32,1,true,access,1,32,"vector",false,true));
+      expectOracle(f);
+    }
+}
+TEST_F(SM90SymbolicAccessTest, HugeOmittedCarrierSaturatesWithoutHardwareExpansion) {
+  SymbolicAccessFixture f;
+  SmallVector<uint64_t> images(62,0);
+  ASSERT_TRUE(f.initialize(context,1,{1,32,1,int64_t(1)<<57,1},images,
+      32768,1,true,AccessKind::Read,1,32,"vector",false,true));
+  auto cost=f.evaluate(); ASSERT_TRUE(succeeded(cost));
+  EXPECT_EQ(cost->cost.instructionPathAndWork,uint64_t(1)<<57);
+  EXPECT_EQ(cost->cost.memoryTransactions,UINT64_MAX);
+  EXPECT_EQ(cost->cost.bankConflictDegree,0u);
+  EXPECT_TRUE(cost->saturated);
+}
+
+TEST_F(SM90SymbolicAccessTest, NonzeroDependentColumnsPreserveReadIssueMultiplicity) {
+  // Every column is nonzero, but c0=c1 XOR c2. Removing only zero columns or
+  // charging one copy of the image would undercount this valid replicated map.
+  for (auto access : {AccessKind::Read,AccessKind::Write}) {
+    SymbolicAccessFixture f;
+    ASSERT_TRUE(f.initialize(context,4,{2,4,1,1,1},{3,1,2},
+        32,1,true,access,8,32,"vector",true));
+    expectOracle(f);
+    auto cost=f.evaluate(); ASSERT_TRUE(succeeded(cost));
+    EXPECT_EQ(cost->cost.instructionPathAndWork,2u);
+  }
+}
+TEST_F(SM90SymbolicAccessTest, FullLogicalBoundaryMatchesConcreteOracle) {
+  SmallVector<uint64_t> images(16,0);
+  for (unsigned i=0;i<16;++i) images[i]=uint64_t(1)<<i;
+  SymbolicAccessFixture f;
+  ASSERT_TRUE(f.initialize(context,65536,{512,32,4,1,1},images,
+      8,1,true,AccessKind::Read));
+  expectOracle(f);
+}
+TEST_F(SM90SymbolicAccessTest, MissingCoverageAndWrongReplicationRemainFailures) {
+  ScopedDiagnosticHandler silence(&context, [](Diagnostic &) { return success(); });
+  SymbolicAccessFixture missing;
+  ASSERT_TRUE(missing.initialize(context,4,{4,1,1,1,1},{1,0}));
+  EXPECT_TRUE(failed(missing.evaluate()));
+  SymbolicAccessFixture wrong;
+  ASSERT_TRUE(wrong.initialize(context,4,{4,1,1,1,1},{1,2}));
+  Builder b(&context);
+  auto old=wrong.encoding;
+  wrong.encoding=DistributedEncodingAttr::get(&context,old.getMap(),old.getTopology(),
+      b.getI64IntegerAttr(2));
+  for (auto &entry : wrong.assignment.values)
+    if (entry.second==old) entry.second=wrong.encoding;
+  for (auto &constraint : wrong.graph.getConstraints())
+    if (constraint.instruction)
+      for (auto &tuple : constraint.instruction->tuples)
+        for (auto &encoding : tuple.encodings)
+          if (encoding==old) encoding=wrong.encoding;
+  EXPECT_TRUE(failed(wrong.evaluate()));
 }
 } // namespace

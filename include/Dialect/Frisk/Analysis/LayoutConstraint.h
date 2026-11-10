@@ -8,9 +8,11 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <tuple>
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
@@ -246,6 +248,30 @@ class LayoutConstraintGraph {
 public:
   using AliasCandidateKey = std::pair<LayoutVarID, Attribute>;
   using AliasPairKey = std::pair<AliasCandidateKey, AliasCandidateKey>;
+  // Raw, unweighted SM90 StorageAccess terms. A graph owns all root/alias/IR
+  // facts; candidate attributes and the selected Copy binding distinguish the
+  // remaining varying inputs. Type and alignment are explicit defensive keys.
+  using AccessCostCacheKey = std::tuple<LayoutConstraintID, Type, Attribute,
+      Type, Attribute, Attribute, uint64_t, unsigned>;
+  static constexpr unsigned maximumCostQueryCacheEntries = 4096;
+  auto &getAccessCostCache() const { return accessCosts; }
+  auto &getStaticCostValidationCache() const { return staticCostValidations; }
+  bool isCostQueryCacheEnabled() const { return finalized && costQueryCacheEnabled; }
+  unsigned getCostQueryCacheCapacity() const { return costQueryCacheCapacity; }
+  // Diagnostic/differential controls only: neither option changes candidates,
+  // proof limits, search probes, scoring semantics or selected plans.
+  void setCostQueryCacheOptions(bool enabled,
+      unsigned capacity = maximumCostQueryCacheEntries) {
+    costQueryCacheEnabled = enabled;
+    costQueryCacheCapacity = capacity > maximumCostQueryCacheEntries
+        ? maximumCostQueryCacheEntries : capacity;
+    clearCostQueryCaches();
+  }
+  void clearCostQueryCaches() const {
+    accessCosts.clear();
+    staticCostValidations.clear();
+  }
+
   auto &getAliasFootprintCache() const { return aliasFootprints; }
   auto &getAliasPairCache() const { return aliasPairProofs; }
   auto &getCandidatePreparationStatistics() const { return preparationStatistics; }
@@ -280,6 +306,7 @@ public:
     return propagationStatistics;
   }
   void addRegionEdge(RegionLayoutEdge edge) {
+    clearCostQueryCaches();
     finalized = false;
     regionEdges.push_back(std::move(edge));
   }
@@ -303,6 +330,14 @@ private:
   mutable LayoutCandidatePreparationStatistics preparationStatistics;
   mutable DenseMap<AliasCandidateKey, StorageAliasFootprint> aliasFootprints;
   mutable DenseMap<AliasPairKey, LayoutProof> aliasPairProofs;
+  // IR, alias transforms and root contracts are immutable while a finalized
+  // graph is queried. Rebuild/re-finalize after changing those facts, as for
+  // footprint proofs. Domain pruning alone does not change query meanings.
+  mutable DenseMap<AccessCostCacheKey, CostEstimate> accessCosts;
+  mutable llvm::DenseSet<std::pair<Type, Attribute>> staticCostValidations;
+  bool costQueryCacheEnabled = true;
+  unsigned costQueryCacheCapacity = maximumCostQueryCacheEntries;
+
   bool finalized = false;
 };
 

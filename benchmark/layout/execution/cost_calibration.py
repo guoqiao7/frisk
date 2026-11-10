@@ -38,16 +38,28 @@ def fresh(path):
     path.mkdir(parents=True,exist_ok=False)
     return path
 
-def source_identity():
+def source_paths(*,root=None):
+    source_root=ROOT if root is None else Path(root)
     suffixes={".cpp",".cc",".c",".h",".hpp",".td",".py",".txt",".cmake",".mlir"}
-    files={}
+    paths={}
     for folder in ("include","lib","tools","benchmark","unittests","test","cmake"):
-        base=ROOT/folder
+        base=source_root/folder
         if base.exists():
             for p in base.rglob("*"):
-                if p.is_file() and p.suffix in suffixes:files[str(p.relative_to(ROOT))]=sha(p)
-    for p in ROOT.glob("CMakeLists.txt"):files[str(p.relative_to(ROOT))]=sha(p)
+                if p.is_file() and p.suffix in suffixes:paths[str(p.relative_to(source_root))]=p
+    for p in source_root.glob("CMakeLists.txt"):paths[str(p.relative_to(source_root))]=p
+    return paths
+
+
+def source_identity():
+    from integrity_session import active, verified_sha
+    paths=source_paths()
+    if active() is not None:
+        root=ROOT
+        active().inventory("source:"+str(root),paths,lambda:source_paths(root=root))
+    files={name:(verified_sha(path) if active() is not None else sha(path)) for name,path in paths.items()}
     return dict(schema_version=1,source_manifest=files,source_digest=hashlib.sha256(json.dumps(files,sort_keys=True,separators=(",",":")).encode()).hexdigest())
+
 
 def input_hashes(run,profile=None):
     paths=[run/"protocol.json",run/"registration.json",run/"unit-profile.json",run/"feature-semantics.json"]
@@ -180,6 +192,8 @@ def compile_exact(directory):
     if any((directory/name).exists() for name in ("kernel.cubin","kernel.ptx","kernel.ttgir","correctness.json")):
         raise FileExistsError("fresh compilation refuses overwrite")
     start=time.perf_counter_ns();execution=read(directory/"execution.json");tt,info=emit(execution)
+    from native_static_support import check_static_shared
+    check_static_shared(info)  # reject unsupported static allocations before native compilation
     write(directory/"resource-plan-before-native.json",dict(prediction=predict_resources(execution),
           information_stage="execution-export-before-native-compile",created_ns=time.time_ns()))
     (directory/"kernel.ttgir").write_text(tt)

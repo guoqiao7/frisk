@@ -1,5 +1,5 @@
 """Replay original Frisk input through checked export and TTGIR on H100."""
-import argparse,json,subprocess,time,hashlib,sys,tempfile,os
+import argparse,ctypes,json,subprocess,time,hashlib,sys,tempfile,os
 os.environ["TRITON_ALWAYS_COMPILE"]="1"
 from pathlib import Path
 import numpy as np
@@ -9,19 +9,48 @@ from triton.backends.nvidia.compiler import get_ptxas
 from triton._C import libtriton
 from backend import emit
 from async_host import validate_launch,TensorMaps,physical_abi
-p=argparse.ArgumentParser();p.add_argument('--path',choices=['vector','cp.async','tma'],default='vector');p.add_argument('--root',default='/home/baopeihua/frisk');p.add_argument('--opt');p.add_argument('--output',required=True);p.add_argument('--compile-only',action='store_true');args=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--path',choices=['vector','cp.async','tma'],default='vector');p.add_argument('--root',default='/home/baopeihua/frisk');p.add_argument('--opt');p.add_argument('--output',required=True);p.add_argument('--compile-only',action='store_true')
+p.add_argument('--target-ctas-per-sm', type=int, choices=(2, 3, 4),
+               help='require a spill-free SM90 binary with this driver residency')
+p.add_argument('--normalization-division', choices=('exact-divide', 'guarded-row-reciprocal'),
+               default='exact-divide', help='select the checked packed Attention normalization path')
+args=p.parse_args()
 r=Path(args.root);output_root=Path(args.output);output_root.mkdir(parents=True,exist_ok=True);out=Path(tempfile.mkdtemp(prefix='run-',dir=output_root));print('artifact_directory='+str(out),flush=True);opt=args.opt or str(r/'build-m6-release/bin/frisk-opt')
 def execute(cmd,name):
  t=time.perf_counter_ns();q=subprocess.run(cmd,text=True,capture_output=True);(out/(name+'.stdout')).write_text(q.stdout);(out/(name+'.stderr')).write_text(q.stderr);(out/(name+'.command.json')).write_text(json.dumps(cmd));
  if q.returncode:raise RuntimeError(name+' failed')
  return time.perf_counter_ns()-t
 source=r/('test/Transforms/attention-layout-'+{'vector':'fixed','cp.async':'cp-async','tma':'tma'}[args.path]+'-abi.mlir');(out/'input.mlir').write_bytes(source.read_bytes());start=time.perf_counter_ns();infer=execute([opt,str(source),'--frisk-layout-pipeline','-o',str(out/'selected.mlir')],'infer');execute([opt,str(out/'selected.mlir'),'-frisk-export-execution=output='+str(out/'execution.json'),'-o','/dev/null'],'export')
-data=json.loads((out/'execution.json').read_text());text,info=emit(data);(out/'kernel.ttgir').write_text(text);(out/'execution_config.json').write_text(json.dumps(info,indent=2))
+data=json.loads((out/'execution.json').read_text());text,info=emit(data, normalization_division=args.normalization_division)
+target = None
+if args.target_ctas_per_sm is not None:
+ from native_static_support import target_sm90_residency
+ text, target = target_sm90_residency(text, info, args.target_ctas_per_sm)
+(out/'kernel.ttgir').write_text(text);(out/'execution_config.json').write_text(json.dumps(info,indent=2))
 torch.cuda.set_device(1)
 k=triton.compile(str(out/'kernel.ttgir'),target=GPUTarget('cuda',90,32),options={'num_warps':4,'enable_fp_fusion':False})
 for ext,content in k.asm.items():
  f=out/('kernel.'+ext);f.write_bytes(content) if isinstance(content,bytes) else f.write_text(content)
 physical_params=physical_abi(k.asm['ptx'],len(info['tma_plans']))
+if target is not None:
+ from cost_calibration import parse_sass
+ from native_static_support import check_sm90_residency_binary
+ from physical_resources import query_physical_resources
+ from resource_prediction import compiler_exact_resources
+
+ if k.metadata.shared or k.metadata.global_scratch_size:
+  raise ValueError('SM90 residency requires static Shared and zero scratch')
+ cubin = out/'kernel.cubin'
+ compiler = compiler_exact_resources(cubin)['resources']
+ resources = dict(compiler, local_bytes=compiler['raw_local_bytes'])
+ sass = subprocess.check_output(['/usr/local/cuda/bin/cuobjdump', '--dump-sass', str(cubin)], text=True)
+ target = check_sm90_residency_binary(target, k.asm['ptx'], resources, parse_sass(sass))
+ k._init_handles()
+ loaded = query_physical_resources(ctypes.CDLL('libcuda.so.1'), k.function)
+ if (loaded['local_bytes'] or loaded['registers_per_thread'] != target['native_registers_per_thread']
+     or loaded['residency']['active_blocks_per_sm'] < target['blocks_per_sm']):
+  raise ValueError('loaded SM90 image failed its spill-free residency target')
+ (out/'native-residency.json').write_text(json.dumps(dict(native=target, loaded=loaded), indent=2))
 full=time.perf_counter_ns()-start
 manifest={'artifact_directory':str(out),'launch_abi':{'logical_arguments':['Q:u8*','K:u8*','V:u8*','O:u8*'],'physical_arguments':physical_params,'grid':[1,1,1],'threads':128,'device':1,'global_alignments':info['global_alignments']},'schema_version':1,'status':'compiled','triton':triton.__version__,'inference_ns':infer,'full_compile_ns':full,'cache_policy':'TRITON_ALWAYS_COMPILE=1; backend recompiled every invocation','config':info,'metadata':str(k.metadata),'hashes':{f.name:hashlib.sha256(f.read_bytes()).hexdigest() for f in out.iterdir() if f.is_file() and f.name!='manifest.json' and not f.name.startswith('failure_')}}
 manifest['source_hashes']={str(f.relative_to(r)):hashlib.sha256(f.read_bytes()).hexdigest() for f in list((r/'benchmark/layout/execution').glob('*.py'))+[r/'lib/Conversion/FriskLayoutToGPU/ExportExecution.cpp',r/'include/Dialect/Frisk/Transforms/Passes.h',r/'include/Dialect/Frisk/Transforms/Passes.td']};manifest['tool_hashes']={str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in [Path(opt),Path(get_ptxas().path),Path(triton.__file__),Path(libtriton.__file__)]};manifest['environment']=subprocess.check_output(['nvidia-smi','-i','1','--query-gpu=uuid,name,driver_version,utilization.gpu,memory.used','--format=csv,noheader'],text=True).strip();(out/'manifest.json').write_text(json.dumps(manifest,indent=2));print('compiled',flush=True)
@@ -56,7 +85,6 @@ for name,q,kk,v in cases:
    torch.cuda.synchronize();raw=ob.cpu().numpy();got=raw[offset:offset+4096].copy().view(np.float32).reshape(64,16);err=np.abs(got-ref);ok=np.isfinite(got).all() and np.all(err<=.002+.002*np.abs(ref));guards=np.all(raw[:offset]==165) and np.all(raw[offset+4096:]==165);input_unchanged=all(np.array_equal(b.cpu().numpy(),expected) for b,expected in zip(buffers,expected_inputs))
    rec={'case':name,'offset':offset,'repeat':repeat,'max_abs_error':float(err.max()),'coordinate':list(map(int,np.unravel_index(err.argmax(),err.shape))),'finite':bool(np.isfinite(got).all()),'numerics':bool(ok),'guards':bool(guards),'input_bytes_and_guards_unchanged':bool(input_unchanged)};records.append(rec);(out/'numerical_results.json').write_text(json.dumps(records,indent=2));print(rec,flush=True)
    if not(ok and guards and input_unchanged):np.save(out/'failure_got.npy',got);np.save(out/'failure_ref.npy',ref);raise AssertionError(rec)
-import ctypes
 cuda=ctypes.CDLL('libcuda.so.1');resources={}
 for key,attribute in [('max_threads',0),('static_shared_bytes',1),('local_bytes',3),('registers',4)]:
  value=ctypes.c_int();status=cuda.cuFuncGetAttribute(ctypes.byref(value),attribute,ctypes.c_void_p(k.function));assert status==0;resources[key]=value.value

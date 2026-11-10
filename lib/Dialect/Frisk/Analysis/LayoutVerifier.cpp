@@ -123,6 +123,12 @@ LogicalResult verifySolvedLayoutGraph(const LayoutConstraintGraph &graph,
     }
     return failure();
   }
+  auto execution = target.verifyExecutionSupport(
+      graph, CandidateAssignment{solution.assignments});
+  if (execution.status != ProofStatus::Proven)
+    return emitError(loc) << "execution-domain: "
+        << (execution.status == ProofStatus::Unknown ? "unknown proof: " : "")
+        << execution.reason;
   // Preserve specific missing-edge/hard-constraint diagnostics before checking
   // the richer placement, cost and clone certificate.
   return verifyLayoutConversionChoices(graph, solution, target, loc, expectedPolicy);

@@ -23,6 +23,23 @@ def case(kind='register',replica=False):
  values={i:dict(id=i,type='tensor<64x16xf32>',distributed=dict(topology=[n,32,4,1,1],shape=[64,16],logical=slots,first=[slots.index(s) for s in range(1024)])) for i,n,slots in [(0,nr,src),(1,8,dst)]}
  return dict(name='frisk.convert_layout',operands=[0],results=[1],redistribution=p),values
 
+class WarpSectionTests(unittest.TestCase):
+ def test_affine_warp_section_uses_immutable_same_warp_replicas(self):
+  from access_plan import linear
+  from redistribution import affine_warp_sections
+  source=[2*(thread//32)+(thread&1) for thread in range(128)]
+  destinations=[2*(thread//32)+((thread>>1)&1) for thread in range(128)]
+  local_first=[thread%32 if source[thread]==slot else slot%2
+               for thread,slot in enumerate(destinations)]
+  with self.assertRaises(ValueError):linear(local_first)
+  plan=dict(source_registers=1,destination_registers=1,source_slots=source,
+            destinations=[dict(slot=slot) for slot in destinations])
+  (lanes,regs),=affine_warp_sections(plan)
+  self.assertEqual(tuple((thread>>1)&1 for thread in range(128)),lanes)
+  self.assertEqual((0,)*128,regs)
+  self.assertEqual(destinations,[source[32*(t//32)+lane] for t,lane in enumerate(lanes)])
+
+
 class Redistribution(unittest.TestCase):
  def test_full_owner_maps_and_instructions(self):
   for kind in ('identity','register','shuffle','dependent','shared'):
@@ -34,7 +51,7 @@ class Redistribution(unittest.TestCase):
      s=d['source'];j=((s['warp_group']*4+s['warp'])*32+s['lane'])*p['source_registers']+s['reg']
      self.assertEqual(values[0]['distributed']['logical'][j],values[1]['distributed']['logical'][i])
     e=backend.Emitter(dict(values=list(values.values())));e.reg[0]=['s'+str(i) for i in range(p['source_registers'])];e.scratch=0;e.convert(op);code='\n'.join(e.code)
-    self.assertEqual('shfl.sync.idx.b32' in code,p['mode']=='Shuffle')
+    self.assertEqual('shfl.sync.' in code,p['mode']=='Shuffle')
     self.assertEqual('st.shared.b32' in code,p['mode']=='Shared')
     self.assertEqual(code.count('bar.sync 0;'),2 if p['mode']=='Shared' else 0)
     if p['mode']=='Shuffle':self.assertFalse(any('@' in line for line in code.splitlines() if 'shfl.sync' in line))

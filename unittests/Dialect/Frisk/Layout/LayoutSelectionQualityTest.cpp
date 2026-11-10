@@ -234,6 +234,83 @@ TEST_F(SelectionQualityTest, OracleExactCapEdgesZeroLimitsAndUnknownProofs) {
   EXPECT_EQ(empty.status,"infeasible");EXPECT_TRUE(empty.exhausted);EXPECT_EQ(empty.evaluatedAssignments,0u);
 }
 
+TEST_F(SelectionQualityTest, OracleExecutionUnknownCannotBecomeFreeOrInfeasible) {
+  struct ExecutionTarget : ZeroTarget {
+    unsigned mode = 0;
+    LayoutProof verifyExecutionSupport(const LayoutConstraintGraph &,
+                                      const CandidateAssignment &a) const override {
+      auto value = cast<IntegerAttr>(a.values.lookup(0)).getInt();
+      if (mode == 1 || value == 1) return {mode == 2 ? ProofStatus::Unknown : ProofStatus::Disproven, {}, "declared backend domain"};
+      return {ProofStatus::Proven, {}, "supported"};
+    }
+  } target;
+  Builder b(&context); LayoutConstraintGraph graph;
+  auto id = graph.addVariable(LayoutKind::Distributed, RankedTensorType::get({1}, b.getF32Type()), "x");
+  graph.getVariable(id).candidates = {{b.getI64IntegerAttr(1)}, {b.getI64IntegerAttr(2)}};
+  auto proof = freezeRelationProofs(graph);
+  auto supported = enumerateOracle(graph, proof, target);
+  EXPECT_EQ(supported.status, "complete"); EXPECT_EQ(supported.rejected, 1u);
+  EXPECT_EQ(supported.evaluatedAssignments, 1u); ASSERT_TRUE(supported.best);
+  EXPECT_EQ(supported.best->assignments.lookup(id), b.getI64IntegerAttr(2));
+  target.mode = 1;
+  auto empty = enumerateOracle(graph, proof, target);
+  EXPECT_EQ(empty.status, "infeasible"); EXPECT_FALSE(empty.best);
+  EXPECT_EQ(empty.evaluatedAssignments, 0u);
+  target.mode = 2;
+  auto unknown = enumerateOracle(graph, proof, target);
+  EXPECT_EQ(unknown.status, "unsupported"); EXPECT_EQ(unknown.unknownAssignments, 1u);
+  EXPECT_EQ(unknown.evaluatedAssignments, 1u); EXPECT_TRUE(unknown.best);
+  EXPECT_FALSE(unknown.fatal);
+}
+
+TEST_F(SelectionQualityTest, CompleteDirectScoresRequireProvenExecutionDomain) {
+  struct ExecutionTarget : ZeroTarget {
+    mutable unsigned checks = 0;
+    ProofStatus proof = ProofStatus::Proven;
+    bool needsCompleteAssignmentValidation(const LayoutConstraintGraph &) const override { return true; }
+    LayoutProof verifyExecutionSupport(const LayoutConstraintGraph &,
+                                      const CandidateAssignment &) const override {
+      ++checks; return {proof, {}, "declared complete execution domain"};
+    }
+  } target;
+  Builder b(&context); LayoutConstraintGraph graph;
+  auto id = graph.addVariable(LayoutKind::Distributed, RankedTensorType::get({1}, b.getF32Type()), "x");
+  graph.getVariable(id).candidates = {{b.getI64IntegerAttr(1)}};
+  CandidateAssignment complete; complete.values[id] = b.getI64IntegerAttr(1);
+  for (auto proof : {ProofStatus::Disproven, ProofStatus::Unknown}) {
+    target.proof = proof;
+    auto before = target.evaluations;
+    EXPECT_TRUE(failed(scoreAssignment(graph, complete, target, {})));
+    EXPECT_EQ(target.evaluations, before); // Never obtain a free or priced invalid score.
+  }
+  target.proof = ProofStatus::Proven;
+  EXPECT_TRUE(succeeded(scoreAssignment(graph, complete, target, {})));
+  EXPECT_EQ(target.checks, 3u);
+  auto checks = target.checks;
+  CandidateAssignment partial;
+  EXPECT_TRUE(succeeded(scoreExperimentAssignment(graph, partial, target, {})));
+  EXPECT_EQ(target.checks, checks); // Partial scoring is not a complete certificate.
+}
+
+TEST_F(SelectionQualityTest, EmptyInformedLocalScopeCannotBecomeFullObjective) {
+  Builder b(&context); LayoutConstraintGraph graph; ZeroTarget target;
+  auto id = graph.addVariable(LayoutKind::Distributed, RankedTensorType::get({1}, b.getF32Type()), "x");
+  graph.getVariable(id).candidates = {{b.getI64IntegerAttr(1)}};
+  ASSERT_TRUE(succeeded(graph.finalize(b.getUnknownLoc())));
+  CandidateAssignment assignment; assignment.values[id] = b.getI64IntegerAttr(1);
+  ExperimentPolicy policy; policy.conversion = ConversionPolicy::Independent;
+  policy.scope.fullGraph = false; policy.scope.informedLocal = true;
+  EXPECT_NE(experimentPolicyUnsupportedReason(graph, policy).find("empty"), std::string::npos);
+  EXPECT_TRUE(failed(scoreExperimentAssignment(graph, assignment, target, policy)));
+  EXPECT_EQ(target.evaluations, 0u);
+  policy.scope.informedLocal = false; // Preserve the legacy empty restricted objective.
+  EXPECT_TRUE(experimentPolicyUnsupportedReason(graph, policy).empty());
+  policy.scope.informedLocal = true; policy.scope.producerInstructions = {0};
+  // Geometry-only local scopes remain accepted by this specific preflight;
+  // their ordinary contract/index checks still run at the scoring entry point.
+  EXPECT_TRUE(experimentPolicyUnsupportedReason(graph, policy).empty());
+}
+
 TEST_F(SelectionQualityTest, OracleRetainsEveryNineFieldTiedGeometry) {
   Builder b(&context);LayoutConstraintGraph graph;ZeroTarget target;
   auto id=graph.addVariable(LayoutKind::Instruction,RankedTensorType::get({1},b.getF32Type()),"geometry");

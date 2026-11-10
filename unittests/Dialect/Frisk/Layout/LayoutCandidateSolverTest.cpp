@@ -880,3 +880,271 @@ TEST_F(JointAblationSolver, SaturatedGlobalTieKeepsStableProducerTuple) {
  EXPECT_EQ(result->assignments.lookup(0),builder.getStringAttr("b"));EXPECT_TRUE(result->components[0].refinementGlobalFallback);
 }
 }
+
+namespace {
+using SeededSolverTest = LayoutCandidateSolverTest;
+
+TEST_F(SeededSolverTest, CommonPreferenceCrossesHardEqualityBarrier) {
+  for (auto name : {"x", "y", "z"}) variable(name);
+  same(0, 1); same(1, 2);
+  SolverOptions baseline{1, 1, 65536};
+  auto plainGraph = graph;
+  auto plain = solveLayoutGraph(plainGraph, target, baseline);
+  ASSERT_TRUE(succeeded(plain));
+  // Both legal common layouts tie on every partial bound. Width one misses b;
+  // no one-variable refinement can cross the equality constraints.
+  EXPECT_EQ(plain->cost.cost.instructionPathAndWork, 3u);
+  ASSERT_TRUE(succeeded(graph.finalize(loc)));
+  auto seededOptions = baseline; seededOptions.seedBeamSolution = true;
+  SharedSearchBudget budget; seededOptions.sharedBudget = &budget;
+  LayoutTrace trace({"unused.json"});
+  auto result = solveLayoutGraph(graph, target, seededOptions, nullptr, nullptr, &trace);
+  ASSERT_TRUE(succeeded(result));
+  EXPECT_EQ(result->cost.cost.instructionPathAndWork, 0u);
+  for (auto [id, value] : result->assignments) EXPECT_EQ(value, builder.getStringAttr("b"));
+  const auto &stats = result->components.front();
+  EXPECT_EQ(stats.seedWitnesses, 2u); EXPECT_TRUE(stats.seedSelected);
+  EXPECT_EQ(stats.seedScores, 2u); EXPECT_GT(stats.seedProbes, 0u);
+  EXPECT_LE(budget.used, 65536u); EXPECT_LE(budget.refinementUsed, 256u);
+  EXPECT_EQ(budget.used, budget.relationshipProbes + budget.completeScores + budget.refinementProbes);
+  EXPECT_EQ(stats.expanded, stats.mrvProbes + stats.refinementProbes + stats.seedProbes + stats.seedScores);
+  auto json = llvm::json::parse(trace.serialize()); ASSERT_TRUE(bool(json));
+  bool summary = false;
+  for (auto &v : *json->getAsObject()->getArray("events")) {
+    auto *e = v.getAsObject();
+    if (e->getString("event") == "search-budget-summary") {
+      summary = true;
+      EXPECT_EQ(e->getInteger("used"), budget.used);
+      EXPECT_EQ(e->getBoolean("strictTotalBudget"), true);
+    }
+  }
+  EXPECT_TRUE(summary);
+}
+
+TEST_F(SeededSolverTest, BudgetCutoffRetainsCompleteWitnessWithoutExtraQuota) {
+  for (unsigned i = 0; i < 32; ++i) variable("v" + std::to_string(i));
+  for (unsigned i = 1; i < 32; ++i) same(0, i);
+  ASSERT_TRUE(succeeded(graph.finalize(loc)));
+  SolverOptions options{1, 1, 1024}; options.seedBeamSolution = true;
+  options.refineBeamSolution = false;
+  SharedSearchBudget budget; budget.limit = budget.stageLimit = 1024;
+  options.sharedBudget = &budget;
+  auto result = solveLayoutGraph(graph, target, options);
+  ASSERT_TRUE(succeeded(result));
+  EXPECT_EQ(result->cost.cost.instructionPathAndWork, 0u);
+  EXPECT_EQ(budget.used, 1024u);
+  EXPECT_TRUE(result->components.front().beamBudgetFallback);
+  EXPECT_FALSE(result->components.front().exhaustive);
+  EXPECT_EQ(budget.used, budget.relationshipProbes + budget.completeScores + budget.refinementProbes);
+  EXPECT_TRUE(succeeded(verifySolvedLayoutGraph(graph, *result, target, loc)));
+}
+
+TEST_F(SeededSolverTest, OwnedStrictBudgetAndSeedCostFailureRemainFailClosed) {
+  for (auto name : {"x", "y", "z"}) variable(name);
+  same(0, 1); same(1, 2);
+  auto copy = graph; SolverOptions options{1, 1, 65536}; options.seedBeamSolution = true;
+  LayoutTrace trace({"unused.json"});
+  auto good = solveLayoutGraph(copy, target, options, nullptr, nullptr, &trace);
+  ASSERT_TRUE(succeeded(good));
+  auto json = llvm::json::parse(trace.serialize()); ASSERT_TRUE(bool(json));
+  bool owned = false;
+  for (auto &v : *json->getAsObject()->getArray("events")) {
+    auto *e = v.getAsObject();
+    if (e->getString("event") == "search-budget-summary") owned = e->getBoolean("ownedSharedBudget").value_or(false);
+  }
+  EXPECT_TRUE(owned);
+  target.failCost = true; LayoutSolveFailure why;
+  ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
+  auto bad = solveLayoutGraph(graph, target, options, &why);
+  EXPECT_TRUE(failed(bad)); EXPECT_EQ(why.kind, LayoutSolveFailureKind::CostFailure);
+}
+
+TEST_F(SeededSolverTest, ExactAndLocalScopesDoNotAcquireFutureAwareSeeds) {
+  variable("producer"); variable("consumer"); pair(0, 1, 15, true);
+  ASSERT_TRUE(succeeded(graph.finalize(loc)));
+  SolverOptions options; options.seedBeamSolution = true;
+  auto copy = graph; auto exact = solveLayoutGraph(copy, target, options);
+  ASSERT_TRUE(succeeded(exact)); EXPECT_EQ(exact->components.front().seedProbes, 0u);
+  options.exactCombinationLimit = 1; options.beamWidth = 1;
+  options.policy.scope.fullGraph = false; options.policy.scope.producers = {0};
+  ScopedTarget scoped;
+  auto local = solveLayoutGraph(graph, scoped, options);
+  ASSERT_TRUE(succeeded(local)); EXPECT_EQ(local->components.front().seedProbes, 0u);
+}
+} // namespace
+
+namespace {
+TEST_F(SeededSolverTest, ConsumerDependentCostRequiresCompleteMergedAssignment) {
+  class CompleteTarget : public RankedTarget {
+  public:
+    bool needsCompleteAssignmentCost() const override { return true; }
+    FailureOr<CostEstimate> evaluateExecutionCost(const LayoutConstraintGraph &g,
+        const CandidateAssignment &a, const ExperimentPolicy &,
+        LayoutCostObserver *observer) const override {
+      if (a.values.size() != g.getVariables().size()) return failure();
+      auto raw = RankedTarget::evaluate(a); if (failed(raw)) return failure();
+      CostEstimate cost{*raw, false};
+      if (observer) observer->recordCost("execution-demand", 0, cost);
+      return cost;
+    }
+    FailureOr<CostEstimate> evaluate(const LayoutConstraintGraph &g,
+                                   const CandidateAssignment &a) const override {
+      if (a.values.size() != g.getVariables().size()) return failure();
+      return CostEstimate{*RankedTarget::evaluate(a), false};
+    }
+  } complete;
+  // No hard edge connects these variables; nonseparable consumers still make
+  // pricing independent components unsound. Capability merges only new models.
+  variable("x"); variable("y");
+  SolverOptions options; options.maxExpandedStates = 64;
+  LayoutTrace trace({"unused.json"});
+  auto result = solveLayoutGraph(graph, complete, options, nullptr, nullptr, &trace);
+  ASSERT_TRUE(succeeded(result)); EXPECT_EQ(result->components.size(), 1u);
+  EXPECT_EQ(result->cost.cost.instructionPathAndWork, 0u);
+  EXPECT_EQ(result->components.front().seedProbes, 0u);
+  auto json = llvm::json::parse(trace.serialize()); ASSERT_TRUE(bool(json));
+  bool charged = false;
+  for (auto &v : *json->getAsObject()->getArray("events")) {
+    auto *e = v.getAsObject();
+    if (e->getString("event") != "search-budget-summary") continue;
+    charged = true; EXPECT_EQ(e->getBoolean("ownedSharedBudget"), true);
+    EXPECT_EQ(e->getInteger("completeScores"), 4);
+    EXPECT_LE(*e->getInteger("used"), 64);
+  }
+  EXPECT_TRUE(charged);
+}
+
+TEST_F(SeededSolverTest, ExistingSeedCannotHideLaterBeamCostFailure) {
+  variable("x"); variable("y"); pair(0, 1, 15, true);
+  NeighborhoodTarget costs; costs.failingAssignment = 1;
+  SolverOptions options{1, 1, 65536}; options.seedBeamSolution = true;
+  ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
+  LayoutSolveFailure why;
+  auto result = solveLayoutGraph(graph, costs, options, &why);
+  EXPECT_TRUE(failed(result)); EXPECT_EQ(why.kind, LayoutSolveFailureKind::CostFailure);
+}
+} // namespace
+
+namespace {
+TEST_F(SeededSolverTest, CompleteCostTargetRetainsScoredBeamWitnessWithoutSeed) {
+  class CompleteTarget : public RankedTarget {
+  public:
+    bool needsCompleteAssignmentCost() const override { return true; }
+    FailureOr<CostEstimate> evaluateExecutionCost(const LayoutConstraintGraph &g,
+        const CandidateAssignment &a, const ExperimentPolicy &,
+        LayoutCostObserver *observer) const override {
+      if (a.values.size() != g.getVariables().size()) return failure();
+      auto raw = RankedTarget::evaluate(a); if (failed(raw)) return failure();
+      CostEstimate cost{*raw, false};
+      if (observer) observer->recordCost("execution-demand", 0, cost);
+      return cost;
+    }
+  } complete;
+  variable("x"); variable("y");
+  SolverOptions options{1, 2, 8};
+  ASSERT_FALSE(options.seedBeamSolution);
+  auto result = solveLayoutGraph(graph, complete, options);
+  ASSERT_TRUE(succeeded(result)); EXPECT_EQ(result->components.size(), 1u);
+  EXPECT_EQ(result->components.front().seedWitnesses, 0u);
+  EXPECT_TRUE(result->components.front().beamBudgetFallback);
+  EXPECT_FALSE(result->components.front().exhaustive);
+  EXPECT_EQ(result->cost.cost.instructionPathAndWork, 1u);
+  EXPECT_TRUE(succeeded(verifySolvedLayoutGraph(graph, *result, complete, loc)));
+}
+} // namespace
+
+namespace {
+TEST_F(SeededSolverTest, SeededWholeGraphCostAndQuotaIncludeIndependentHardComponents) {
+  for (unsigned i = 0; i < 31; ++i) variable("v" + std::to_string(i));
+  SolverOptions options{1, 1, 512}; options.seedBeamSolution = true;
+  options.refineBeamSolution = false;
+  LayoutTrace trace({"unused.json"});
+  auto result = solveLayoutGraph(graph, target, options, nullptr, nullptr, &trace);
+  ASSERT_TRUE(succeeded(result));
+  EXPECT_EQ(result->components.size(), 1u);
+  EXPECT_EQ(result->components.front().seedWitnesses, 2u);
+  EXPECT_EQ(result->components.front().seedScores, 2u);
+  EXPECT_EQ(result->assignments.size(), graph.getVariables().size());
+  // The seed's recorded cost is the whole objective, so retaining it cannot
+  // regress after independently connected hard components are merged.
+  EXPECT_FALSE(result->components.front().seedStartCost.cost < result->cost.cost);
+  uint64_t seedWork = 0;
+  for (const auto &c : result->components) seedWork += c.seedProbes + c.seedScores;
+  EXPECT_LE(seedWork, 512u / 8); EXPECT_GT(seedWork, 0u);
+  auto json = llvm::json::parse(trace.serialize()); ASSERT_TRUE(bool(json));
+  bool summary = false;
+  for (auto &v : *json->getAsObject()->getArray("events")) {
+    auto *e = v.getAsObject();
+    if (e->getString("event") != "search-budget-summary") continue;
+    summary = true; EXPECT_EQ(e->getInteger("seedWorkLimit"), 64);
+    EXPECT_EQ(e->getInteger("seedWorkUsed"), seedWork);
+    EXPECT_LE(*e->getInteger("used"), 512);
+  }
+  EXPECT_TRUE(summary);
+}
+} // namespace
+
+namespace {
+TEST_F(SeededSolverTest, UnknownExecutionSupportDoesNotBecomeOptimalityOrEmptiness) {
+  class ExecutionTarget : public RankedTarget {
+  public:
+    bool allUnknown = false;
+    LayoutProof verifyExecutionSupport(const LayoutConstraintGraph &,
+                                      const CandidateAssignment &a) const override {
+      if (a.values.empty()) return {ProofStatus::Proven, {}, "no known conflict"};
+      if (allUnknown || cast<StringAttr>(a.values.lookup(0)).getValue() == "b")
+        return {ProofStatus::Unknown, {}, "unknown execution schema"};
+      return {ProofStatus::Proven, {}, "supported"};
+    }
+  } execution;
+  variable("x"); auto copy = graph;
+  auto known = solveLayoutGraph(copy, execution);
+  ASSERT_TRUE(succeeded(known)); EXPECT_EQ(known->assignments.lookup(0), builder.getStringAttr("a"));
+  EXPECT_FALSE(known->components.front().exhaustive);
+  execution.allUnknown = true; LayoutSolveFailure why;
+  ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
+  auto unknown = solveLayoutGraph(graph, execution, {}, &why);
+  EXPECT_TRUE(failed(unknown)); EXPECT_EQ(why.kind, LayoutSolveFailureKind::Unsupported);
+}
+
+TEST_F(SeededSolverTest, FinalCertificateRequiresProvenExecutionDomain) {
+  class ExecutionTarget : public RankedTarget {
+  public:
+    ProofStatus proof = ProofStatus::Proven;
+    LayoutProof verifyExecutionSupport(const LayoutConstraintGraph &,
+                                      const CandidateAssignment &) const override {
+      return {proof, {}, "explicit backend contract"};
+    }
+  } execution;
+  variable("x"); auto result = solveLayoutGraph(graph, execution);
+  ASSERT_TRUE(succeeded(result)); EXPECT_TRUE(succeeded(verifySolvedLayoutGraph(graph, *result, execution, loc)));
+  ScopedDiagnosticHandler quiet(&context, [](Diagnostic &) { return success(); });
+  execution.proof = ProofStatus::Disproven;
+  EXPECT_TRUE(failed(verifySolvedLayoutGraph(graph, *result, execution, loc)));
+  execution.proof = ProofStatus::Unknown;
+  EXPECT_TRUE(failed(verifySolvedLayoutGraph(graph, *result, execution, loc)));
+}
+} // namespace
+
+namespace {
+TEST_F(SeededSolverTest, CompleteValidationMergesComponentsWithoutChangingCostModel) {
+  class ExecutionTarget : public RankedTarget {
+  public:
+    bool needsCompleteAssignmentValidation(const LayoutConstraintGraph &) const override { return true; }
+    LayoutProof verifyExecutionSupport(const LayoutConstraintGraph &g,
+                                      const CandidateAssignment &a) const override {
+      if (a.values.size() != g.getVariables().size()) return {ProofStatus::Proven, {}, "no known conflict"};
+      bool same = a.values.lookup(0) == a.values.lookup(1);
+      return {same ? ProofStatus::Disproven : ProofStatus::Proven, {}, "cross-component execution boundary"};
+    }
+  } execution;
+  EXPECT_FALSE(execution.needsCompleteAssignmentCost());
+  variable("x"); variable("y");
+  SolverOptions options; options.maxExpandedStates = 64;
+  auto result = solveLayoutGraph(graph, execution, options);
+  ASSERT_TRUE(succeeded(result)); EXPECT_EQ(result->components.size(), 1u);
+  EXPECT_NE(result->assignments.lookup(0), result->assignments.lookup(1));
+  EXPECT_EQ(result->cost.cost.instructionPathAndWork, 1u);
+  EXPECT_TRUE(succeeded(verifySolvedLayoutGraph(graph, *result, execution, loc)));
+}
+} // namespace

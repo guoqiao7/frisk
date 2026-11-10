@@ -26,9 +26,9 @@ evaluateStaticLayoutCost(const LayoutConstraintGraph &graph,
                          const CandidateAssignment &assignment,
                          LayoutCostObserver *observer = nullptr);
 
-/// Uses bounded physical-owner proofs to classify register, shuffle, or shared
-/// exchange. cta-staging-upper-bound-v1 is the nonzero fallback when the proof
-/// budget or supported topology is exceeded. This is neither hardware cycles
+/// Uses symbolic GF(2) source-image containment to classify register, shuffle,
+/// or shared exchange. cta-staging-upper-bound-v1 is the nonzero fallback when
+/// the algebra representation or supported topology is exceeded. This is neither hardware cycles
 /// nor the scratch allocation of a lowering plan.
 FailureOr<CostEstimate> evaluateLayoutConversionCost(
     const LayoutVar &sourceVar, Attribute source, Attribute target,

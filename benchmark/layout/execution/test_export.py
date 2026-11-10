@@ -30,5 +30,10 @@ class ExportTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as t:
    p=Path(t);src=p/'unsupported.mlir';out=p/'execution.json';out.write_text('preserve')
    src.write_text('module { func.func @unsupported(%x: f32) -> f32 { %y = math.sqrt %x : f32 return %y : f32 } }')
-   q=self.export(src,out);self.assertNotEqual(q.returncode,0);self.assertIn('unsupported execution operation',q.stderr);self.assertEqual(out.read_text(),'preserve')
+   q=self.export(src,out);self.assertNotEqual(q.returncode,0);self.assertIn('unsupported execution operation',q.stderr);self.assertIn('stage=export-preflight code=unsupported-operation',q.stderr);self.assertEqual(out.read_text(),'preserve')
+ def test_output_create_failure_is_typed_without_partial_file(self):
+  with tempfile.TemporaryDirectory() as t:
+   p=Path(t);selected=p/'selected.mlir';out=p/'missing'/'execution.json'
+   q=subprocess.run([str(OPT),str(ROOT/'test/Transforms/attention-layout-fixed-abi.mlir'),'--frisk-layout-pipeline','-o',str(selected)],capture_output=True,text=True);self.assertEqual(q.returncode,0,q.stderr)
+   q=self.export(selected,out);self.assertNotEqual(q.returncode,0);self.assertIn('stage=export-publication code=output-create',q.stderr);self.assertFalse(out.exists())
 if __name__=='__main__':unittest.main()

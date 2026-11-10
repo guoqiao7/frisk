@@ -170,7 +170,7 @@ TEST(LayoutStatisticsTest, StandaloneCollectorIsPerInvocationAndSuccessClearsFai
     pm.addPass(createFriskInferLayoutsPass({}, false, &report));
     ASSERT_TRUE(succeeded(pm.run(*module)));
     EXPECT_EQ(report.attempts.size(), 1u);
-    EXPECT_EQ(report.toJSON().getString("cost_model_id"), "sm90-layout-lex9-legacy-v1");
+    EXPECT_EQ(report.toJSON().getString("cost_model_id"), "sm90-layout-lex9-legacy-v2");
     EXPECT_EQ(report.toJSON().getInteger("schema_version"), 1);
     EXPECT_TRUE(report.failureKind.empty());
   }
@@ -235,7 +235,7 @@ TEST(LayoutStatisticsTest, CallerOwnedTraceMetadataPrecedesOptionValidation) {
       EXPECT_EQ(report.failureKind, failureKind);
       EXPECT_FALSE(report.failureReason.empty());
       EXPECT_TRUE(report.attempts.empty());
-      EXPECT_EQ(report.toJSON().getString("cost_model_id"), "sm90-layout-lex9-legacy-v1");
+      EXPECT_EQ(report.toJSON().getString("cost_model_id"), "sm90-layout-lex9-legacy-v2");
       auto json = llvm::json::parse(trace.serialize());
       ASSERT_TRUE(bool(json));
       auto *object = json->getAsObject();
@@ -600,9 +600,9 @@ TEST(LayoutTraceIntegrationTest, MandatorySolverOptionsSurviveTruncationAndEarly
     EXPECT_TRUE(report.attempts.empty());
     auto file = llvm::MemoryBuffer::getFile(path);
     ASSERT_TRUE(bool(file));
-    EXPECT_EQ(report.costModelID, "sm90-layout-lex9-legacy-v1");
+    EXPECT_EQ(report.costModelID, "sm90-layout-lex9-legacy-v2");
     EXPECT_EQ(report.toJSON().getString("cost_model_id"), report.costModelID);
-    check((*file)->getBuffer(), "sm90-layout-lex9-legacy-v1");
+    check((*file)->getBuffer(), "sm90-layout-lex9-legacy-v2");
   }
   StatisticsTarget target;
   for (bool coordinator : {false, true}) {
@@ -654,7 +654,7 @@ TEST(LayoutTraceIntegrationTest, TransactionRollbackForInvalidOptionsAndWriteFai
       }
       EXPECT_TRUE(failed(pm.run(*module)));
       EXPECT_EQ(print(), before);
-      EXPECT_EQ(report.costModelID, "sm90-layout-lex9-legacy-v1");
+      EXPECT_EQ(report.costModelID, "sm90-layout-lex9-legacy-v2");
       EXPECT_EQ(report.failureKind, scenario ? "trace-options" : "trace-write");
       if (scenario) EXPECT_TRUE(report.attempts.empty());
       else {
@@ -680,7 +680,7 @@ TEST(LayoutTraceIntegrationTest, TraceOnOffAndRepeatedSemanticJSONAreIdentical) 
     PassManager pm(&context);
     buildFriskLayoutPipeline(pm, {}, {}, &report, {iteration ? path : ""});
     ASSERT_TRUE(succeeded(pm.run(*module)));
-    EXPECT_EQ(report.costModelID, "sm90-layout-lex9-legacy-v1");
+    EXPECT_EQ(report.costModelID, "sm90-layout-lex9-legacy-v2");
     std::string ir;
     llvm::raw_string_ostream(ir) << *module;
     report.timings.clear();
@@ -748,7 +748,7 @@ TEST(LayoutTraceIntegrationTest, StaticEarlyFailurePreservesModelAndOriginalIR) 
                                                &trace, nullptr, LayoutBoundaryFrequencyMode::StaticTripCount));
     EXPECT_TRUE(failed(pm.run(*module)));
     EXPECT_EQ(print(), before);
-    EXPECT_EQ(report.costModelID, "sm90-layout-lex9-static-trip-count-v1");
+    EXPECT_EQ(report.costModelID, "sm90-layout-lex9-static-trip-count-v2");
     EXPECT_TRUE(report.staticTripCountFrequency);
     if (!pipeline) {
       EXPECT_EQ(trace.getSummary().costModelID, report.costModelID);
