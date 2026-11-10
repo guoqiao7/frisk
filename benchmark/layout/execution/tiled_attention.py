@@ -25,7 +25,7 @@ _ALL_THREADS = (1 << THREADS) - 1
 _FRAGMENT_REQUEST = '_checked_attention_fragment_layout'
 
 
-def checked_geometry(spec, *, kv_width=TILE):
+def checked_geometry(spec, *, kv_width=TILE, tail_score_carrier=False):
     """Admit compact BHSD buffers and bind one exact query-tile/grid mapping."""
     if (type(spec) is not dict or set(spec) != {'B', 'H', 'N', 'D', 'q_block', 'kv_block'}
             or any(type(n) is not int or n <= 0 for n in spec.values())):
@@ -33,7 +33,12 @@ def checked_geometry(spec, *, kv_width=TILE):
     batch, heads, length, dim = (spec[k] for k in ('B', 'H', 'N', 'D'))
     if (dim, spec['q_block'], spec['kv_block']) != (64, TILE, TILE) or not TILE <= length <= 1025:
         raise ValueError('checked tiled Attention requires 64 <= N <= 1025, D64 and Q64/KV64 carriers')
-    if type(kv_width) is not int or kv_width not in (32, TILE, TILE * 2, TILE * 4) or length < kv_width:
+    if type(tail_score_carrier) is not bool:
+        raise ValueError('Attention tail score carrier flag must be boolean')
+    if tail_score_carrier and (kv_width != 2 * TILE or not TILE < length < 2 * TILE):
+        raise ValueError('tail score carrier requires physical KV128 and 65 to 127 logical keys')
+    if (type(kv_width) is not int or kv_width not in (32, TILE, TILE * 2, TILE * 4)
+            or (length < kv_width and not tail_score_carrier)):
         raise ValueError('execution KV width requires a complete checked KV64 or KV128 group')
     if kv_width == 32 and length % TILE:
         raise ValueError('compact KV32 requires complete KV64 pairs')
@@ -726,7 +731,7 @@ def emit_tiled_attention(spec, *, tile_packet, copy_owner_policy='gf2', kv_width
                          simplify_tail_copy=False, retain_all_scores=False, factored_copy=False,
                          bulk_value_publish=False, retain_residual_scores=False,
                          streaming_bulk_values=False, shared_swizzle=128,
-                         fragment_layout=NATIVE_FRAGMENT, k_stage_policy=None):
+                         fragment_layout=NATIVE_FRAGMENT, k_stage_policy=None, tail_score_carrier=False):
     fragment = checked_fragment_layout(fragment_layout)
     if type(tile_packet) is not dict or _FRAGMENT_REQUEST in tile_packet:
         raise ValueError('checked Attention requires the original execution replay packet')
@@ -734,12 +739,18 @@ def emit_tiled_attention(spec, *, tile_packet, copy_owner_policy='gf2', kv_width
         tile_packet = dict(tile_packet, **{_FRAGMENT_REQUEST: fragment.name})
     if type(kv_width) is not int or any(type(flag) is not bool for flag in
             (retain_all_scores, retain_tail_scores, vector_store, narrow_tail, simplify_tail_copy,
-             factored_copy, bulk_value_publish, retain_residual_scores, streaming_bulk_values)):
+             factored_copy, bulk_value_publish, retain_residual_scores, streaming_bulk_values,
+             tail_score_carrier)):
         raise ValueError('Attention requires an integer KV width and boolean strategy flags')
     if type(shared_swizzle) is not int or shared_swizzle not in (64, 128):
         raise ValueError('checked Attention Shared swizzle must be 64 or 128')
     if shared_swizzle == 64 and (kv_width != TILE or retain_all_scores):
         raise ValueError('SW64 requires the checked streaming KV64 schedule')
+    if tail_score_carrier:
+        if (not retain_all_scores or shared_swizzle != 128 or fragment.name != NATIVE_FRAGMENT
+                or k_stage_policy is not None):
+            raise ValueError('tail score carrier requires native SW128 and full score retention')
+        checked_geometry(spec, kv_width=kv_width, tail_score_carrier=True)
     if k_stage_policy in ('boundary-control', 'boundary-reuse'):
         from attention_k_boundary_reuse import emit_boundary_k_attention
 
@@ -764,11 +775,12 @@ def emit_tiled_attention(spec, *, tile_packet, copy_owner_policy='gf2', kv_width
 
         if retain_tail_scores or narrow_tail or simplify_tail_copy or retain_residual_scores or streaming_bulk_values:
             raise ValueError('full score retention has no tail-copy strategy')
-        if kv_width != spec['N']:
+        if not tail_score_carrier and kv_width != spec['N']:
             raise ValueError('full score retention requires one complete native key tile')
         implementation = emit_single_score_bulk_attention if bulk_value_publish else emit_single_score_attention
         return implementation(spec, tile_packet=tile_packet, vector_store=vector_store,
-                              copy_owner_policy=copy_owner_policy, factored_copy=factored_copy)
+                              copy_owner_policy=copy_owner_policy, factored_copy=factored_copy,
+                              tail_score_carrier=tail_score_carrier)
     if bulk_value_publish:
         raise ValueError('bulk value publication requires a complete retained score tile')
     if streaming_bulk_values:

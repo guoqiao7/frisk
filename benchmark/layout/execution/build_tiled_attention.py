@@ -64,7 +64,8 @@ def build_native_image(triton, dest, case, spec, packet, **strategy):
 def compile_emitted_image(triton, dest, case, spec, ttgir, proof, *, emission_ns=0):
     from triton.backends.compiler import GPUTarget
 
-    geometry = checked_geometry(spec, kv_width=proof['execution_kv_width'])
+    geometry = checked_geometry(spec, kv_width=proof['execution_kv_width'],
+                                tail_score_carrier=proof.get('tail_score_carrier', False))
     if any(proof.get(key) != value for key, value in geometry.items()):
         raise ValueError('native image changed the checked Attention geometry')
     if proof['ttgir_sha256'] != sha256(ttgir.encode()).hexdigest():
