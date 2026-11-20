@@ -362,7 +362,9 @@ LayoutConstraintBuilder::lookup(Value value, LayoutKind kind) const {
 
 FailureOr<LayoutConstraintGraph>
 collectLayoutConstraints(Operation *root, LayoutTarget &target,
-    LayoutCollectionMode mode, LayoutStatisticsReport *statistics, LayoutTrace *trace) {
+                         LayoutCollectionMode mode,
+                         LayoutStatisticsReport *statistics, LayoutTrace *trace,
+                         const CertifiedInstructionDomains *certified) {
   if (trace && !trace->enabled()) trace = nullptr;
   auto collectionStart = LayoutClock::now();
   auto phaseStart = collectionStart;
@@ -450,9 +452,49 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
   if (failed(target.prepareInstructionCandidates(graph)))
     return failure();
 
+  // Seed joint local-optimum tuples before distributing candidates across
+  // SSA and region edges. Shared role variables take the intersection later
+  // through the ordinary instruction support constraints.
+  if (certified) {
+    for (auto &c : graph.getConstraints()) {
+      if (!c.instruction)
+        continue;
+      auto it = certified->find(c.instruction->source);
+      if (it == certified->end())
+        continue;
+      auto origin =
+          graph.addProvenance(std::nullopt, c.instruction->source,
+                              "certified-anchor", "isolated local optimum");
+      for (const auto &tuple : it->second) {
+        if (tuple.encodings.size() != c.vars.size())
+          return failure();
+        for (auto [id, encoding] : llvm::zip_equal(c.vars, tuple.encodings)) {
+          auto &candidates = graph.getVariable(id).candidates;
+          if (llvm::none_of(candidates,
+                            [&](const auto &v) { return v.value == encoding; }))
+            candidates.push_back({encoding, origin, graph.getVariable(id).id});
+        }
+      }
+    }
+  }
   if (failed(initializeStorageAliasCandidates(root, graph, target)))
     return failure();
 
+  // A fixed load pins the producer, not its consumers. At a fork, a layout
+  // delivered to one consumer can be delivered to its siblings as well.
+  // Propagating through the pinned variable itself would lose that candidate.
+  DenseMap<LayoutVarID, SmallVector<LayoutVarID>> fixedLoadUsers;
+  for (const auto &edge : graph.getConstraints()) {
+    if (edge.kind != ConstraintKind::Convertible || edge.existingConversion)
+      continue;
+    auto &src = graph.getVariable(edge.vars.front());
+    if (src.value && src.value.getDefiningOp<TileLoadOp>() &&
+        src.value.getDefiningOp()->hasAttr("frisk.fixed_access_layout")) {
+      auto &users = fixedLoadUsers[src.id];
+      if (!llvm::is_contained(users, edge.vars.back()))
+        users.push_back(edge.vars.back());
+    }
+  }
   auto projectCandidatesToFixedPoint = [&]() {
     bool addedCandidate;
     do {
@@ -515,6 +557,28 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
           }
         }
       }
+      for (const auto &entry : fixedLoadUsers) {
+        for (auto dstID : entry.second) {
+          auto &dst = graph.getVariable(dstID);
+          if (dst.instructionRole || dst.reductionResult ||
+              llvm::any_of(graph.getConstraints(), [&](const auto &c) {
+                return c.kind == ConstraintKind::RequireEncoding &&
+                       llvm::is_contained(c.vars, dstID);
+              }))
+            continue;
+          for (auto other : entry.second) {
+            if (other == dstID) continue;
+            for (auto proposal : graph.getVariable(other).candidates) {
+              if (llvm::none_of(dst.candidates, [&](const auto &x) {
+                    return x.value == proposal.value;
+                  }) && succeeded(target.verifyCandidate(dst, proposal.value, root->getLoc()))) {
+                dst.candidates.push_back(proposal);
+                addedCandidate = true;
+              }
+            }
+          }
+        }
+      }
     } while (addedCandidate);
   };
 
@@ -548,6 +612,7 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
     // receives transformed alternatives, not another independent default set.
     projectCandidatesToFixedPoint();
   }
+  seedFixedReductionStoreLifts(graph, target, root->getLoc());
   projectCandidatesToFixedPoint();
 
   for (LayoutVar &var : graph.getVariables()) {
@@ -566,7 +631,8 @@ collectLayoutConstraints(Operation *root, LayoutTarget &target,
       return failure();
     }
   }
-  if (failed(prepareInstructionTuples(graph, target, root->getLoc(), trace)))
+  if (failed(prepareInstructionTuples(graph, target, root->getLoc(), trace,
+                                      certified)))
     return failure();
   if (failed(prepareReductionPairs(graph, target, root->getLoc())))
     return failure();

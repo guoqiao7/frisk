@@ -1,3 +1,4 @@
+#include "Dialect/Frisk/Analysis/ExecutionGroups.h"
 #include "Dialect/Frisk/Analysis/MmaLayoutConstraints.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
 
@@ -16,11 +17,11 @@ LogicalResult collectMmaLayoutConstraints(Operation *root,
       threads = count.getInt();
     }
     if (auto parallel = mma->getParentOfType<ParallelOp>()) {
-      if (mma->hasAttr("frisk.execution_threads") && threads != parallel.getThreads()) {
+      if (mma->hasAttr("frisk.execution_threads") && threads != executionGroupWidth(mma, parallel)) {
         mma.emitError("sm90-mma-thread-group: execution_threads conflicts with enclosing parallel");
         return WalkResult::interrupt();
       }
-      threads = parallel.getThreads();
+      threads = executionGroupWidth(mma, parallel);
     }
     if (threads != 128 && threads != 256 && threads != 512 && threads != 1024) {
       mma.emitError("sm90-mma-thread-group: expected 128, 256, 512 or 1024 threads");

@@ -4,6 +4,9 @@ config.llvm_tools_dir = lit_config.substitute("@LLVM_TOOLS_DIR@")
 config.frisk_obj_root = "@FRISK_BINARY_DIR@"
 config.frisk_tools_dir = "@FRISK_BINARY_DIR@/bin"
 
+if @FRISK_TEST_HAS_Z3@:
+    config.available_features.add("frisk-z3")
+
 import lit.llvm
 
 lit.llvm.initialize(lit_config, config)

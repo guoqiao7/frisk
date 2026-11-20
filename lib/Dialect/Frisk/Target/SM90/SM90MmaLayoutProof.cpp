@@ -52,7 +52,7 @@ FailureOr<SM90MmaGeometry> mlir::frisk::getSM90MmaGeometry(MmaOp op, int64_t thr
 // Semantic instruction geometries, independent of the generated proof domain.
 // Explicit bindings must still reach the fragment proof when replication puts
 // an otherwise valid geometry beyond its hardware enumeration budget.
-static FailureOr<SmallVector<SM90MmaGeometry>> getSM90MmaSemanticGeometries(
+static FailureOr<SmallVector<SM90MmaGeometry>> getSM90MmaBaseGeometries(
     MmaOp op, int64_t threads) {
   if (op.getPolicy() != attr::GemmWarpPolicy::Auto) {
     auto legacy = getSM90MmaGeometry(op, threads);
@@ -79,10 +79,44 @@ static FailureOr<SmallVector<SM90MmaGeometry>> getSM90MmaSemanticGeometries(
   return result;
 }
 
-FailureOr<SmallVector<SM90MmaGeometry>> mlir::frisk::getSM90MmaGeometries(
+static FailureOr<SmallVector<SM90MmaGeometry>> getSM90MmaSemanticGeometries(
     MmaOp op, int64_t threads) {
+  auto base = getSM90MmaBaseGeometries(op, threads);
+  if (failed(base)) return failure();
+  SmallVector<SM90MmaGeometry> result;
+  auto pin = op->getAttrOfType<StringAttr>("frisk.row_partition");
+  if (op->hasAttr("frisk.row_partition") &&
+      (!pin || (pin.getValue() != "contiguous" && pin.getValue() != "interleaved64")))
+    return failure();
+  for (auto g : *base) {
+    if (!pin || pin.getValue() == "contiguous") result.push_back(g);
+    if (g.gM == 2 && g.gN == 1 && g.mRepeat > 1 &&
+        (!pin || pin.getValue() == "interleaved64")) {
+      g.interleavedRows = true;
+      result.push_back(g);
+    }
+  }
+  if (result.empty()) return failure();
+  return result;
+}
+
+FailureOr<SmallVector<SM90MmaGeometry>> mlir::frisk::getSM90MmaGeometries(
+    MmaOp op, int64_t threads, bool exploreRowPartitions) {
   auto result = getSM90MmaSemanticGeometries(op,threads);
   if (failed(result)) return failure();
+  auto binding = op->getAttrOfType<MmaInstructionContractAttr>("frisk.mma_contract");
+  if (exploreRowPartitions && binding) {
+    auto fixed=getSM90MmaContractGeometry(op,threads,binding);
+    if (failed(fixed)) return failure();
+    llvm::erase_if(*result,[&](const auto &g) {
+      return g.gM!=fixed->gM || g.gN!=fixed->gN || g.interleavedRows!=fixed->interleavedRows;
+    });
+  } else if (!exploreRowPartitions && !op->hasAttr("frisk.row_partition") &&
+             !(binding && binding.getPayload().get("row_partition"))) {
+    // Keep ordinary generation independent of a fixed grid. The binding proof
+    // separately diagnoses legal RS geometries beyond the enumeration budget.
+    llvm::erase_if(*result, [](const auto &g) { return g.interleavedRows; });
+  }
   if (op.getPolicy() == attr::GemmWarpPolicy::Auto && isa<RankedTensorType>(op.getA().getType()))
     llvm::erase_if(*result,[](const SM90MmaGeometry &g) {
       // Keep the bounded generated domain unchanged, including RS replication.
@@ -95,7 +129,7 @@ FailureOr<SmallVector<SM90MmaGeometry>> mlir::frisk::getSM90MmaGeometries(
 DictionaryAttr mlir::frisk::encodeSM90MmaGeometry(MLIRContext *ctx,
                                                 const SM90MmaGeometry &g) {
   Builder b(ctx);
-  return b.getDictionaryAttr({
+  NamedAttrList geometry({
       b.getNamedAttr("kind", b.getStringAttr("sm90-mma-geometry")),
       b.getNamedAttr("version", b.getI64IntegerAttr(1)),
       b.getNamedAttr("shape", b.getDenseI64ArrayAttr({g.m,g.n,g.k})),
@@ -103,12 +137,14 @@ DictionaryAttr mlir::frisk::encodeSM90MmaGeometry(MLIRContext *ctx,
       b.getNamedAttr("grid", b.getDenseI64ArrayAttr({g.gM,g.gN})),
       b.getNamedAttr("atom", b.getDenseI64ArrayAttr({64,g.atomN,16})),
       b.getNamedAttr("repeats", b.getDenseI64ArrayAttr({g.mRepeat,g.nRepeat,g.kRepeat}))});
+  if (g.interleavedRows) geometry.set("row_partition", b.getStringAttr("interleaved64"));
+  return geometry.getDictionary(ctx);
 }
 
 FailureOr<SM90MmaGeometry> mlir::frisk::decodeSM90MmaGeometry(
     MmaOp op, int64_t threads, Attribute candidate) {
   auto dictionary = dyn_cast_or_null<DictionaryAttr>(candidate);
-  if (!dictionary || dictionary.size() != 7) return failure();
+  if (!dictionary || (dictionary.size() != 7 && dictionary.size() != 8)) return failure();
   auto legal = getSM90MmaSemanticGeometries(op,threads);
   if (failed(legal)) return failure();
   // Exact checked serialization validates every field, type and semantic
@@ -131,7 +167,8 @@ FailureOr<SM90MmaGeometry> mlir::frisk::getSM90MmaContractGeometry(
   for (const auto &g : *legal) {
     auto encoded = encodeSM90MmaGeometry(op.getContext(),g);
     if (p.get("grid") == encoded.get("grid") && p.get("atom") == encoded.get("atom") &&
-        p.get("repeats") == encoded.get("repeats")) return g;
+        p.get("repeats") == encoded.get("repeats") &&
+        p.get("row_partition") == encoded.get("row_partition")) return g;
   }
   return failure();
 }
@@ -143,7 +180,9 @@ std::array<int64_t,2> mlir::frisk::getSM90MmaFragmentCoordinate(
   int64_t slots = a ? 8 : g.atomN/2;
   int64_t inner = reg % slots, outer = reg / slots;
   int64_t repeat = a ? g.kRepeat : g.nRepeat;
-  int64_t row = group/g.gN*(g.m/g.gM) + outer/repeat*64 +
+  int64_t atomRow = g.interleavedRows ? (outer/repeat)*g.gM + group/g.gN
+                                      : (group/g.gN)*g.mRepeat + outer/repeat;
+  int64_t row = atomRow*64 +
                 warp*16 + lane/4 + (inner/2%2)*8;
   int64_t col = (a ? 0 : group%g.gN*(g.n/g.gN)) +
                 outer%repeat*(a ? 16 : g.atomN) +

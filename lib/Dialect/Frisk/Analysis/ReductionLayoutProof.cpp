@@ -1,4 +1,5 @@
 #include "Dialect/Frisk/Analysis/ReductionLayoutProof.h"
+#include "Dialect/Frisk/Analysis/LinearExecutionLayout.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/MathExtras.h"
 using namespace mlir;
@@ -85,6 +86,112 @@ FailureOr<DistributedEncodingAttr> mlir::frisk::projectReductionEncoding(
   ExecutionEnumeration output;
   if (enumerateExecutionLayout(result,dstType,output).status != ProofStatus::Proven) return failure();
   return result;
+}
+
+
+// Complete a rank-one quotient in the hardware domain of an existing source
+// candidate. All retained rows are copied, including XOR terms. Coordinates
+// whose quotient columns are dependent complement its independent columns;
+// unit rows at those coordinates form an independent basis for the lost axis.
+void mlir::frisk::enumerateReductionLifts(
+    DistributedEncodingAttr slice, DistributedEncodingAttr model,
+    RankedTensorType sourceType, RankedTensorType resultType, int64_t axis,
+    SmallVectorImpl<DistributedEncodingAttr> &out) {
+  if (!validTypes(sourceType, resultType, axis) || sourceType.getRank() != 2)
+    return;
+  LinearExecutionLayout parent, quotient;
+  if (analyzeLinearExecutionLayout(model, sourceType, parent).status != ProofStatus::Proven ||
+      analyzeLinearExecutionLayout(slice, resultType, quotient).status != ProofStatus::Proven ||
+      parent.hardwareBits != parent.logicalBits || parent.hardwareBits > 16 ||
+      model.getReplication().getInt() != 1 || parent.topology[4] != 1)
+    return;
+  for (unsigned h = 1; h < 5; ++h)
+    if (parent.topology[h] != quotient.topology[h]) return;
+  unsigned regs = parent.hardwareWidths[0], kept = quotient.hardwareWidths[0];
+  if (kept > regs) return;
+
+  // The existing source supplies the register vector width. Enumerate the two
+  // axis orders while retaining the order of register bits in the quotient.
+  unsigned vectorBits = 0, base = 0;
+  for (unsigned width : parent.logicalWidths) {
+    unsigned bits = 0;
+    while (bits < std::min(width, regs) &&
+           parent.rows[base + bits] == APInt::getOneBitSet(parent.hardwareBits, bits))
+      ++bits;
+    vectorBits = std::max(vectorBits, bits);
+    base += width;
+  }
+  const unsigned missing = regs - kept;
+  SmallVector<unsigned> freeHardware;
+  SmallVector<unsigned> echelon(quotient.logicalBits, 0);
+  bool keptMinor = true, reducedMinor = true;
+  for (unsigned h = 0; h < 5; ++h) {
+    bool sawPivot = false, sawFree = false;
+    for (unsigned bit = 0; bit < quotient.hardwareWidths[h]; ++bit) {
+      unsigned col = quotient.hardwareOffsets[h] + bit, value = 0;
+      for (unsigned r = 0; r < quotient.logicalBits; ++r)
+        if (quotient.rows[r][col]) value |= 1u << r;
+      while (value) {
+        unsigned pivot = llvm::countr_zero(value);
+        if (!echelon[pivot]) { echelon[pivot] = value; break; }
+        value ^= echelon[pivot];
+      }
+      if (value) {
+        if (sawFree) keptMinor = false;
+        sawPivot = true;
+      } else {
+        if (!h) return; // The natural projection has independent register columns.
+        if (sawPivot) reducedMinor = false;
+        sawFree = true;
+        freeHardware.push_back(col + missing);
+      }
+    }
+  }
+  if (missing + freeHardware.size() != parent.logicalWidths[axis]) return;
+  const bool ordered = keptMinor || reducedMinor;
+  Builder b(model.getContext());
+  auto modelMap = cast<BitLinearLayoutMapAttr>(model.getMap());
+  SmallVector<Attribute> names;
+  SmallVector<int64_t> widths;
+  constexpr StringLiteral carriers[] = {"register", "lane", "warp", "warp_group", "cta"};
+  for (unsigned h = 0; h < 5; ++h)
+    if (parent.hardwareWidths[h]) {
+      names.push_back(b.getStringAttr(carriers[h]));
+      widths.push_back(parent.hardwareWidths[h]);
+    }
+  for (bool reducedFirst : {false, true}) {
+    if (ordered && !(reducedFirst ? reducedMinor : keptMinor)) continue;
+    unsigned shift = reducedFirst ? missing : 0;
+    unsigned inner = reducedFirst ? std::min(vectorBits, missing) : 0;
+    SmallVector<unsigned> removed;
+    unsigned start = reducedFirst ? 0 : kept;
+    for (unsigned i = 0; i < inner; ++i) removed.push_back(start + i);
+    llvm::append_range(removed, freeHardware);
+    for (unsigned i = inner; i < missing; ++i) removed.push_back(start + i);
+    SmallVector<APInt> bits;
+    for (unsigned d = 0; d < 2; ++d) {
+      for (unsigned j = 0; j < parent.logicalWidths[d]; ++j) {
+        for (unsigned col = 0; col < parent.hardwareBits; ++col) {
+          bool set = false;
+          if (d == unsigned(axis)) set = col == removed[j];
+          else if (col >= regs) set = quotient.rows[j][col - missing];
+          else if (col >= shift && col < shift + kept)
+            set = quotient.rows[j][col - shift];
+          bits.emplace_back(1, set);
+        }
+      }
+    }
+    auto matrix = DenseIntElementsAttr::get(RankedTensorType::get(
+        {parent.logicalBits, parent.hardwareBits}, b.getI1Type()), bits);
+    auto map = BitLinearLayoutMapAttr::get(b.getContext(), b.getArrayAttr(names),
+        b.getDenseI64ArrayAttr(widths), modelMap.getOutputNames(),
+        modelMap.getOutputBitWidths(), matrix);
+    auto candidate = DistributedEncodingAttr::get(b.getContext(), map,
+        model.getTopology(), model.getReplication());
+    if (llvm::is_contained(out, candidate)) continue;
+    auto natural = projectReductionEncoding(candidate, sourceType, resultType, axis);
+    if (succeeded(natural) && *natural == slice) out.push_back(candidate);
+  }
 }
 
 ReductionLayoutProof mlir::frisk::buildReductionLayoutProof(DistributedEncodingAttr src,

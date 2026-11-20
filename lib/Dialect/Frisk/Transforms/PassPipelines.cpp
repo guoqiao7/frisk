@@ -57,8 +57,8 @@ public:
                                          LayoutStatisticsReport *statistics = nullptr,
                                          LayoutTraceOptions traceOptions = {}, StringRef profileFile = {},
                                          bool irDiagnostics = false, LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy,
-                                         StringRef costProfileFile = {})
-      : options(options), statsFile(statsFile.str()), statistics(statistics), traceOptions(std::move(traceOptions)), profileFile(profileFile.str()), irDiagnostics(irDiagnostics), mode(mode), costProfileFile(costProfileFile.str()) {}
+                                         StringRef costProfileFile = {}, bool vectorAccess = false)
+      : options(options), statsFile(statsFile.str()), statistics(statistics), traceOptions(std::move(traceOptions)), profileFile(profileFile.str()), irDiagnostics(irDiagnostics), mode(mode), costProfileFile(costProfileFile.str()), nativeVector(vectorAccess) {}
   LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy;
   SolverOptions options;
   std::string statsFile;
@@ -67,6 +67,7 @@ public:
   std::string profileFile;
   std::string costProfileFile;
   bool irDiagnostics = false;
+  bool nativeVector = false;
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<FriskDialect, arith::ArithDialect, func::FuncDialect,
                     memref::MemRefDialect, scf::SCFDialect>();
@@ -92,7 +93,12 @@ public:
       calibration = std::move(*loaded);
     }
     // Load once: all pipeline stages use this same immutable profile value.
-    auto target = calibration ? createSM90LayoutTarget(mode, *calibration) : createSM90LayoutTarget(mode);
+    if (calibration && nativeVector) {
+      getOperation().emitError("native-vector-access needs an uncalibrated SM90 target");
+      signalPassFailure();
+      return;
+    }
+    auto target = calibration ? createSM90LayoutTarget(mode, *calibration) : createSM90LayoutTarget(mode, nativeVector);
     report.costModelID = normalizeLayoutCostModelID(target->costModelID()).str();
     report.staticTripCountFrequency = mode == LayoutBoundaryFrequencyMode::StaticTripCount;
     ModuleOp original = getOperation();
@@ -130,9 +136,10 @@ public:
     pipeline.addInstrumentation(std::make_unique<LayoutTimingInstrumentation>(report));
     pipeline.addPass(createNormalizeLayoutIRPass());
     pipeline.addPass(createFriskInferLayoutsPass(options, true, &report, LayoutStatisticsScope::Pipeline,
-                                               trace ? &*trace : nullptr, &profile, mode, calibration ? &*calibration : nullptr));
+                                               trace ? &*trace : nullptr, &profile, mode, calibration ? &*calibration : nullptr, nativeVector));
     pipeline.addPass(std::make_unique<PreserveRootContractsPass>());
-    pipeline.addPass(createOptimizeLayoutConversionsPass(mode, calibration ? &*calibration : nullptr));
+    if (options.policy.conversion == ConversionPolicy::Full)
+      pipeline.addPass(createOptimizeLayoutConversionsPass(mode, calibration ? &*calibration : nullptr, nativeVector));
     bool failedPipeline = failed(pipeline.run(*staged));
     auto verificationStart = LayoutClock::now();
     bool failedFinalVerification = false;
@@ -150,7 +157,7 @@ public:
       report.status = "committed";
       if (irDiagnostics) {
         report.actualIRDiagnostics = llvm::json::Object{
-            {"stage", "post-conversion-optimization"},
+            {"stage", options.policy.conversion == ConversionPolicy::Full ? "post-conversion-optimization" : "post-inference-selected-conversion-policy"},
             {"arithmetic", collectLayoutIRArithmetic(*staged)},
             {"resources", collectLayoutIRResources(*staged)}};
         if (trace) trace->recordEvent([&] {
@@ -215,15 +222,21 @@ void buildFriskLayoutPipeline(OpPassManager &pm) {
 void buildFriskLayoutPipeline(OpPassManager &pm, const SolverOptions &options,
                              StringRef statsFile, LayoutStatisticsReport *statistics,
                              LayoutTraceOptions traceOptions, StringRef profileFile,
-                             bool irDiagnostics, LayoutBoundaryFrequencyMode mode, StringRef costProfileFile) {
-  pm.addPass(std::make_unique<LayoutPipelineTransactionPass>(options, statsFile, statistics, std::move(traceOptions), profileFile, irDiagnostics, mode, costProfileFile));
+                             bool irDiagnostics, LayoutBoundaryFrequencyMode mode, StringRef costProfileFile, bool nativeVector) {
+  pm.addPass(std::make_unique<LayoutPipelineTransactionPass>(options, statsFile, statistics, std::move(traceOptions), profileFile, irDiagnostics, mode, costProfileFile, nativeVector));
 }
 
+void registerProtectedStoreLayoutPass();
 void registerFriskLayoutPipelines() {
+  registerProtectedStoreLayoutPass();
   struct Options : PassPipelineOptions<Options> {
     Option<std::string> costProfileFile{*this, "cost-profile", llvm::cl::desc("Explicit SM90 calibrated cost profile JSON"), llvm::cl::init("")};
     Option<std::string> boundaryFrequency{*this, "boundary-frequency", llvm::cl::desc("Boundary frequency: legacy or static-trip-count"), llvm::cl::init("legacy")};
     Option<bool> irDiagnostics{*this, "ir-diagnostics", llvm::cl::desc("Collect post-optimization static logical arithmetic and resource diagnostics"), llvm::cl::init(false)};
+    Option<bool> nativeVector{*this, "native-vector-access", llvm::cl::desc("Use the native aligned Global access model"), llvm::cl::init(false)};
+    Option<bool> memoizeCosts{*this, "memoize-costs", llvm::cl::desc("Reuse bounded graph-local pure cost queries"), llvm::cl::init(true)};
+    Option<bool> seedBeamSolution{*this, "seed-beam-solution", llvm::cl::desc("Budgeted coherent-layout witnesses before beam search"), llvm::cl::init(false)};
+    Option<std::string> conversionPolicy{*this, "conversion-policy", llvm::cl::desc("Conversion policy: full, shared-only or independent"), llvm::cl::init("full")};
     Option<std::string> profileFile{*this, "profile-file", llvm::cl::desc("Invocation-local inclusive layout profile JSON"), llvm::cl::init("")};
     Option<std::string> traceFile{*this, "trace-file", llvm::cl::desc("Layout decision trace JSON"), llvm::cl::init("")};
     Option<uint64_t> traceMaxEvents{*this, "trace-max-events", llvm::cl::desc("Maximum trace events"), llvm::cl::init(4096)};
@@ -250,10 +263,15 @@ void registerFriskLayoutPipelines() {
           pm.addPass(std::move(pass));
           return;
         }
-        buildFriskLayoutPipeline(pm, {options.exactCombinationLimit,
+        SolverOptions solverOptions{options.exactCombinationLimit,
                                     options.beamWidth, options.maxExpandedStates,
-                                    options.refineBeamSolution, options.maxRefinementProbes}, options.statsFile, nullptr,
-                                 {options.traceFile, options.traceMaxEvents, options.traceMaxBytes}, options.profileFile, options.irDiagnostics, options.boundaryFrequency == "legacy" ? LayoutBoundaryFrequencyMode::Legacy : LayoutBoundaryFrequencyMode::StaticTripCount, options.costProfileFile);
+                                    options.refineBeamSolution, options.maxRefinementProbes};
+        solverOptions.memoizeCosts = options.memoizeCosts;
+        solverOptions.seedBeamSolution = options.seedBeamSolution;
+        if (options.conversionPolicy != "full" && options.conversionPolicy != "shared-only" && options.conversionPolicy != "independent") llvm::report_fatal_error("unknown conversion-policy");
+        solverOptions.policy.conversion = options.conversionPolicy == "independent" ? ConversionPolicy::Independent : options.conversionPolicy == "shared-only" ? ConversionPolicy::SharedOnly : ConversionPolicy::Full;
+        buildFriskLayoutPipeline(pm, solverOptions, options.statsFile, nullptr,
+                                 {options.traceFile, options.traceMaxEvents, options.traceMaxBytes}, options.profileFile, options.irDiagnostics, options.boundaryFrequency == "legacy" ? LayoutBoundaryFrequencyMode::Legacy : LayoutBoundaryFrequencyMode::StaticTripCount, options.costProfileFile, options.nativeVector);
       });
   (void)registration;
 }

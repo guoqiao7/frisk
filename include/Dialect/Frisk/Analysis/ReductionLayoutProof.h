@@ -37,6 +37,11 @@ struct ReductionLayoutProof {
 FailureOr<DistributedEncodingAttr> projectReductionEncoding(
     DistributedEncodingAttr source, RankedTensorType sourceType,
     RankedTensorType resultType, int64_t axis);
+/// Enumerate canonical rank-two parents in the source carrier budget.
+/// Each returned parent projects exactly to the supplied rank-one layout.
+void enumerateReductionLifts(DistributedEncodingAttr slice, DistributedEncodingAttr model,
+    RankedTensorType sourceType, RankedTensorType resultType, int64_t axis,
+    SmallVectorImpl<DistributedEncodingAttr> &out);
 /// Pure bounded dependency proof, not GPU lowering or shared resource validation.
 /// Elects one physical first_owner for each distinct source coordinate, forms
 /// canonical_fiber_tree_v1 and broadcasts completed roots to every result holder.

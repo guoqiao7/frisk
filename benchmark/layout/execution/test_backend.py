@@ -48,6 +48,34 @@ class BackendTests(unittest.TestCase):
   emitter=backend.Emitter({'values':[source,target],'operations':[]});emitter.reg[0]=['r0','r1']
   with self.assertRaisesRegex(ValueError,'broadcast requires rank1.*dimensions=\[1\]'):
    emitter.broadcast({'operands':[0],'results':[1],'attrs':{'dimensions':[0]}})
+ def test_checked_attention_reductions_keep_an_eager_control(self):
+  data=json.loads(Path(INPUT).read_text())
+  old,eager=backend.emit(data,reduction_policy='eager')
+  new,optimized=backend.emit(data)
+  self.assertEqual([row['strategy'] for row in eager['reduction_plans']],['ordered-eager']*2)
+  self.assertEqual([row['strategy'] for row in optimized['reduction_plans']],['ordered-butterfly']*2)
+  self.assertTrue(all(row['butterfly_masks']==[[1,2],[1,2]] for row in optimized['reduction_plans']))
+  self.assertLess(new.count('shfl.sync'),old.count('shfl.sync'))
+  reduction=next(op for op in data['operations'] if op['name']=='frisk.reduce_tensor')
+  root=reduction['fibers'][0]['nodes'][-1]
+  root['left'],root['right']=root['right'],root['left']
+  for mode in ('auto','eager'):
+   with self.assertRaisesRegex(ValueError,'noncanonical reduction'):
+    backend.emit(data,reduction_policy=mode)
+ def test_aligned_fp16_uses_packed_four_word_transport(self):
+  slots=list(range(1024))
+  addresses=[dict(begin_bit=16*i,end_bit=16*(i+1),view=[i],root=[i]) for i in slots]
+  storage={'id':0,'type':'memref<1024xf16, 1>','storage':{'root':0,'alignment':16,'addresses':addresses}}
+  tensor={'id':1,'type':'tensor<1024xf16>','distributed':dict(shape=[1024],topology=[8,32,4,1,1],
+                                                            logical=slots,first=slots,replication=1)}
+  emitter=backend.Emitter({'values':[storage,tensor],'operations':[]})
+  emitter.roots={0:0}
+  emitter.load({'operands':[0],'results':[1]})
+  emitter.store({'operands':[1,0]})
+  self.assertEqual([x['groups_by_width'] for x in emitter.global_access],[{16:1},{16:1}])
+  self.assertEqual(sum(line.startswith('ld.global.v4.b32') for line in emitter.code),1)
+  self.assertEqual(sum(line.startswith('st.global.v4.b32') for line in emitter.code),1)
+  self.assertFalse(any('global.u8' in line for line in emitter.code))
 if __name__=='__main__':
  arg=sys.argv[1];sys.argv=[sys.argv[0]];BackendTests.test_complete_input_drives_operations.__globals__['INPUT']=arg
  # Explicit test input retained separately from unittest options.

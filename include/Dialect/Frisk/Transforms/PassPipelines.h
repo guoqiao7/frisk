@@ -18,7 +18,7 @@ void buildFriskLayoutPipeline(OpPassManager &pm, const SolverOptions &options,
                              llvm::StringRef profileFile = {},
                              bool irDiagnostics = false,
                              LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy,
-                              llvm::StringRef costProfileFile = {});
+                              llvm::StringRef costProfileFile = {}, bool nativeVector = false);
 /// Explicit host registration; no static initialization dependency.
 void registerFriskLayoutPipelines();
 } // namespace frisk

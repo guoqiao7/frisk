@@ -12,7 +12,8 @@ constexpr const char *names[] = {
   "address_enumeration", "execution_enumeration", "access_cost",
   "conversion_classification", "conversion_choice", "instruction_support",
   "instruction_contract", "relation_query", "relation_cache", "alias_pair_cache",
-  "footprint_cache"};
+  "footprint_cache", "access_cost_cache", "static_cost_validation_cache",
+  "static_cost_validation", "demand_footprint_cache"};
 static_assert(std::size(names) == static_cast<size_t>(LayoutProfileKind::Count));
 void increment(uint64_t &value) { if (value != UINT64_MAX) ++value; }
 } // namespace
@@ -45,6 +46,12 @@ void LayoutProfile::cacheInsertion(LayoutProfileKind kind) {
   if (activeProfile)
     increment(activeProfile->metrics[static_cast<size_t>(kind)].entries);
 }
+void LayoutProfile::cacheSize(LayoutProfileKind kind, uint64_t size) {
+  if (activeProfile) {
+    auto &metric = activeProfile->metrics[static_cast<size_t>(kind)];
+    metric.peakEntries = std::max(metric.peakEntries, size);
+  }
+}
 const LayoutProfileMetric &LayoutProfile::get(LayoutProfileKind kind) const {
   return metrics[static_cast<size_t>(kind)];
 }
@@ -54,11 +61,12 @@ llvm::json::Object LayoutProfile::toJSON(StringRef status) const {
     const auto &m = metrics[i];
     values[names[i]] = llvm::json::Object{{"count", m.count},
         {"inclusive_ns", m.inclusiveNS}, {"hits", m.hits},
-        {"misses", m.misses}, {"entries", m.entries}};
+        {"misses", m.misses}, {"entries", m.entries},
+        {"peak_entries", m.peakEntries}};
   }
   return llvm::json::Object{{"version", 1}, {"status", status}, {"timing_kind", "inclusive"},
           {"entries_kind", "insertions"},
-          {"timing_note", "Nested inclusive times overlap and are not additive: access_cost includes execution_enumeration/footprint_cache; relation_query and relation_cache include instruction_support/alias_pair_cache; footprint_cache includes address_enumeration. Counts measure actual entries, including cache hits; misses measure cache computation, entries successful insertions."},
+          {"timing_note", "Nested inclusive times overlap and are not additive: access_cost includes execution_enumeration/footprint_cache; relation_query and relation_cache include instruction_support/alias_pair_cache; footprint_cache includes address_enumeration. Counts measure actual entries, including cache hits; misses measure cache computation, entries successful insertions. access_cost_cache stores only successful unweighted terms and replays observer contributions; static_cost_validation_cache stores only successful immutable type/attribute validations. Both are graph-local, capped at 4096 entries each (lower limits/disabled operation may bypass storage); their insertions are not live/peak size. static_cost_validation counts actual decoder calls after misses or cache bypass. demand_footprint_cache memoizes the selected memory-space footprint after exact per-warp integer-translation normalization; it is builder-local and capped at min(256, graph cache bound), with graph cache disabling honored. Its timing covers normalization and actual misses, including disabled operation. peak_entries records the maximum explicitly observed live size; currently only demand_footprint_cache supplies this observation, so zero on other metrics is not a measured zero."},
           {"metrics", std::move(values)}};
 }
 std::string LayoutProfile::serialize(StringRef status) const {

@@ -33,7 +33,7 @@ func.func @two(%a: memref<8x8xf32, 1>, %b: memref<8x8xf32, 1>,
 // address cost precedes conversion work, so one proven shuffle is worthwhile.
 // CHECK: conversions: 1
 // CHECK-NEXT: convert 3:two/b0/o5/use0
-// CHECK-SAME: estimate=bounded-owner-proof-v1/shuffle
+// CHECK-SAME: estimate=symbolic-subspace-proof-v1/shuffle
 
 // -----
 

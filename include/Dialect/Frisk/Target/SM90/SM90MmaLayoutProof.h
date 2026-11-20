@@ -6,11 +6,13 @@
 namespace mlir::frisk {
 struct SM90MmaGeometry {
   int64_t m, n, k, threads, gM, gN, atomN, mRepeat, nRepeat, kRepeat;
+  bool interleavedRows = false;
 };
 FailureOr<SM90MmaGeometry> getSM90MmaGeometry(MmaOp op, int64_t threads);
 /// Bounded generated proof domain in ascending gM order, at most four grids;
 /// legacy policies are singletons.
-FailureOr<SmallVector<SM90MmaGeometry>> getSM90MmaGeometries(MmaOp op, int64_t threads);
+FailureOr<SmallVector<SM90MmaGeometry>> getSM90MmaGeometries(MmaOp op, int64_t threads,
+    bool exploreRowPartitions = false);
 DictionaryAttr encodeSM90MmaGeometry(MLIRContext *context, const SM90MmaGeometry &geometry);
 /// Strict schema and membership checks against the operation's shape/policy/dtype/threads.
 /// Semantic validity does not imply the fragment proof fits its hardware budget.

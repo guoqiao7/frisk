@@ -54,7 +54,7 @@ expected = {"stage": "post-conversion-optimization", "arithmetic": arithmetic,
 for stats in (on, capped, replay):
     assert stats["actual_ir_diagnostics"] == expected
 for stats in (off, on, capped):
-    assert stats["cost_model_id"] == "sm90-layout-lex9-legacy-v1"
+    assert stats["cost_model_id"] == "sm90-layout-lex9-legacy-v2"
     assert stats["status"] == "committed"
     stats.pop("timings")
     stats.pop("actual_ir_diagnostics")
@@ -65,7 +65,7 @@ assert off == on == capped
 traces = [read(f".{mode}.trace.json") for mode in ("off", "on", "cap")]
 assert traces[0]["finalCost"] == traces[1]["finalCost"] == traces[2]["finalCost"]
 for index, trace in enumerate(traces):
-    assert trace["cost_model_id"] == "sm90-layout-lex9-legacy-v1"
+    assert trace["cost_model_id"] == "sm90-layout-lex9-legacy-v2"
     total = list(trace["omittedCost"]["cost"])
     saturated = trace["omittedCost"]["saturated"]
     limit = 2**64 - 1

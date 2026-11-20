@@ -12,7 +12,7 @@
 // RUN: frisk-opt %s --frisk-infer-layouts='analysis-only refine-beam-solution=false max-refinement-probes=3' -verify-each > %t.disabled
 // RUN: frisk-opt %s --frisk-infer-layouts='analysis-only max-refinement-probes=0' -verify-each > %t.zero
 // RUN: diff %t.disabled %t.zero
-// CHECK: cost coverage: bounded-owner-proof-v1 with cta-staging-upper-bound-v1 fallback
+// CHECK: cost coverage: symbolic-subspace-proof-v1 with cta-staging-upper-bound-v1 fallback
 // CHECK-SAME: sm90-shape-work-v1
 // CHECK-SAME: warp-issue-32B-sectors-v1
 // CHECK-SAME: shared-128B-phase-32x4B-distinct-word-conflicts-v2

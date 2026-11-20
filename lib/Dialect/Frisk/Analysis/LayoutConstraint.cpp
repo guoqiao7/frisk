@@ -80,6 +80,7 @@ StringRef stringifyConstraintStrength(ConstraintStrength strength) {
 LayoutVarID LayoutConstraintGraph::addVariable(LayoutKind kind, Type type,
                                                StringRef stableName,
                                                Operation *anchor) {
+  clearCostQueryCaches();
   finalized = false;
   LayoutVarID id = variables.size();
   variables.push_back(
@@ -100,6 +101,7 @@ LayoutConstraintID LayoutConstraintGraph::addConstraint(
     ConstraintKind kind, ConstraintStrength strength,
     ArrayRef<LayoutVarID> vars, Operation *source, StringRef rule,
     StringRef reason, Attribute requiredEncoding) {
+  clearCostQueryCaches();
   finalized = false;
   ProvenanceID provenance =
       addProvenance(std::nullopt, source, rule, reason);
@@ -124,6 +126,8 @@ static std::string getStableAttributeText(Attribute attribute) {
 }
 
 LogicalResult LayoutConstraintGraph::finalize(Location loc) {
+  clearCostQueryCaches();
+  finalized = false;
   if (failed(verifyInvariants(loc)))
     return failure();
 

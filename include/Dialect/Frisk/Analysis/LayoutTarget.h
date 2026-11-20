@@ -9,6 +9,8 @@
 
 namespace mlir::frisk {
 
+struct ExperimentPolicy;
+
 struct CandidateAssignment {
   DenseMap<LayoutVarID, Attribute> values;
 };
@@ -55,6 +57,26 @@ public:
       observer->recordCost("target-aggregate", 0, *cost);
     return cost;
   }
+  /// Consumer-sensitive execution costs may couple all SSA values. Such
+  /// targets are scored only on complete graph assignments; the solver must
+  /// not use hard-component separability or endpoint-only memoization.
+  virtual bool needsCompleteAssignmentCost() const { return false; }
+  virtual bool needsCompleteAssignmentValidation(const LayoutConstraintGraph &) const { return false; }
+  /// Optional backend-domain feasibility policy, shared by every cost model.
+  /// Proven on a partial assignment means no assigned endpoint pair violates
+  /// it; it is not a certificate that every extension is executable.
+  virtual LayoutProof verifyExecutionSupport(const LayoutConstraintGraph &,
+      const CandidateAssignment &) const {
+    return {ProofStatus::Proven, {}, "no additional execution domain"};
+  }
+
+  /// Includes operation and conversion charges under the declared roots and
+  /// conversion policy. Scoped implementations must not inspect future uses
+  /// to determine a local producer demand. Failure is never a zero charge.
+  virtual FailureOr<CostEstimate> evaluateExecutionCost(
+      const LayoutConstraintGraph &, const CandidateAssignment &,
+      const ExperimentPolicy &, LayoutCostObserver *) const { return failure(); }
+
   // Costs must be nonnegative and separable by hard component. A partial
   // estimate must never exceed any complete extension. Component optima do
   // not imply an optimum of a saturated global sum (priority can collapse).

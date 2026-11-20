@@ -4,6 +4,7 @@
 namespace mlir::frisk {
 LogicalResult collectReductionLayoutConstraints(Operation *root,
     LayoutConstraintGraph &graph, LayoutConstraintBuilder &builder);
+void seedFixedReductionStoreLifts(LayoutConstraintGraph &graph, LayoutTarget &target, Location loc);
 LogicalResult prepareReductionPairs(LayoutConstraintGraph &graph,
                                     LayoutTarget &target, Location loc);
 const ReductionLayoutPair *findReductionSupport(

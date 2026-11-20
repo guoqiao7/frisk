@@ -41,6 +41,7 @@ struct LayoutTraceSummary {
   uint64_t maxExpandedStates = 65536;
   bool refineBeamSolution = true;
   uint64_t maxRefinementProbes = 256;
+  bool seedBeamSolution = false;
   bool hasFinalCost = false;
   CostEstimate finalCost;
 };

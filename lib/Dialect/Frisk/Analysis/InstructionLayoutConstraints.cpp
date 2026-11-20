@@ -35,9 +35,10 @@ const InstructionLayoutTuple *findInstructionSupport(
   return nullptr;
 }
 
-LogicalResult prepareInstructionTuples(LayoutConstraintGraph &graph,
-                                       LayoutTarget &target, Location loc,
-                                       LayoutTrace *trace) {
+LogicalResult
+prepareInstructionTuples(LayoutConstraintGraph &graph, LayoutTarget &target,
+                         Location loc, LayoutTrace *trace,
+                         const CertifiedInstructionDomains *certified) {
   for (auto &constraint : graph.getConstraints()) {
     if (constraint.kind != ConstraintKind::InstructionContract) continue;
     bool mma = constraint.instruction && isa_and_nonnull<MmaOp>(constraint.instruction->source);
@@ -45,6 +46,24 @@ LogicalResult prepareInstructionTuples(LayoutConstraintGraph &graph,
       return emitError(loc) << "unsupported instruction contract";
     auto &instruction = *constraint.instruction;
     instruction.tuples.clear();
+    if (certified && certified->count(instruction.source)) {
+      for (const auto &tuple : certified->find(instruction.source)->second) {
+        if (instruction.binding && instruction.binding != tuple.binding)
+          continue;
+        auto proof = target.verifyInstructionContract(
+            graph, constraint, tuple.encodings, tuple.binding);
+        if (proof.status == ProofStatus::Unknown)
+          return emitError(loc) << "could not verify certified anchor in its "
+                                   "full storage scope: "
+                                << proof.reason;
+        if (proof.status == ProofStatus::Proven)
+          instruction.tuples.push_back(tuple);
+      }
+      if (instruction.tuples.empty())
+        return emitError(loc) << "no certified local optimum is legal in the "
+                                 "full storage scope";
+      continue;
+    }
     for (auto id : constraint.vars)
       if (graph.getVariable(id).candidates.size() > 4)
         return emitError(loc) << "unknown proof: instruction proof budget exceeded: candidate domain is too large";

@@ -245,7 +245,7 @@ OracleResult enumerateOracle(const LayoutConstraintGraph &g,const FrozenProofs &
     r.status="unsupported";r.reason=unsupportedPolicy;return r;
   }
   auto start=std::chrono::steady_clock::now();CandidateAssignment current;
-  bool stopped=false;
+  bool stopped=false, unknownExecution=false;
   auto stop=[&](StringRef reason){stopped=true;r.reason=reason.str();};
   auto timedOut=[&] {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count()>=int64_t(limits.milliseconds);
@@ -270,6 +270,13 @@ OracleResult enumerateOracle(const LayoutConstraintGraph &g,const FrozenProofs &
     }
     if(depth==g.getVariables().size()) {
       if(unknown) {++r.unknownAssignments;return;}
+      auto execution=target.verifyExecutionSupport(g,current);
+      if(execution.status==ProofStatus::Disproven) {++r.rejected;return;}
+      if(execution.status==ProofStatus::Unknown) {
+        ++r.unknownAssignments;unknownExecution=true;
+        r.reason="unknown execution-domain proof: "+execution.reason;
+        return;
+      }
       if(r.evaluatedAssignments==limits.evaluations) {stop("evaluation-limit");return;}
       ++r.evaluatedAssignments;
       auto scored=scoreAssignment(g,current,target,policy);
@@ -319,7 +326,7 @@ OracleResult enumerateOracle(const LayoutConstraintGraph &g,const FrozenProofs &
     current.values.erase(v.id);
   };
   visit(0);r.exhausted=!stopped;
-  r.status=r.fatal ? "failed" : stopped ? "oracle-incomplete" : r.unknownAssignments ? "proof-incomplete" : r.best ? "complete" : "infeasible";
+  r.status=r.fatal ? "failed" : stopped ? "oracle-incomplete" : unknownExecution ? "unsupported" : r.unknownAssignments ? "proof-incomplete" : r.best ? "complete" : "infeasible";
   return r;
 }
 llvm::json::Array assignmentJSON(const LayoutConstraintGraph &g,const DenseMap<LayoutVarID,Attribute> &a) {

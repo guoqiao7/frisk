@@ -1,11 +1,14 @@
+#include "Dialect/Frisk/Analysis/ExecutionGroups.h"
 #include "Dialect/Frisk/Analysis/ReductionLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/LayoutRelations.h"
+#include "Dialect/Frisk/Analysis/ReductionLayoutProof.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
 #include "llvm/ADT/SmallSet.h"
 #include "mlir/IR/Diagnostics.h"
 
 namespace mlir::frisk {
 namespace {
+constexpr unsigned maxReductionCandidates = 4;
 FailureOr<int64_t> inferSourceThreads(const LayoutConstraintGraph &graph,
                                       LayoutVarID start, Operation *op) {
   SmallVector<LayoutVarID> pending{start};
@@ -62,11 +65,11 @@ LogicalResult collectReductionLayoutConstraints(Operation *root,
     if (auto explicitCount = reduce->getAttrOfType<IntegerAttr>("frisk.execution_threads"))
       threads = explicitCount.getInt();
     if (auto parallel = reduce->getParentOfType<ParallelOp>()) {
-      if (threads && threads != parallel.getThreads()) {
+      if (threads && threads != executionGroupWidth(reduce, parallel)) {
         reduce.emitError("reduce-thread-scope: execution_threads conflicts with enclosing parallel");
         return WalkResult::interrupt();
       }
-      threads = parallel.getThreads();
+      threads = executionGroupWidth(reduce, parallel);
     }
     if (!threads) {
       auto inferred = inferSourceThreads(graph, source, reduce);
@@ -124,6 +127,51 @@ const ReductionLayoutPair *findReductionSupport(
   return nullptr;
 }
 
+
+void seedFixedReductionStoreLifts(LayoutConstraintGraph &graph, LayoutTarget &target,
+                                  Location loc) {
+  DenseSet<LayoutVarID> pinned;
+  for (const auto &binding : graph.getConstraints())
+    if (binding.kind == ConstraintKind::RequireEncoding)
+      pinned.insert(binding.vars.front());
+
+  for (const auto &relation : graph.getConstraints()) {
+    if (!relation.reduction || relation.vars.size() != 2) continue;
+    auto &src = graph.getVariable(relation.vars.front());
+    auto &dst = graph.getVariable(relation.vars.back());
+    if (pinned.contains(src.id) || src.instructionRole || !dst.value ||
+        !dst.value.hasOneUse()) continue;
+    auto store = dyn_cast<TileStoreOp>(*dst.value.getUsers().begin());
+    if (!store) continue;
+    auto slice = store->getAttrOfType<DistributedEncodingAttr>("frisk.fixed_access_layout");
+    auto sourceType = cast<RankedTensorType>(src.shapedType);
+    auto resultType = cast<RankedTensorType>(dst.shapedType);
+    if (!slice)
+      slice = dyn_cast_or_null<DistributedEncodingAttr>(resultType.getEncoding());
+    if (!slice) continue;
+    if (sourceType.getRank() != 2 || resultType.getRank() != 1) continue;
+    auto present = [](const LayoutVar &v, Attribute a) {
+      return llvm::any_of(v.candidates, [&](const auto &c) { return c.value == a; });
+    };
+    if (!present(dst, slice) &&
+        (pinned.contains(dst.id) || dst.candidates.size() >= maxReductionCandidates))
+      continue;
+    SmallVector<DistributedEncodingAttr> proposals;
+    for (const auto &seed : src.candidates)
+      if (auto enc = dyn_cast<DistributedEncodingAttr>(seed.value))
+        enumerateReductionLifts(slice, enc, sourceType, resultType,
+                                relation.reduction->axis, proposals);
+    graph.getCandidatePreparationStatistics().generatedProposals += proposals.size();
+    for (auto enc : proposals) {
+      if (src.candidates.size() >= maxReductionCandidates) break;
+      if (present(src, enc) || failed(target.verifyCandidate(src, enc, loc))) continue;
+      auto origin = graph.addProvenance(relation.provenance, store,
+          "reduction-store-lift", "rank-two parent projects to the fixed store layout");
+      src.candidates.push_back({enc, origin, src.candidates.size()});
+    }
+  }
+}
+
 LogicalResult prepareReductionPairs(LayoutConstraintGraph &graph,
                                     LayoutTarget &target, Location loc) {
   for (auto &constraint : graph.getConstraints()) {
@@ -134,7 +182,7 @@ LogicalResult prepareReductionPairs(LayoutConstraintGraph &graph,
     reduction.pairs.clear();
     const auto &src = graph.getVariable(constraint.vars[0]);
     const auto &dst = graph.getVariable(constraint.vars[1]);
-    if (src.candidates.size() > 4 || dst.candidates.size() > 4)
+    if (src.candidates.size() > maxReductionCandidates || dst.candidates.size() > maxReductionCandidates)
       return emitError(loc) << "reduction proof budget exceeded: candidate domain is too large";
     std::optional<LayoutProof> firstFailure;
     {

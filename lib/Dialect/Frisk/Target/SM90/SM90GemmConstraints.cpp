@@ -195,7 +195,7 @@ LogicalResult mlir::frisk::prepareSM90MmaCandidates(LayoutConstraintGraph &graph
       // The semantic decoder admits this hard binding, but Auto may omit it
       // from the generated domain solely for the RS hardware proof budget.
       if (failed(geometries) || llvm::none_of(*geometries,[&](const SM90MmaGeometry &g) {
-            return g.gM == fixed->gM && g.gN == fixed->gN;
+            return g.gM == fixed->gM && g.gN == fixed->gN && g.interleavedRows == fixed->interleavedRows;
           }))
         return op.emitOpError("sm90-mma-fragment: unknown proof: hardware point budget exceeds 65536");
     }
@@ -229,7 +229,7 @@ LogicalResult mlir::frisk::prepareSM90MmaCandidates(LayoutConstraintGraph &graph
     bool rs = isa<RankedTensorType>(op.getA().getType());
     for (const auto &g : *geometries) {
       if (constraint.instruction->binding) {
-        if (fixed->gM != g.gM || fixed->gN != g.gN) continue;
+        if (fixed->gM != g.gM || fixed->gN != g.gN || fixed->interleavedRows != g.interleavedRows) continue;
       }
       add(4,encodeSM90MmaGeometry(op.getContext(),g));
       auto accum = buildSM90MmaFragment(op.getContext(),g,false,false);
@@ -293,6 +293,8 @@ InstructionContractBuildResult mlir::frisk::buildSM90MmaContractDetailed(const L
     b.getNamedAttr("grid",b.getDenseI64ArrayAttr({g->gM,g->gN})),
     b.getNamedAttr("repeats",b.getDenseI64ArrayAttr({g->mRepeat,g->nRepeat,g->kRepeat})),
     b.getNamedAttr("packing",b.getStringAttr(rule->packing))};
+  if (g->interleavedRows)
+    fields.push_back(b.getNamedAttr("row_partition", b.getStringAttr("interleaved64")));
   for (unsigned role = rs?1:0; role<2; ++role) {
     auto &var = graph.getVariable(constraint.vars[role]);
     auto storage = dyn_cast_or_null<StorageLayoutAttr>(encodings[role]);

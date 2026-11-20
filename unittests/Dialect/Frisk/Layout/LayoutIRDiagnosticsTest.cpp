@@ -113,7 +113,7 @@ TEST_F(LayoutIRDiagnosticsTest, PipelineIsOptInPureAndReplayStableWithTraceCostR
       auto trace = llvm::json::parse((*traceBuffer)->getBuffer());
       ASSERT_TRUE(bool(trace));
       auto *object = trace->getAsObject();
-      EXPECT_EQ(object->getString("cost_model_id"), "sm90-layout-lex9-legacy-v1");
+      EXPECT_EQ(object->getString("cost_model_id"), "sm90-layout-lex9-legacy-v2");
       auto *final = object->getObject("finalCost");
       ASSERT_TRUE(final);
       for (unsigned field = 0; field < 9; ++field) {

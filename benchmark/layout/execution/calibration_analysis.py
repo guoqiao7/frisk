@@ -17,14 +17,16 @@ def features(record):
         raise ValueError("features must be nonnegative integers")
     return result
 
-def coordinate_fit(x,y,ridge=1e-6,max_iterations=20000,tolerance=1e-10):
+def coordinate_fit(x,y,ridge=1e-6,max_iterations=20000,tolerance=1e-10,*,signed=False,fit_intercept=True):
     x=np.asarray(x,dtype=float);y=np.asarray(y,dtype=float)
-    if x.ndim!=2 or y.shape!=(len(x),) or len(x)<2 or np.any(~np.isfinite(x)) or np.any(x<0) or np.any(~np.isfinite(y)) or np.any(y<0):
+    if x.ndim!=2 or y.shape!=(len(x),) or len(x)<2 or np.any(~np.isfinite(x)) or (not signed and np.any(x<0)) or np.any(~np.isfinite(y)) or (not signed and np.any(y<0)):
         raise ValueError("invalid training matrix")
-    maxima=np.max(x,axis=0);active=maxima>0
-    a=np.column_stack([np.ones(len(x)),x[:,active]/maxima[active]])
+    maxima=np.max(np.abs(x),axis=0);active=maxima>0
+    a=x[:,active]/maxima[active]
+    if fit_intercept:a=np.column_stack([np.ones(len(x)),a])
     # Lawson-Hanson active-set NNLS on the ridge-augmented design.
-    penalty=np.sqrt(ridge)*np.eye(a.shape[1]);penalty[0,0]=0
+    penalty=np.sqrt(ridge)*np.eye(a.shape[1])
+    if fit_intercept:penalty[0,0]=0
     augmented=np.vstack([a,penalty]);target=np.r_[y,np.zeros(a.shape[1])]
     weights=np.zeros(a.shape[1]);passive=np.zeros(a.shape[1],dtype=bool);converged=False
     iteration=0
@@ -45,11 +47,11 @@ def coordinate_fit(x,y,ridge=1e-6,max_iterations=20000,tolerance=1e-10):
             passive[passive&(weights<=tolerance)]=False;weights[~passive]=0
             if iteration>=max_iterations:break
     residual=y-a@weights
-    coefficients=np.zeros(x.shape[1]);coefficients[active]=weights[1:]/maxima[active]
+    coefficients=np.zeros(x.shape[1]);coefficients[active]=weights[1 if fit_intercept else 0:]/maxima[active]
     gradient=augmented.T@(target-augmented@weights)
     kkt=max(float(np.max(np.abs(gradient[passive]))) if np.any(passive) else 0.,
             max(0.,float(np.max(gradient[~passive]))) if np.any(~passive) else 0.)
-    return dict(coefficients=coefficients.tolist(),intercept=float(weights[0]),iterations=iteration,converged=converged,kkt_violation=kkt,
+    return dict(coefficients=coefficients.tolist(),intercept=float(weights[0]) if fit_intercept else 0.,iterations=iteration,converged=converged,kkt_violation=kkt,
                 design_rank=int(np.linalg.matrix_rank(a)),design_columns=int(a.shape[1]),active_columns=active.tolist(),
                 training_rmse=float(np.sqrt(np.mean(residual**2))),prediction=(y-residual).tolist())
 

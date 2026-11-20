@@ -34,7 +34,7 @@ class Redistribution(unittest.TestCase):
      s=d['source'];j=((s['warp_group']*4+s['warp'])*32+s['lane'])*p['source_registers']+s['reg']
      self.assertEqual(values[0]['distributed']['logical'][j],values[1]['distributed']['logical'][i])
     e=backend.Emitter(dict(values=list(values.values())));e.reg[0]=['s'+str(i) for i in range(p['source_registers'])];e.scratch=0;e.convert(op);code='\n'.join(e.code)
-    self.assertEqual('shfl.sync.idx.b32' in code,p['mode']=='Shuffle')
+    self.assertEqual('shfl.sync.' in code,p['mode']=='Shuffle')
     self.assertEqual('st.shared.b32' in code,p['mode']=='Shared')
     self.assertEqual(code.count('bar.sync 0;'),2 if p['mode']=='Shared' else 0)
     if p['mode']=='Shuffle':self.assertFalse(any('@' in line for line in code.splitlines() if 'shfl.sync' in line))
@@ -49,6 +49,13 @@ class Redistribution(unittest.TestCase):
   self.assertEqual(backend.reserve_shared(5,16,8,64),24)
   for args in ((2**64-1,1,4,2**64-1),(0,65,4,64),(0,1,3,64)):
    with self.assertRaises(ValueError):backend.reserve_shared(*args)
+ def test_invalid_native_stripe_declaration(self):
+  from redistribution import validate
+  op,values=case('shared')
+  # A valid four-warp exchange cannot declare the eight-warp delivery ABI.
+  op['redistribution']['stripe_elements']=16384
+  with self.assertRaisesRegex(ValueError,'stripe geometry'):
+   validate(op,values)
  def test_corrupt_plan_rejected(self):
   for change in ('owner','missing','slot','mode','scratch','writer'):
    op,v=case('shared');p=op['redistribution']

@@ -1,3 +1,4 @@
+#include "Dialect/Frisk/Analysis/ExecutionGroups.h"
 #include "LegacyFragmentNormalization.h"
 #include "Dialect/Frisk/Analysis/LayoutAliasAnalysis.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
@@ -65,6 +66,67 @@ LogicalResult verifyImportAttributes(Operation *scope, bool allowLegacyThreads) 
       }
       StringRef name = named.getName().getValue();
       if (!name.starts_with("frisk.")) continue;
+      // The scalar executor domain is a module-wide capability contract shared
+      // by every objective. Do not drop it during legacy normalization.
+      if (name == "frisk.execution_domain") {
+        auto domain = dyn_cast<StringAttr>(named.getValue());
+        if (isa<ModuleOp>(op) && domain &&
+            domain.getValue() == "sm90-scalar-f32-dag-v1")
+          continue;
+        op->emitError("execution-domain-contract: expected module-level sm90-scalar-f32-dag-v1");
+        return WalkResult::interrupt();
+      }
+      if (name == "frisk.compiled_sum_spill" && isa<ModuleOp>(op) &&
+          isa<DictionaryAttr>(named.getValue())) continue;
+      if (name == "frisk.execution_contract" && isa<ModuleOp>(op) && isa<DictionaryAttr>(named.getValue())) continue;
+      if (name == "frisk.execution_role" && isa<MmaOp, CopyOp, ReduceTensorOp>(op) && isa<StringAttr>(named.getValue())) continue;
+      if (name == "frisk.online_launch") {
+        if (isa<ModuleOp>(op) && isa<DictionaryAttr>(named.getValue())) continue;
+        op->emitError("expected a module-level online launch dictionary");
+        return WalkResult::interrupt();
+      }
+      if (name == "frisk.h100_store_schedule") {
+        if (isa<TileStoreOp>(op) && isa<DictionaryAttr>(named.getValue()))
+          continue;
+        op->emitError("expected a per-tile_store schedule dictionary");
+        return WalkResult::interrupt();
+      }
+      // Protected-store receipts may cross a normalization/materialization
+      // boundary. Keep per-use provenance so a later fixed pass can reprice.
+      if (isa<ModuleOp>(op) &&
+          (((name == "frisk.protected_graph" || name == "frisk.protected_functions") && isa<DictionaryAttr>(named.getValue())) ||
+           (name == "frisk.protected_candidates" && isa<ArrayAttr>(named.getValue())) ||
+           (name == "frisk.fixed_store_cost" && isa<DenseI64ArrayAttr>(named.getValue()))))
+        continue;
+      if (isa<ConvertLayoutOp>(op) && name == "frisk.protected_store_route" &&
+          isa<UnitAttr>(named.getValue()))
+        continue;
+      if (name == "frisk.fixed_access_layout" && isa<TileLoadOp, TileStoreOp>(op) &&
+          isa<DistributedEncodingAttr>(named.getValue()))
+        continue;
+      if (isa<TileStoreOp>(op)) {
+        Attribute value = named.getValue();
+        if (((name == "frisk.store_score" || name == "frisk.scheduled_store_score" ||
+              name == "frisk.spill_pressure" || name == "frisk.store_route_service" ||
+              name == "frisk.writer_bank_extra" || name == "frisk.wave_sectors") &&
+             isa<DenseI64ArrayAttr>(value)) ||
+            ((name == "frisk.store_route_kind" || name == "frisk.store_route_backend") &&
+             isa<StringAttr>(value)) ||
+            (name == "frisk.store_route_feasible" && isa<BoolAttr>(value)) ||
+            ((name == "frisk.store_route_charge_q10" || name == "frisk.mainloop_delta_q10" ||
+              name == "frisk.segment_delta_q10" || name == "frisk.writer_delta_q10" ||
+              name == "frisk.drain_delta_q10" || name == "frisk.wave_delta_q10") && isa<IntegerAttr>(value)) ||
+            (name == "frisk.protected_store_use" && isa<UnitAttr>(value)))
+          continue;
+      }
+      if (name == "frisk.row_partition") {
+        auto partition = dyn_cast<StringAttr>(named.getValue());
+        if (isa<MmaOp>(op) && partition &&
+            (partition.getValue() == "contiguous" || partition.getValue() == "interleaved64"))
+          continue;
+        op->emitError("expected contiguous or interleaved64 on an MMA");
+        return WalkResult::interrupt();
+      }
       if (name == "frisk.target" || name == "frisk.legacy_semantics" ||
           name == "frisk.execution_threads" || name == "frisk.execution_layout" ||
           name == "frisk.writer_policy" || name == "frisk.vector_bytes" ||
@@ -225,7 +287,7 @@ LogicalResult Normalizer::preflight() {
     return WalkResult::advance();
   });
   if (math.wasInterrupted()) return failure();
-  if (failed(verifyImportAttributes(module, /*allowLegacyThreads=*/true)))
+  if (failed(bindExecutionGroups(module)) || failed(verifyImportAttributes(module, /*allowLegacyThreads=*/true)))
     return failure();
   module.walk<WalkOrder::PreOrder>([&](Operation *op) {
     if (isa<AllocBufferOp, memref::AllocOp, memref::AllocaOp>(op) && isLocal(op->getResult(0)))

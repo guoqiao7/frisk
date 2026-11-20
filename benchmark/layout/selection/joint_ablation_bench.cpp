@@ -9,9 +9,12 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "SelectionOracle.h"
+#include "Dialect/Frisk/Analysis/LayoutDemand.h"
 
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
 #include "Dialect/Frisk/Analysis/LayoutTrace.h"
+#include "Dialect/Frisk/Analysis/LayoutProfile.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "Dialect/Frisk/Analysis/LayoutIRDiagnostics.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
@@ -78,9 +81,41 @@ int main(int argc,char **argv){
 
 namespace {
 std::string failureDirectory;
+// Failure sidecars preserve the live shared ledger without changing the
+// published five-field failure.json envelope consumed by older runners.
+const llvm::json::Object *failureSearchRecord = nullptr;
+const SharedSearchBudget *failureSearchBudget = nullptr;
+bool failureSearchPerformed = false;
 [[noreturn]] void matrixStop(const std::string &kind,const std::string &message,bool fatal){
  llvm::errs()<<message<<"\n";
  if(!failureDirectory.empty()){std::error_code ec;llvm::raw_fd_ostream os(failureDirectory+"/failure.json",ec);if(!ec){os<<llvm::formatv("{0:2}",llvm::json::Value(llvm::json::Object{{"status","failed"},{"failure_kind",kind},{"fatal",fatal},{"reason",message},{"limits",llvm::json::Object{{"probes",65536},{"refinement",256}}}}));os.close();if(os.has_error())os.clear_error();}}
+ if(!failureDirectory.empty()) {
+   SharedSearchBudget noSearch;
+   const auto &b=failureSearchBudget?*failureSearchBudget:noSearch;
+   llvm::json::Object totals{{"probes",b.used},{"refinement",b.refinementUsed},
+       {"relationship",b.relationshipProbes},{"complete_scores",b.completeScores},
+       {"refinement_probes",b.refinementProbes}};
+   llvm::json::Object contract{{"kind","shared-total-search-probes-v1"},
+       {"search_performed",failureSearchPerformed},{"limit",b.limit},
+       {"refinement_limit",b.refinementLimit},{"used",b.used},
+       {"refinement_used",b.refinementUsed},
+       {"includes","constraint extensions, complete objective scores and refinement probes; no second seed budget"},
+       {"certificate_rescores","selected-certificate verification only, no candidate selection"}};
+   llvm::json::Object budget{{"schema_version",1},
+       {"budget_context_available",failureSearchBudget!=nullptr},
+       {"total",llvm::json::Object(totals)},{"budget_contract",llvm::json::Object(contract)}};
+   llvm::json::Object snapshot=failureSearchRecord?llvm::json::Object(*failureSearchRecord):llvm::json::Object{};
+   snapshot["status"]="failed";snapshot["failure_kind"]=kind;snapshot["fatal"]=fatal;
+   snapshot["reason"]=message;snapshot["total"]=std::move(totals);
+   snapshot["budget_contract"]=std::move(contract);
+   snapshot["budget_context_available"]=failureSearchBudget!=nullptr;
+   auto sidecar=[&](StringRef name,llvm::json::Object object) {
+     std::error_code ec;llvm::raw_fd_ostream os(failureDirectory+"/"+name.str(),ec);
+     if(!ec){os<<llvm::formatv("{0:2}",llvm::json::Value(std::move(object)));os.close();if(os.has_error())os.clear_error();}
+   };
+   sidecar("failure-budget.json",std::move(budget));
+   sidecar("failure-search-record.json",std::move(snapshot));
+ }
  std::exit(fatal?2:3);
 }
 [[noreturn]] void matrixError(const std::string &message){matrixStop("fatal-integrity",message,true);}
@@ -140,6 +175,8 @@ void restore(LayoutConstraintGraph &g,const llvm::json::Object &d,MLIRContext &c
  }
  for(unsigned i=g.getProvenances().size();i<provenances->size();++i){auto &p=*(*provenances)[i].getAsObject();std::optional<ProvenanceID> parent;if(auto n=p.getInteger("parent"))parent=*n;g.addProvenance(parent,nullptr,*p.getString("rule"),*p.getString("reason"));}
 }
+
+
 FrozenProofs readProofs(const llvm::json::Object &d,const llvm::json::Object &meta,MLIRContext &ctx){
  FrozenProofs p;p.commonDigest=meta.getString("common_digest")->str();p.domainDigest=meta.getString("domain_digest")->str();p.coverageDigest=meta.getString("coverage_digest")->str();
  for(auto &j:*d.getArray("relation_proofs")){auto &v=*j.getAsObject();SmallVector<int64_t> example;for(auto &x:*v.getArray("counterexample"))example.push_back(*x.getAsInteger());auto status=*v.getString("status");p.entries.push_back({LayoutConstraintID(*v.getInteger("constraint")),LayoutVarID(*v.getInteger("lhs")),LayoutVarID(*v.getInteger("rhs")),parseJSONAttribute(ctx,*v.getObject("a"),"attribute"),parseJSONAttribute(ctx,*v.getObject("b"),"attribute"),{status=="proven"?ProofStatus::Proven:status=="disproven"?ProofStatus::Disproven:ProofStatus::Unknown,example,v.getString("reason")->str()}});}
@@ -154,6 +191,21 @@ llvm::json::Value costProfileJSON(const SM90CostProfile &profile) {
   return std::move(*value);
 }
 }
+llvm::json::Object networkStaticContractJSON(const SM90CostProfile &profile,StringRef frequency) {
+ if(!profile.networkProxy)matrixError("common network contract requires explicit engineering proxy");
+ auto value=costProfileJSON(profile);auto coefficients=llvm::json::Object(*value.getAsObject()->getObject("coefficients"));
+ const std::string contract="sm90-network-static-common-v1",grammar="ordered-surviving-network-source-issues-v1";
+ const std::string provenance="migrated-engineering-proxy-not-refit",units="nonnegative-score-ticks-per-feature-unit-not-cycles";
+ std::string encoding=contract+"\n"+grammar+"\n"+frequency.str()+"\n"+provenance+"\n"+units+"\n";
+ llvm::json::Array order;
+ for(StringRef name:getSM90SurvivingCostFeatureNames()) {
+  auto *entry=coefficients.get(name);if(!entry || !entry->getAsUINT64())matrixError("missing network common coefficient");
+  order.push_back(name.str());encoding+=name.str()+"="+std::to_string(*entry->getAsUINT64())+"\n";
+ }
+ return llvm::json::Object{{"contract",contract},{"grammar",grammar},{"frequency_mode",frequency.str()},
+   {"weight_provenance",provenance},{"units",units},{"feature_order",std::move(order)},
+   {"coefficients",std::move(coefficients)},{"sha256",sha256(encoding)}};
+}
 int matrixMain(int argc,char **argv){
  MLIRContext context;context.disableMultithreading();context.loadDialect<FriskDialect,arith::ArithDialect,memref::MemRefDialect,func::FuncDialect,math::MathDialect,tensor::TensorDialect,linalg::LinalgDialect>();
  std::string profilePath;for(int i=1;i<argc;++i)if(StringRef(argv[i]).starts_with("--cost-profile=")) {
@@ -166,29 +218,77 @@ int matrixMain(int argc,char **argv){
    profile=std::move(*parsed);target=createSM90LayoutTarget(LayoutBoundaryFrequencyMode::Legacy,*profile);
   } else target=createSM90LayoutTarget();std::string frequency=target->boundaryFrequencyMode()==LayoutBoundaryFrequencyMode::Legacy?"legacy":"static-trip-count";
  if(StringRef(argv[1])=="--prepare"){
-  if(argc!=5 && !(argc==6 && StringRef(argv[5]).starts_with("--cost-profile=")))matrixError("--prepare input case outputdir [--cost-profile=path]");std::string out=argv[4];fresh(out);auto m=parseSourceFile<ModuleOp>(argv[2],&context);if(!m)matrixError("parse failed");
-  bool controlled=StringRef(argv[3])!="attention";
+  if(argc<5 || argc>7)matrixError("--prepare input case outputdir [--natural] [--cost-profile=path]");
+  bool natural=false;for(int i=5;i<argc;++i){StringRef a=argv[i];if(a=="--natural"){if(natural)matrixError("duplicate natural preparation option");natural=true;}else if(!a.starts_with("--cost-profile="))matrixError("unknown prepare option");}
+  StringRef caseID=argv[3];if(!llvm::is_contained(ArrayRef<StringRef>{"no-conflict","conflict","diamond","remat","attention"},caseID))matrixError("unknown preparation case");
+  std::string out=argv[4];fresh(out);auto m=parseSourceFile<ModuleOp>(argv[2],&context);if(!m)matrixError("parse failed");
+  bool controlled=caseID!="attention" && !natural;
   if(!controlled){PassManager pm(&context);pm.addPass(createNormalizeLayoutIRPass());if(failed(pm.run(*m)))matrixError("normalization failed");}
   auto graph=collectLayoutConstraints(*m,*target,LayoutCollectionMode::InitializeCandidates);if(failed(graph))matrixError("collection failed");SmallVector<LayoutVarID> producers,instructions;
-  if(controlled){auto a=m->getOperation()->getAttr("joint.A"),b=m->getOperation()->getAttr("joint.B");if(!a||!b)matrixError("missing experimental A/B declaration");SmallVector<Operation*> muls;Value load;m->walk([&](Operation *op){if(isa<arith::MulFOp>(op))muls.push_back(op);if(!load && isa<TileLoadOp>(op))load=op->getResult(0);});StringRef id=argv[3];if(!load || muls.empty())matrixError("invalid controlled graph");Value producer=id=="diamond"?load:muls.front()->getResult(0);auto producerID=graph->lookupVariable(producer);if(!producerID)matrixError("missing producer");producers.push_back(*producerID);Operation *branchB=id=="no-conflict"?nullptr:muls[id=="diamond"?1:2];
-   for(auto &v:graph->getVariables())if(v.kind==LayoutKind::Distributed){Attribute enc=(v.use && v.use->getOwner()==branchB)||(v.value && v.value.getDefiningOp()==branchB)?b:a;if(id=="remat" && v.value==load)enc=b;v.candidates={{enc,kInvalidProvenanceID,enc==a?0u:1u}};if(v.id==*producerID)v.candidates={{a,kInvalidProvenanceID,0},{b,kInvalidProvenanceID,1}};}
+  if(caseID!="attention"){
+   // Keep the local baseline's declared producer scope identical for the
+   // controlled mechanism experiment and the natural candidate-domain anchor.
+   // Natural preparation never overwrites any collector-generated candidates.
+   SmallVector<Operation*> muls;Value load;m->walk([&](Operation *op){if(isa<arith::MulFOp>(op))muls.push_back(op);if(!load && isa<TileLoadOp>(op))load=op->getResult(0);});
+   unsigned required=caseID=="no-conflict"?1u:caseID=="diamond"?3u:4u;if(!load || muls.size()<required)matrixError("graph lacks the declared producer/branch structure");
+   Value producer=caseID=="diamond"?load:muls.front()->getResult(0);auto producerID=graph->lookupVariable(producer);if(!producerID)matrixError("missing producer");producers.push_back(*producerID);
+   if(controlled){auto a=m->getOperation()->getAttr("joint.A"),b=m->getOperation()->getAttr("joint.B");if(!a||!b)matrixError("missing experimental A/B declaration");Operation *branchB=caseID=="no-conflict"?nullptr:muls[caseID=="diamond"?1:2];
+    for(auto &v:graph->getVariables())if(v.kind==LayoutKind::Distributed){Attribute enc=(v.use && v.use->getOwner()==branchB)||(v.value && v.value.getDefiningOp()==branchB)?b:a;if(caseID=="remat" && v.value==load)enc=b;v.candidates={{enc,kInvalidProvenanceID,enc==a?0u:1u}};if(v.id==*producerID)v.candidates={{a,kInvalidProvenanceID,0},{b,kInvalidProvenanceID,1}};}
+   }
   }else{for(const auto &c:graph->getConstraints())if(c.instruction){instructions.push_back(c.id);for(auto id:c.vars)if((graph->getVariable(id).kind==LayoutKind::Distributed || graph->getVariable(id).kind==LayoutKind::Instruction) && !graph->getVariable(id).use)producers.push_back(id);}llvm::sort(producers);producers.erase(std::unique(producers.begin(),producers.end()),producers.end());}
   auto proofs=freezeRelationProofs(*graph,target.get());auto d=domainJSON(*graph,proofs);llvm::json::Array candidateProofs,ps,is;for(auto id:producers)ps.push_back(id);for(auto id:instructions)is.push_back(id);for(auto &v:proofs.candidates){std::string text;llvm::raw_string_ostream(text)<<v.candidate;candidateProofs.push_back(llvm::json::Object{{"variable",v.variable},{"attribute",text},{"valid",v.valid},{"capacity",v.capacity}});}
   llvm::json::Object meta{{"common_digest",proofs.commonDigest},{"domain_digest",proofs.domainDigest},{"coverage_digest",proofs.coverageDigest},{"candidate_proofs",std::move(candidateProofs)},{"producers",std::move(ps)},{"producer_instructions",std::move(is)},{"case",argv[3]},{"cost_model",target->costModelID()},{"frequency_mode",frequency},{"candidate_preparation",controlled?"experimental-A/B-injection":"natural"}};
-  if(profile){meta["cost_profile_sha256"]=getSM90CostProfileSHA256(*profile);meta["cost_profile"]=costProfileJSON(*profile);}
+  if(auto executionDomain=m->getOperation()->getAttrOfType<StringAttr>("frisk.execution_domain"))meta["execution_domain"]=executionDomain.getValue();
+   if(profile){meta["cost_profile_sha256"]=getSM90CostProfileSHA256(*profile);meta["cost_profile"]=costProfileJSON(*profile);}
    auto inputText=moduleText(*m),domainText=jsonText(llvm::json::Object(d));meta["input_sha256"]=sha256(inputText);meta["domain_file_sha256"]=sha256(domainText);meta["package_digest"]=sha256(inputText+domainText+jsonText(llvm::json::Object(meta)));writeFile(out,"input.mlir",inputText);writeFile(out,"domains.json",domainText);writeFile(out,"prepared.json",jsonText(std::move(meta)));return 0;
  }
- std::string prepared,out,selection="J",conversion="C",assignment,replay,forcedProducer;bool oracle=false;for(int i=1;i<argc;++i){StringRef a=argv[i];auto split=a.split('=');if(split.first=="--prepared")prepared=split.second.str();else if(split.first=="--output-dir")out=split.second.str();else if(split.first=="--selection")selection=split.second.str();else if(split.first=="--conversion")conversion=split.second.str();else if(split.first=="--assignment")assignment=split.second.str();else if(split.first=="--replay")replay=split.second.str();else if(split.first=="--force-producer"){if(!forcedProducer.empty() || (split.second!="A" && split.second!="B"))matrixError("invalid or duplicate forced producer");forcedProducer=split.second.str();}else if(a=="--oracle")oracle=true;else if(split.first=="--cost-profile"){if(split.second.empty())matrixError("empty cost profile");}else if(split.first!="--case")matrixError("unknown option");}
+ std::string prepared,out,selection="J",conversion="C",assignment,replay,forcedProducer,networkObjectiveOverride,archiveRetention="legacy-hamming-v2";bool invocationProfileEnabled=false,disableCostQueryCache=false;bool archiveRetentionSet=false,auditPaidObservations=false;bool networkArchiveV2=false,oracle=false,seedBeam=false,demandLedger=false,minifyExecutionJSON=false;unsigned archiveCapacity=0;for(int i=1;i<argc;++i){StringRef a=argv[i];auto split=a.split('=');if(split.first=="--prepared")prepared=split.second.str();else if(split.first=="--output-dir")out=split.second.str();else if(split.first=="--selection")selection=split.second.str();else if(split.first=="--conversion")conversion=split.second.str();else if(split.first=="--assignment")assignment=split.second.str();else if(split.first=="--replay")replay=split.second.str();else if(split.first=="--force-producer"){if(!forcedProducer.empty() || (split.second!="A" && split.second!="B"))matrixError("invalid or duplicate forced producer");forcedProducer=split.second.str();}else if(split.first=="--seed-beam-solution"){if(split.second!="true" && split.second!="false")matrixError("seed-beam-solution requires true or false");seedBeam=split.second=="true";}else if(split.first=="--candidate-archive"){if(split.second.getAsInteger(10,archiveCapacity) || archiveCapacity<2 || archiveCapacity>6)matrixError("candidate-archive requires capacity 2..6");}else if(split.first=="--archive-audit-paid-observations"){if(split.second!="true" && split.second!="false")matrixError("archive-audit-paid-observations requires true or false");auditPaidObservations=split.second=="true";}else if(split.first=="--archive-retention"){if(archiveRetentionSet || (split.second!="legacy-hamming-v2" && split.second!="paid-feature-frontier-v1" && split.second!="paid-static-feature-frontier-v1" && split.second!="calibrated-source-grammar-v1"))matrixError("invalid or duplicate archive-retention policy");archiveRetentionSet=true;archiveRetention=split.second.str();}else if(split.first=="--network-archive-v2"){if(split.second!="true" && split.second!="false")matrixError("network-archive-v2 requires true or false");networkArchiveV2=split.second=="true";}else if(split.first=="--network-objective"){if(split.second!="min-shfl" && split.second!="min-work")matrixError("unknown network objective");networkObjectiveOverride=split.second.str();}else if(split.first=="--minify-execution-json"){if(a=="--minify-execution-json")minifyExecutionJSON=true;else if(split.second=="true" || split.second=="false")minifyExecutionJSON=split.second=="true";else matrixError("minify-execution-json requires true or false");}else if(a=="--layout-profile")invocationProfileEnabled=true;else if(a=="--disable-cost-query-cache")disableCostQueryCache=true;else if(a=="--demand-ledger")demandLedger=true;else if(a=="--oracle")oracle=true;else if(split.first=="--cost-profile"){if(split.second.empty())matrixError("empty cost profile");}else if(split.first!="--case")matrixError("unknown option");}
  if(prepared.empty()||out.empty()||(selection!="L" && selection!="LI" && selection!="J")||(conversion!="C" && conversion!="O"))matrixError("invalid matrix options");fresh(out);
- auto domain=readJSON(prepared+"/domains.json"),metadata=readJSON(prepared+"/prepared.json");if(!domain.getAsObject() || !metadata.getAsObject())matrixError("malformed domain JSON");auto &d=*domain.getAsObject(),&meta=*metadata.getAsObject();preparedSchema(d,meta);if(meta.getString("cost_model")!=target->costModelID() || meta.getString("frequency_mode")!=frequency)matrixError("cost model or frequency identity mismatch");if(profile && meta.getString("cost_profile_sha256")!=getSM90CostProfileSHA256(*profile))matrixError("full cost profile identity mismatch");auto m=parseSourceFile<ModuleOp>(prepared+"/input.mlir",&context);if(!m)matrixError("input parse failed");auto claimedPackage=meta.getString("package_digest");if(!claimedPackage)matrixError("missing prepared package digest");std::string package=claimedPackage->str();auto packageMetadata=meta;packageMetadata.erase("package_digest");auto inputBuffer=llvm::MemoryBuffer::getFile(prepared+"/input.mlir");if(!inputBuffer || sha256((*inputBuffer)->getBuffer().str()+jsonText(domain)+jsonText(std::move(packageMetadata)))!=package)matrixError("prepared package integrity mismatch");auto graph=collectLayoutConstraints(*m,*target,LayoutCollectionMode::RelationsOnly);if(failed(graph))matrixError("relation reconstruction failed");restore(*graph,d,context);auto proofs=readProofs(d,meta,context);if(jsonText(domainJSON(*graph,proofs))!=jsonText(domain))matrixError("serialized graph/domain mismatch");
- SolverOptions options;options.policy.scope.informedLocal=selection=="LI";options.policy.conversion=conversion=="C"?ConversionPolicy::Independent:ConversionPolicy::Full;for(auto &id:*meta.getArray("producers"))options.policy.scope.producers.push_back(*id.getAsInteger());for(auto &id:*meta.getArray("producer_instructions"))options.policy.scope.producerInstructions.push_back(*id.getAsInteger());
+ LayoutProfile invocationProfile(invocationProfileEnabled);LayoutProfile::Invocation invocationProfileBinding(&invocationProfile);
+ auto publishInvocationProfile=llvm::make_scope_exit([&]{if(invocationProfileEnabled)writeFile(out,"layout-profile.json",invocationProfile.serialize("success"));});
+ auto domain=readJSON(prepared+"/domains.json"),metadata=readJSON(prepared+"/prepared.json");if(!domain.getAsObject() || !metadata.getAsObject())matrixError("malformed domain JSON");auto &d=*domain.getAsObject(),&meta=*metadata.getAsObject();preparedSchema(d,meta);if(meta.getString("cost_model")!=target->costModelID() || meta.getString("frequency_mode")!=frequency)matrixError("cost model or frequency identity mismatch");if(profile && meta.getString("cost_profile_sha256")!=getSM90CostProfileSHA256(*profile))matrixError("full cost profile identity mismatch");auto m=parseSourceFile<ModuleOp>(prepared+"/input.mlir",&context);if(!m)matrixError("input parse failed");if(auto executionDomain=m->getOperation()->getAttrOfType<StringAttr>("frisk.execution_domain")){if(meta.getString("execution_domain")!=executionDomain.getValue())matrixError("execution domain identity mismatch");}else if(meta.getString("execution_domain"))matrixError("unexpected execution domain metadata");auto claimedPackage=meta.getString("package_digest");if(!claimedPackage)matrixError("missing prepared package digest");std::string package=claimedPackage->str();auto packageMetadata=meta;packageMetadata.erase("package_digest");auto inputBuffer=llvm::MemoryBuffer::getFile(prepared+"/input.mlir");if(!inputBuffer || sha256((*inputBuffer)->getBuffer().str()+jsonText(domain)+jsonText(std::move(packageMetadata)))!=package)matrixError("prepared package integrity mismatch");auto graph=collectLayoutConstraints(*m,*target,LayoutCollectionMode::RelationsOnly);if(failed(graph))matrixError("relation reconstruction failed");restore(*graph,d,context);if(disableCostQueryCache)graph->setCostQueryCacheOptions(false,0);auto proofs=readProofs(d,meta,context);if(jsonText(domainJSON(*graph,proofs))!=jsonText(domain))matrixError("serialized graph/domain mismatch");
+ const std::string preparedCostModel=target->costModelID().str();
+ const std::string preparedProfileSHA=profile?getSM90CostProfileSHA256(*profile):"";
+ if(!networkObjectiveOverride.empty()) {
+   if(!profile || !profile->networkProxy || assignment.empty() || archiveCapacity)matrixError("network objective override requires a fixed-assignment replay of the explicit network proxy");
+   profile->networkObjective=networkObjectiveOverride=="min-work"?shuffle_network::Objective::MinWork:shuffle_network::Objective::MinShuffle;
+   target=createSM90LayoutTarget(LayoutBoundaryFrequencyMode::Legacy,*profile);
+ }
+ std::unique_ptr<LayoutTarget> minWorkVariantTarget;
+ if(networkArchiveV2) {
+   if(archiveCapacity!=4 || !profile || !profile->networkProxy || profile->networkObjective!=shuffle_network::Objective::MinShuffle || !assignment.empty())matrixError("network archive v2 requires K4 auto search with the explicit network proxy");
+   auto alternate=*profile;alternate.networkObjective=shuffle_network::Objective::MinWork;
+   minWorkVariantTarget=createSM90LayoutTarget(LayoutBoundaryFrequencyMode::Legacy,alternate);
+ }
+ const auto retention=archiveRetention=="calibrated-source-grammar-v1"?ArchiveRetentionPolicy::CalibratedSourceGrammarV1:archiveRetention=="paid-feature-frontier-v1"?ArchiveRetentionPolicy::PaidFeatureFrontierV1:archiveRetention=="paid-static-feature-frontier-v1"?ArchiveRetentionPolicy::PaidStaticFeaturesV1:ArchiveRetentionPolicy::LegacyHammingV2;
+ if(auditPaidObservations && !archiveCapacity)matrixError("paid observation audit requires an archive search");
+ if(archiveRetentionSet && (!archiveCapacity || (retention!=ArchiveRetentionPolicy::LegacyHammingV2 && archiveCapacity!=4)))matrixError("archive-retention requires archive search; paid feature retention requires K4");
+ const std::string effectiveNetworkObjective=profile && profile->networkObjective==shuffle_network::Objective::MinWork?"min-work":"min-shfl";
+ SolverOptions options;options.memoizeCosts=!disableCostQueryCache;options.seedBeamSolution=seedBeam;options.policy.scope.informedLocal=selection=="LI";options.policy.conversion=conversion=="C"?ConversionPolicy::Independent:ConversionPolicy::Full;for(auto &id:*meta.getArray("producers"))options.policy.scope.producers.push_back(*id.getAsInteger());for(auto &id:*meta.getArray("producer_instructions"))options.policy.scope.producerInstructions.push_back(*id.getAsInteger());
  if(!replay.empty()){if(replay!="independent" && replay!="shared" && replay!="remat" && replay!="post")matrixError("invalid replay");options.policy.conversion=replay=="independent"?ConversionPolicy::Independent:replay=="shared"?ConversionPolicy::SharedOnly:ConversionPolicy::Full;}
- if(selection=="LI" && assignment.empty()) {
+ if(archiveCapacity && ((selection!="J" && selection!="LI") || !assignment.empty() || !replay.empty() || !forcedProducer.empty() || oracle || conversion!="C"))matrixError("candidate archive requires independent LI/J without replay, forced assignment or oracle");
+  if(selection=="LI" && assignment.empty()) {
     auto localPolicy=options.policy;localPolicy.scope.fullGraph=false;
     auto unsupported=experimentPolicyUnsupportedReason(*graph,localPolicy);
     if(!unsupported.empty())matrixStop("unsupported",unsupported,false);
   }
-  auto preSolveText=moduleText(*m);auto common=*graph;if(enumerateOracle(common,proofs,*target,{0,0,0},options.policy).fatal)matrixError("frozen proof integrity failed");SharedSearchBudget budget;options.sharedBudget=&budget;llvm::json::Object record;FailureOr<LayoutSolution> solution=failure();
+  auto preSolveText=moduleText(*m);auto common=*graph;if(enumerateOracle(common,proofs,*target,{0,0,0},options.policy).fatal)matrixError("frozen proof integrity failed");SharedSearchBudget budget;options.sharedBudget=&budget;llvm::json::Object record;
+  failureSearchBudget=&budget;failureSearchRecord=&record;failureSearchPerformed=assignment.empty();
+  record["prepared_digest"]=package;record["common_domain_digest"]=proofs.commonDigest;
+  if(profile && profile->networkProxy){
+    auto baseAuto=*profile;baseAuto.networkObjective=shuffle_network::Objective::MinShuffle;
+    record["prepared_cost_model"]=preparedCostModel;record["prepared_cost_profile_sha256"]=preparedProfileSHA;
+    record["network_objective"]=effectiveNetworkObjective;record["cost_semantics"]=target->costCoverage().str();
+    record["static_base_model_id"]=getSM90CalibratedCostModelID(baseAuto,LayoutBoundaryFrequencyMode::Legacy);
+    record["static_base_profile_sha256"]=getSM90CostProfileSHA256(baseAuto);
+    record["static_effective_model_id"]=target->costModelID().str();record["static_effective_profile_sha256"]=getSM90CostProfileSHA256(*profile);
+    record["common_static_contract"]=networkStaticContractJSON(*profile,frequency);
+  }
+  record["cost_model"]=target->costModelID();record["selection"]=selection;
+  record["seed_beam_solution"]=seedBeam;
+  record["conversion_policy"]=options.policy.conversion==ConversionPolicy::Independent?"independent":options.policy.conversion==ConversionPolicy::SharedOnly?"shared-only":"full";
+  if(profile)record["cost_profile_sha256"]=getSM90CostProfileSHA256(*profile);
+  FailureOr<LayoutSolution> solution=failure();
  if(!forcedProducer.empty()) {
    if(!assignment.empty() || (forcedProducer!="A" && forcedProducer!="B") ||
       meta.getString("candidate_preparation")!="experimental-A/B-injection" || options.policy.scope.producers.size()!=1)
@@ -201,11 +301,76 @@ int matrixMain(int argc,char **argv){
    auto restrictedProofs=projectFrozenProofs(common,*graph,proofs);if(failed(restrictedProofs))matrixError("forced producer proof projection failed");
    record["producer_restriction"]=llvm::json::Object{{"variable",id},{"stable_name",v.stableName},{"ordinal",ordinal},{"label",forcedProducer},{"restricted_domain_digest",restrictedProofs->domainDigest},{"original_package_preserved",true}};
   }
-  record["selection_restricted"]=!forcedProducer.empty();
-  if(assignment.empty()){if(failed(propagateCommonToFixedPoint(*graph))){auto diagnosis=common;LayoutSolveFailure why;auto witness=solveLayoutGraph(diagnosis,*target,options,&why,nullptr,nullptr,true);if(succeeded(witness))matrixError("propagation contradicts a legal full witness");documentedFailure(why);}solution=solveAblation(*graph,*target,selection!="J"?SelectionMode::ProducerFirst:SelectionMode::Joint,options,record);}else{auto input=readJSON(assignment);if(!input.getAsObject())matrixError("malformed assignment JSON");auto &o=*input.getAsObject();assignmentSchema(o,common);if(!o.getArray("assignment") || !o.getArray("instruction_bindings") || !o.getArray("reduction_bindings"))matrixError("missing complete assignment bindings");if(replay.empty() && o.getString("conversion_policy")!=(conversion=="C"?"independent":"full"))matrixError("cross-policy assignment rejected");llvm::json::Object originalComplete{{"assignment",llvm::json::Array(*o.getArray("assignment"))},{"instruction_bindings",llvm::json::Array(*o.getArray("instruction_bindings"))},{"reduction_bindings",llvm::json::Array(*o.getArray("reduction_bindings"))}};if(o.getString("complete_assignment_sha256")!=sha256(jsonText(std::move(originalComplete))))matrixError("assignment identity mismatch");if(o.getString("prepared_digest")!=package)matrixError("assignment domain mismatch");LayoutSolution s;s.policy=options.policy;for(auto &j:*o.getArray("assignment")){auto &v=*j.getAsObject();s.assignments[*v.getInteger("variable")]=candidate(context,*v.getObject("candidate"));}auto scored=scoreAssignment(common,CandidateAssignment{s.assignments},*target,s.policy);if(failed(scored))matrixError("assignment scoring failed");s.cost=scored->cost;s.conversions=std::move(scored->conversions);for(auto &j:*o.getArray("instruction_bindings")){auto &v=*j.getAsObject();s.instructionBindings[*v.getInteger("constraint")]=parseJSONAttribute(context,v,"binding");}for(auto &j:*o.getArray("reduction_bindings")){auto &v=*j.getAsObject();s.reductionBindings[*v.getInteger("constraint")]=parseJSONAttribute(context,v,"binding");}solution=s;}
+  record["seed_beam_solution"]=seedBeam;
+record["selection_restricted"]=!forcedProducer.empty();
+  SmallVector<ArchivedLayoutCandidate,0> archivedCandidates;
+  if(archiveCapacity){if(failed(propagateCommonToFixedPoint(*graph))){auto diagnosis=common;LayoutSolveFailure why;auto witness=solveLayoutGraph(diagnosis,*target,options,&why,nullptr,nullptr,true);if(succeeded(witness))matrixError("propagation contradicts a legal archive witness");documentedFailure(why);}solution=solveCandidateArchive(*graph,*target,selection=="J"?SelectionMode::Joint:SelectionMode::ProducerFirst,options,archiveCapacity,archivedCandidates,record,minWorkVariantTarget.get(),retention,auditPaidObservations,*m);}
+  else if(assignment.empty()){if(failed(propagateCommonToFixedPoint(*graph))){auto diagnosis=common;LayoutSolveFailure why;auto witness=solveLayoutGraph(diagnosis,*target,options,&why,nullptr,nullptr,true);if(succeeded(witness))matrixError("propagation contradicts a legal full witness");documentedFailure(why);}solution=solveAblation(*graph,*target,selection!="J"?SelectionMode::ProducerFirst:SelectionMode::Joint,options,record);}else{auto input=readJSON(assignment);if(!input.getAsObject())matrixError("malformed assignment JSON");auto &o=*input.getAsObject();if(auto objective=o.getString("network_objective");objective && *objective!=effectiveNetworkObjective)matrixError("assignment network objective differs from explicit replay target");assignmentSchema(o,common);if(!o.getArray("assignment") || !o.getArray("instruction_bindings") || !o.getArray("reduction_bindings"))matrixError("missing complete assignment bindings");if(replay.empty() && o.getString("conversion_policy")!=(conversion=="C"?"independent":"full"))matrixError("cross-policy assignment rejected");llvm::json::Object originalComplete{{"assignment",llvm::json::Array(*o.getArray("assignment"))},{"instruction_bindings",llvm::json::Array(*o.getArray("instruction_bindings"))},{"reduction_bindings",llvm::json::Array(*o.getArray("reduction_bindings"))}};if(o.getString("complete_assignment_sha256")!=sha256(jsonText(std::move(originalComplete))))matrixError("assignment identity mismatch");if(o.getString("prepared_digest")!=package)matrixError("assignment domain mismatch");if(o.getString("network_objective")) {if(o.getString("cost_model")!=target->costModelID())matrixError("assignment effective cost model mismatch");llvm::json::Object programIdentity{{"complete_assignment_sha256",o.getString("complete_assignment_sha256")->str()},{"network_objective",effectiveNetworkObjective},{"cost_model",target->costModelID().str()}};if(o.getString("complete_program_sha256")!=sha256(jsonText(std::move(programIdentity))))matrixError("assignment program identity mismatch");}LayoutSolution s;s.policy=options.policy;for(auto &j:*o.getArray("assignment")){auto &v=*j.getAsObject();s.assignments[*v.getInteger("variable")]=candidate(context,*v.getObject("candidate"));}auto support=target->verifyExecutionSupport(common,CandidateAssignment{s.assignments});
+  if(support.status!=ProofStatus::Proven)matrixStop(support.status==ProofStatus::Unknown?"unsupported":"no-feasible","assignment replay outside declared execution domain: "+support.reason,false);
+  auto scored=scoreAssignment(common,CandidateAssignment{s.assignments},*target,s.policy);if(failed(scored))matrixError("assignment scoring failed");s.cost=scored->cost;s.conversions=std::move(scored->conversions);for(auto &j:*o.getArray("instruction_bindings")){auto &v=*j.getAsObject();s.instructionBindings[*v.getInteger("constraint")]=parseJSONAttribute(context,v,"binding");}for(auto &j:*o.getArray("reduction_bindings")){auto &v=*j.getAsObject();s.reductionBindings[*v.getInteger("constraint")]=parseJSONAttribute(context,v,"binding");}solution=s;}
  if(failed(solution)){auto kind=record.getString("failure_kind");if(kind && *kind!="fatal-integrity")matrixStop(kind->str(),record.getString("failure").value_or("documented search outcome").str(),false);matrixError(record.getString("failure").value_or("unclassified solver failure").str());}if(failed(verifySolvedLayoutGraph(common,*solution,*target,m->getLoc(),options.policy.conversion)))matrixError("solution verification failed");
- if(profile){record["cost_profile_sha256"]=getSM90CostProfileSHA256(*profile);record["cost_profile"]=costProfileJSON(*profile);}
-  record["prepared_digest"]=package;record["common_domain_digest"]=proofs.commonDigest;record["assignment"]=assignmentJSON(common,solution->assignments);record["instruction_bindings"]=bindingJSON(solution->instructionBindings);record["reduction_bindings"]=bindingJSON(solution->reductionBindings);llvm::json::Object complete{{"assignment",llvm::json::Array(*record.getArray("assignment"))},{"instruction_bindings",llvm::json::Array(*record.getArray("instruction_bindings"))},{"reduction_bindings",llvm::json::Array(*record.getArray("reduction_bindings"))}};record["complete_assignment_sha256"]=sha256(jsonText(std::move(complete)));record["conversion_policy"]=options.policy.conversion==ConversionPolicy::Independent?"independent":options.policy.conversion==ConversionPolicy::SharedOnly?"shared-only":"full";record["selection"]=selection;record["selection_bypassed"]=!assignment.empty();record["cost"]=layoutCostJSON(solution->cost);record["conversions"]=conversionsJSON(common,solution->conversions);auto scored=scoreAssignment(common,CandidateAssignment{solution->assignments},*target,options.policy);if(failed(scored))matrixError("score failed");record["cost_contributions"]=std::move(scored->contributions);
+ if(archiveCapacity){
+    llvm::json::Array entries;unsigned index=0;
+    for(const auto &candidate:archivedCandidates){
+      const auto &x=candidate.solution;
+      llvm::json::Object entry{{"index",index++},{"assignment",assignmentJSON(common,x.assignments)},
+        {"instruction_bindings",bindingJSON(x.instructionBindings)},{"reduction_bindings",bindingJSON(x.reductionBindings)},
+        {"cost",layoutCostJSON(x.cost)},{"prepared_digest",package},{"conversion_policy","independent"},
+        {"local_incumbent",candidate.localIncumbent},{"joint_incumbent",candidate.jointIncumbent},
+        {"probes_at_observation",candidate.probesAtObservation},{"refinement_at_observation",candidate.refinementAtObservation},
+        {"certificate_verified",true}};
+       if(record.getObject("candidate_archive_search")->getString("version")=="shared-network-candidate-archive-v3" || record.getObject("candidate_archive_search")->getString("version")=="shared-complete-candidate-archive-v2"){entry["retention_reason"]=candidate.retentionReason;entry["retention_structure"]=llvm::json::Object(candidate.retentionStructure);}
+      if(networkArchiveV2) {
+        entry["network_objective"]=candidate.networkObjective;entry["network_variant"]=candidate.networkVariant;
+        entry["cost_model"]=candidate.networkVariant?minWorkVariantTarget->costModelID().str():target->costModelID().str();
+        auto effective=*profile;effective.networkObjective=candidate.networkVariant?shuffle_network::Objective::MinWork:shuffle_network::Objective::MinShuffle;
+        auto baseAuto=*profile;baseAuto.networkObjective=shuffle_network::Objective::MinShuffle;
+        entry["cost_profile"]=costProfileJSON(effective);entry["cost_profile_sha256"]=getSM90CostProfileSHA256(effective);
+        entry["static_base_model_id"]=getSM90CalibratedCostModelID(baseAuto,LayoutBoundaryFrequencyMode::Legacy);
+        entry["static_base_profile_sha256"]=getSM90CostProfileSHA256(baseAuto);
+        entry["static_effective_model_id"]=entry.getString("cost_model")->str();
+        entry["static_effective_profile_sha256"]=getSM90CostProfileSHA256(effective);
+        entry["common_static_contract"]=networkStaticContractJSON(effective,frequency);
+      }
+      llvm::json::Array origins;for(const auto &origin:candidate.origins)origins.push_back(origin);entry["origins"]=std::move(origins);
+      llvm::json::Object identity{{"assignment",llvm::json::Array(*entry.getArray("assignment"))},{"instruction_bindings",llvm::json::Array(*entry.getArray("instruction_bindings"))},{"reduction_bindings",llvm::json::Array(*entry.getArray("reduction_bindings"))}};
+      entry["complete_assignment_sha256"]=sha256(jsonText(std::move(identity)));
+      if(networkArchiveV2)entry["complete_program_sha256"]=sha256(jsonText(llvm::json::Object{{"complete_assignment_sha256",entry.getString("complete_assignment_sha256")->str()},{"network_objective",candidate.networkObjective},{"cost_model",entry.getString("cost_model")->str()}}));
+      entries.push_back(std::move(entry));
+    }
+    llvm::json::Object archive{{"schema_version",1},{"version",record.getObject("candidate_archive_search")->getString("version")->str()},{"prepared_digest",package},{"cost_model",target->costModelID()},
+      {"capacity",archiveCapacity},{"entries",std::move(entries)},{"search",llvm::json::Object(*record.getObject("candidate_archive_search"))},
+      {"export_contract","each entry is a complete --assignment replay; replay only reconstructs/verifies/materializes and performs no solve"}};
+    writeFile(out,"candidate-archive.json",jsonText(std::move(archive)));
+    record["candidate_archive_file"]="candidate-archive.json";
+  }
+  if(demandLedger){auto ledger=analyzeLayoutDemand(common,CandidateAssignment{solution->assignments},{},65536,true,profile?profile->networkObjective:shuffle_network::Objective::MinShuffle);if(options.policy.conversion!=ConversionPolicy::Independent){ledger.exact=false;ledger.reason="independent conversion required";}record["demand_coverage"]=layoutDemandJSON(ledger);if(profile && profile->survivingDemand){auto surviving=analyzeLayoutSurvivingDemand(common,CandidateAssignment{solution->assignments},{},65536,profile->networkObjective);if(options.policy.conversion!=ConversionPolicy::Independent){surviving.proven=false;surviving.reason="independent conversion required";}record["surviving_coverage"]=layoutSurvivingDemandJSON(surviving);}}
+  if(profile){record["cost_profile_sha256"]=getSM90CostProfileSHA256(*profile);record["cost_profile"]=costProfileJSON(*profile);}
+    record["budget_contract"]=llvm::json::Object{
+      {"kind","shared-total-search-probes-v1"},
+      {"search_performed",assignment.empty()},
+      {"limit",budget.limit},{"refinement_limit",budget.refinementLimit},
+      {"used",budget.used},{"refinement_used",budget.refinementUsed},
+      {"includes","constraint extensions, complete objective scores and refinement probes; no second seed budget"},
+      {"producer_first_full_transition_charged",selection=="J" || !assignment.empty() ? llvm::json::Value(nullptr) : llvm::json::Value(record.getBoolean("incumbent_full_score_budget_charged").value_or(false))},
+      {"certificate_rescores","selected-certificate verification only, no candidate selection"}};
+  llvm::json::Array searchComponents;
+  for(const auto &component:solution->components)searchComponents.push_back(llvm::json::Object{
+      {"root",component.root},{"used_beam",component.usedBeam},
+      {"expanded",component.expanded},{"mrv_probes",component.mrvProbes},
+      {"refinement_probes",component.refinementProbes},
+      {"seed_probes",component.seedProbes},{"seed_scores",component.seedScores},
+      {"seed_witnesses",component.seedWitnesses},
+      {"has_seed_witness",component.seedWitnesses!=0},
+      {"seed_start_cost",component.seedWitnesses ? llvm::json::Value(layoutCostJSON(component.seedStartCost)) : llvm::json::Value(nullptr)},
+      {"seed_selected_before_refinement",component.seedSelected},
+      {"seed_stop_reason",component.seedStopReason},
+      {"beam_budget_fallback",component.beamBudgetFallback},
+      {"selected_component_cost",layoutCostJSON(component.cost)},
+      {"seed_comparison_scope",selection=="J" ? "full-objective-component" : "returned-stage-component"},
+      {"exhaustive",component.exhaustive}});
+  record["search_components"]=std::move(searchComponents);
+  record["prepared_digest"]=package;record["common_domain_digest"]=proofs.commonDigest;record["assignment"]=assignmentJSON(common,solution->assignments);record["instruction_bindings"]=bindingJSON(solution->instructionBindings);record["reduction_bindings"]=bindingJSON(solution->reductionBindings);llvm::json::Object complete{{"assignment",llvm::json::Array(*record.getArray("assignment"))},{"instruction_bindings",llvm::json::Array(*record.getArray("instruction_bindings"))},{"reduction_bindings",llvm::json::Array(*record.getArray("reduction_bindings"))}};record["complete_assignment_sha256"]=sha256(jsonText(std::move(complete)));if(profile && profile->networkProxy)record["complete_program_sha256"]=sha256(jsonText(llvm::json::Object{{"complete_assignment_sha256",record.getString("complete_assignment_sha256")->str()},{"network_objective",effectiveNetworkObjective},{"cost_model",target->costModelID().str()}}));record["conversion_policy"]=options.policy.conversion==ConversionPolicy::Independent?"independent":options.policy.conversion==ConversionPolicy::SharedOnly?"shared-only":"full";record["selection"]=selection;record["selection_bypassed"]=!assignment.empty();record["cost"]=layoutCostJSON(solution->cost);record["conversions"]=conversionsJSON(common,solution->conversions);auto scored=scoreAssignment(common,CandidateAssignment{solution->assignments},*target,options.policy);if(failed(scored))matrixError("score failed");record["cost_contributions"]=std::move(scored->contributions);
  if(oracle){
  auto result=enumerateOracle(common,proofs,*target,{},options.policy);record["oracle"]=result.toJSON();if(result.fatal)matrixError(result.reason);
  auto comparison=[&](const CostEstimate &a,const CostEstimate &b){auto x=layoutCostJSON(a),y=layoutCostJSON(b);auto *xs=x.getArray("cost"),*ys=y.getArray("cost");llvm::json::Object answer{{"status","equal"}};for(unsigned i=0;i<xs->size();++i)if((*xs)[i]!=(*ys)[i]){answer["status"]="different";answer["first_component"]=i;answer["selected"]=llvm::json::Value((*xs)[i]);answer["oracle"]=llvm::json::Value((*ys)[i]);break;}return answer;};
@@ -217,8 +382,9 @@ int matrixMain(int argc,char **argv){
  }else if(result.best){auto c=comparison(solution->cost,result.best->cost);c["reference_kind"]="global";c["reference_status"]=result.status=="complete" && result.exhausted?"complete-optimum":"best-so-far-incumbent";record["full_cost_oracle_comparison"]=std::move(c);}
 }
  bool post=replay.empty()?conversion=="O":replay=="post";record["post_opt"]=post;record["cost_model"]=target->costModelID();record["frequency_mode"]=frequency;record["scope"]=selection=="LI"?"informed-producer-first-then-full":selection=="L"?"producer-first-then-full":"full";record["failure_kind"]="";
- if(moduleText(*m)!=preSolveText)matrixError("selection mutated input IR");record["selection_preserved_input_ir"]=true;SmallVector<std::string> expectedContracts;for(const auto &entry:solution->instructionBindings){std::string text;llvm::raw_string_ostream(text)<<entry.second;expectedContracts.push_back(text);}llvm::sort(expectedContracts);writeFile(out,"record.json",jsonText(llvm::json::Object(record)));writeFile(out,"prepared.mlir",moduleText(*m));
+ if(moduleText(*m)!=preSolveText)matrixError("selection mutated input IR");record["selection_preserved_input_ir"]=true;SmallVector<std::string> expectedContracts;for(const auto &entry:solution->instructionBindings){std::string text;llvm::raw_string_ostream(text)<<entry.second;expectedContracts.push_back(text);}llvm::sort(expectedContracts);writeFile(out,"record.json",jsonText(llvm::json::Object(record)));writeFile(out,"prepared.mlir",moduleText(*m));if(demandLedger)markDemandLineage(common);
  if(failed(materializeLayouts(*m,common,*solution,true,target.get(),options.policy.conversion))||failed(preserveStorageContracts(*m))||failed(verify(*m))||failed(verifyMaterializedLayouts(*m,*target)))matrixError("materialization verification failed");SmallVector<std::string> actualContracts;m->walk([&](Operation *op){if(auto a=op->getAttr("frisk.mma_contract")){std::string t;llvm::raw_string_ostream(t)<<a;actualContracts.push_back(t);}if(auto a=op->getAttr("frisk.copy_contract")){std::string t;llvm::raw_string_ostream(t)<<a;actualContracts.push_back(t);}});llvm::sort(actualContracts);if(actualContracts!=expectedContracts)matrixError("materialized contracts differ from pinned assignment");record["instruction_contracts_verified"]=true;writeFile(out,"materialized.mlir",moduleText(*m));record["materialized_diagnostics"]=llvm::json::Object{{"arithmetic",collectLayoutIRArithmetic(*m)},{"resources",collectLayoutIRResources(*m)}};if(post){PassManager pm(&context);pm.addPass(createOptimizeLayoutConversionsPass(LayoutBoundaryFrequencyMode::Legacy,profile?&*profile:nullptr));if(failed(pm.run(*m)))matrixError("post optimization failed");}
- if(failed(verify(*m))||failed(verifyMaterializedLayouts(*m,*target)))matrixError("post verification failed");record["output_diagnostics"]=llvm::json::Object{{"arithmetic",collectLayoutIRArithmetic(*m)},{"resources",collectLayoutIRResources(*m)}};auto text=moduleText(*m);writeFile(out,"output.mlir",text);auto reparsed=parseSourceString<ModuleOp>(text,&context);if(!reparsed || failed(verify(*reparsed))||failed(verifyMaterializedLayouts(*reparsed,*target)))matrixError("reparse verification failed");writeFile(out,"reparsed.mlir",moduleText(*reparsed));
- PassManager pm(&context);auto pass=createExportExecutionPass();if(failed(pass->initializeOptions("output="+out+"/execution.json",[](const Twine &){return failure();})))matrixError("export options");pm.addPass(std::move(pass));if(failed(pm.run(*m)))matrixStop("backend-unsupported","backend unsupported",false);record["status"]="success";writeFile(out,"record.json",jsonText(std::move(record)));return 0;
+ if(demandLedger && failed(resolveDemandLineage(*m)))matrixError("execution demand operand lineage arity changed");
+  if(failed(verify(*m))||failed(verifyMaterializedLayouts(*m,*target)))matrixError("post verification failed");record["output_diagnostics"]=llvm::json::Object{{"arithmetic",collectLayoutIRArithmetic(*m)},{"resources",collectLayoutIRResources(*m)}};auto text=moduleText(*m);writeFile(out,"output.mlir",text);auto reparsed=parseSourceString<ModuleOp>(text,&context);if(!reparsed || failed(verify(*reparsed))||failed(verifyMaterializedLayouts(*reparsed,*target)))matrixError("reparse verification failed");writeFile(out,"reparsed.mlir",moduleText(*reparsed));
+ PassManager pm(&context);auto pass=createExportExecutionPass();std::string exportOptions="output="+out+"/execution.json";if(minifyExecutionJSON)exportOptions+=" minify=true";exportOptions+=" network-objective="+effectiveNetworkObjective;if(failed(pass->initializeOptions(exportOptions,[](const Twine &){return failure();})))matrixError("export options");pm.addPass(std::move(pass));if(failed(pm.run(*m)))matrixStop("backend-unsupported","backend unsupported",false);record["status"]="success";writeFile(out,"record.json",jsonText(std::move(record)));return 0;
  }

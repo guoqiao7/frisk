@@ -8,7 +8,8 @@
 namespace mlir::frisk {
 struct SM90CostProfile;
 
-std::unique_ptr<LayoutTarget> createSM90LayoutTarget(LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy);
+std::unique_ptr<LayoutTarget> createSM90LayoutTarget(LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy,
+    bool nativeVector = false);
 
 std::unique_ptr<LayoutTarget> createSM90LayoutTarget(
     LayoutBoundaryFrequencyMode mode, const SM90CostProfile &profile);

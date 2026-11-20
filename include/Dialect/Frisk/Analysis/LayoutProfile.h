@@ -11,10 +11,11 @@ enum class LayoutProfileKind {
   AddressEnumeration, ExecutionEnumeration, AccessCost,
   ConversionClassification, ConversionChoice, InstructionSupport,
   InstructionContract, RelationQuery, RelationCache, AliasPairCache,
-  FootprintCache, Count
+  FootprintCache, AccessCostCache, StaticCostValidationCache,
+  StaticCostValidation, DemandFootprintCache, Count
 };
 struct LayoutProfileMetric {
-  uint64_t count = 0, inclusiveNS = 0, hits = 0, misses = 0, entries = 0;
+  uint64_t count = 0, inclusiveNS = 0, hits = 0, misses = 0, entries = 0, peakEntries = 0;
 };
 /// Invocation-local observation only: no IR references, query data, or caches.
 /// Times are inclusive and overlap (e.g. access cost includes enumeration and
@@ -59,6 +60,7 @@ public:
   };
   static void cacheLookup(LayoutProfileKind kind, bool hit);
   static void cacheInsertion(LayoutProfileKind kind);
+  static void cacheSize(LayoutProfileKind kind, uint64_t size);
 private:
   bool isEnabled;
   std::array<LayoutProfileMetric, static_cast<size_t>(LayoutProfileKind::Count)> metrics{};

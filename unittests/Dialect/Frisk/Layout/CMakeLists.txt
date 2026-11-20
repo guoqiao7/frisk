@@ -23,6 +23,8 @@ add_unittest(FriskUnitTests FriskLayoutUnitTests PARTIAL_SOURCES_INTENDED
   LayoutConversionChoiceTest.cpp
   LayoutCandidateSolverTest.cpp
   LayoutCostModelTest.cpp
+  LayoutDemandTest.cpp
+  ShuffleNetworkTest.cpp
   ReduceConstraintTest.cpp
   ReductionLayoutProofTest.cpp
   GemmConstraintTest.cpp
@@ -36,6 +38,7 @@ add_unittest(FriskUnitTests FriskLayoutUnitTests PARTIAL_SOURCES_INTENDED
   CopyFillConstraintTest.cpp
   AliasRegionTest.cpp
   LayoutAliasAnalysisTest.cpp
+  ContiguousStorageLayoutTest.cpp
   ExecutionLayoutProofTest.cpp
   SymbolicExecutionLayoutTest.cpp
   StorageAliasIntegrationTest.cpp
@@ -95,3 +98,13 @@ target_link_libraries(FriskLayoutUnitTests
   MLIRIR
   MLIRParser
 )
+
+target_compile_definitions(FriskLayoutUnitTests PRIVATE FRISK_DEMAND_MIXED_FIXTURE="${PROJECT_SOURCE_DIR}/test/Transforms/Inputs/demand-mixed-large-register.mlir")
+
+target_compile_definitions(FriskLayoutUnitTests PRIVATE
+  FRISK_DEMAND_ORDER_DFS_FIXTURE="${PROJECT_SOURCE_DIR}/test/Transforms/Inputs/demand-order-mixed-dfs.mlir"
+  FRISK_DEMAND_ORDER_EAGER_FIXTURE="${PROJECT_SOURCE_DIR}/test/Transforms/Inputs/demand-order-mixed-eager.mlir")
+
+target_compile_definitions(FriskLayoutUnitTests PRIVATE FRISK_DEMAND_FINAL_STORE_FIXTURE="${PROJECT_SOURCE_DIR}/test/Transforms/Inputs/demand-final-store-repair.mlir")
+
+target_compile_definitions(FriskLayoutUnitTests PRIVATE FRISK_DEMAND_MMA_FALLBACK_FIXTURE="${PROJECT_SOURCE_DIR}/test/Transforms/mma-auto-layout.mlir")

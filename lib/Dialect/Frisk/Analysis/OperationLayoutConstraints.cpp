@@ -1,3 +1,4 @@
+#include "Dialect/Frisk/Analysis/ExecutionGroups.h"
 #include "Dialect/Frisk/Analysis/OperationLayoutConstraints.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
 #include "llvm/Support/MathExtras.h"
@@ -75,11 +76,11 @@ LogicalResult collectOperationLayoutConstraints(
     if (auto threads = op->getAttrOfType<IntegerAttr>("frisk.execution_threads"))
       binding.threads = threads.getInt();
     if (auto parallel = op->getParentOfType<ParallelOp>()) {
-      if (op->hasAttr("frisk.execution_threads") && binding.threads != parallel.getThreads()) {
+      if (op->hasAttr("frisk.execution_threads") && binding.threads != executionGroupWidth(op, parallel)) {
         op->emitError("execution_threads conflicts with enclosing parallel thread count");
         return WalkResult::interrupt();
       }
-      binding.threads = parallel.getThreads();
+      binding.threads = executionGroupWidth(op, parallel);
     }
     if (auto width = op->getAttrOfType<IntegerAttr>("frisk.vector_bytes"))
       binding.vectorBytes = width.getInt();

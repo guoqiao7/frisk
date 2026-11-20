@@ -13,6 +13,18 @@ LogicalResult collectDistributedLayoutConstraints(
     Operation *root, LayoutConstraintGraph &graph, LayoutConstraintBuilder &builder) {
   DenseMap<Value, bool> visited;
   DenseMap<Operation *, SmallVector<LayoutVarID>> functionResults;
+  // An access can pin its execution layout independently of the distributed
+  // SSA type. In particular a store pins only its own use, allowing other
+  // consumers and the producer to retain independent layouts.
+  auto pinAccess = [&](Operation *op, LayoutVarID var) -> LogicalResult {
+    Attribute attr = op->getAttr("frisk.fixed_access_layout");
+    if (!attr) return success();
+    auto enc = dyn_cast<DistributedEncodingAttr>(attr);
+    if (!enc) return op->emitOpError("expected a distributed fixed access layout");
+    auto type = cast<RankedTensorType>(graph.getVariable(var).shapedType);
+    if (failed(enc.verifyForType(type, op->getLoc()))) return failure();
+    return builder.require(var, enc, op, "fixed-access-layout");
+  };
   auto bind = [&](Value value) -> LogicalResult {
     if (!isa<TensorType>(value.getType()) || !visited.try_emplace(value, true).second)
       return success();
@@ -203,7 +215,9 @@ LogicalResult collectDistributedLayoutConstraints(
         op->emitError("distributed tile access requires a layout_view source");
         return WalkResult::interrupt();
       }
-      (void)builder.storageAccess(builder.getOrCreateDistributedVar(load.getResult()),
+      auto access = builder.getOrCreateDistributedVar(load.getResult());
+      if (failed(pinAccess(load, access))) return WalkResult::interrupt();
+      (void)builder.storageAccess(access,
           builder.getOrCreateStorageVar(load.getSource()), AccessKind::Read, op, "tile-load");
       return WalkResult::advance();
     }
@@ -212,7 +226,9 @@ LogicalResult collectDistributedLayoutConstraints(
         op->emitError("distributed tile access requires a layout_view target");
         return WalkResult::interrupt();
       }
-      (void)builder.storageAccess(builder.getOrCreateDistributedUse(op->getOpOperand(0)),
+      auto access = builder.getOrCreateDistributedUse(op->getOpOperand(0));
+      if (failed(pinAccess(store, access))) return WalkResult::interrupt();
+      (void)builder.storageAccess(access,
           builder.getOrCreateStorageVar(store.getTarget()), AccessKind::Write, op, "tile-store");
       return WalkResult::advance();
     }

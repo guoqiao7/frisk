@@ -155,7 +155,8 @@ public:
         calibratedProfile(other.calibratedProfile) {}
   std::optional<SM90CostProfile> calibratedProfile;
   explicit OptimizeLayoutConversionsPass(LayoutBoundaryFrequencyMode mode,
-                                         const SM90CostProfile *profile) {
+                                         const SM90CostProfile *profile, bool nativeVector) {
+    nativeVectorAccess = nativeVector;
     if (profile) calibratedProfile = *profile;
     boundaryFrequency = mode == LayoutBoundaryFrequencyMode::Legacy ? "legacy" : "static-trip-count";
   }
@@ -173,7 +174,12 @@ public:
       activeCalibration = std::move(*loaded);
     }
     auto mode = boundaryFrequency == "legacy" ? LayoutBoundaryFrequencyMode::Legacy : LayoutBoundaryFrequencyMode::StaticTripCount;
-    auto target = activeCalibration ? createSM90LayoutTarget(mode, *activeCalibration) : createSM90LayoutTarget(mode);
+    if (activeCalibration && nativeVectorAccess) {
+      original.emitError("native-vector-access needs an uncalibrated SM90 target");
+      signalPassFailure();
+      return;
+    }
+    auto target = activeCalibration ? createSM90LayoutTarget(mode, *activeCalibration) : createSM90LayoutTarget(mode, nativeVectorAccess);
     if (failed(verifyMaterializedLayouts(original, *target))) {
       signalPassFailure(); return;
     }
@@ -212,8 +218,8 @@ public:
 };
 }
 std::unique_ptr<Pass> createOptimizeLayoutConversionsPass(LayoutBoundaryFrequencyMode mode,
-                                                             const SM90CostProfile *profile) {
-  return std::make_unique<OptimizeLayoutConversionsPass>(mode, profile);
+                                                             const SM90CostProfile *profile, bool nativeVector) {
+  return std::make_unique<OptimizeLayoutConversionsPass>(mode, profile, nativeVector);
 }
 std::unique_ptr<Pass> createOptimizeLayoutConversionsPass() {
   return std::make_unique<OptimizeLayoutConversionsPass>();

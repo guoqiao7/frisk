@@ -8,8 +8,9 @@ class LayoutTrace;
 const InstructionLayoutTuple *findInstructionSupport(
     const LayoutConstraintGraph &graph, const LayoutConstraint &constraint,
     const DenseMap<LayoutVarID, Attribute> &partialAssignment);
-LogicalResult prepareInstructionTuples(LayoutConstraintGraph &graph,
-                                       LayoutTarget &target, Location loc,
-                                       LayoutTrace *trace = nullptr);
+LogicalResult prepareInstructionTuples(
+    LayoutConstraintGraph &graph, LayoutTarget &target, Location loc,
+    LayoutTrace *trace = nullptr,
+    const CertifiedInstructionDomains *certified = nullptr);
 } // namespace mlir::frisk
 #endif

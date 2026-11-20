@@ -1,3 +1,58 @@
+> 阶段更新（2026-11-05）：冻结源码摘要`7cf13ffa82ef`的新网络后端已完成本轮实现、执行回归、选择质量与完整费用复验。新6组的regret门槛及21组相对legacy退化保护通过；至少3%的性能晋升条件未通过，默认继续使用legacy。
+> 当前范围、原始证据与限制见[本轮完整报告](inference_detail/network_selection_execution_report.md)。后文按时间保留历史记录，其中“当前”以对应阶段日期为准。
+
+## 2026-11-05：新网络后端验收
+
+- 正式比较固定C转换模式、128线程、单CTA：183候选完成数值与安全门禁，三Attention ABI在回归范围内。独立tile多CTA另覆盖grid=1/2/257；不包含长序列KV循环或跨CTA通信。
+- 新留出GM regret上界1.013448、最坏上界1.044640；21组退化保护通过。J/legacy时间比0.998293，95%区间[0.994599,1.003304]，尚无预登记3%收益。已有回归和新留出分别报告。
+- 首次／热缓存prepare+validate实际15386.618／10748.236秒，缩短约30.1%，包含严格安全证明复用与额外核验。热搜索仍重跑，完整热准备本身更长；缓存收益与验证费用分项保存。
+- native14仍有75个unsupported候选及已观察排序缺口；LOCAL额外选择效应未由该矩阵识别。已有GF(2)访存轴的非冗余证据已登记，不等同于新性能增益。
+- 本阶段已完成所选支持域验收；Triton/TileLang同算法、ABI、精度与调优预算的外部比较尚未开展。新版本保留legacy基线与实验策略，所有失败／中止及原始计时保留。
+
+---
+
+> 阶段更新（2026-11-03）：存活需求 v6、通信边际费用和 native/GF(2) 联合评分已实现，并完成六个新性能留出复验。整体选择质量未通过，默认仍为 legacy，尚不进入 Triton/TileLang 外部公平对比冻结。
+> 六来源候选池的 kernel 平均收益与额外搜索/编译开销已分别记录；conflict 的 LOCAL 未覆盖触发整池回退是当前必要修复。
+> 详见[本阶段完整实现与验收报告](inference_detail/native_cost_repair_report.md)。以下保留之前版本的原始记录。
+
+## 2026-11-03：需求覆盖与同预算搜索复验（整体未通过）
+
+本轮执行覆盖与预算内搜索修复已经实现并复验：114配置、16002数值/保护记录、144次实际sanitizer全部通过；36次受控Oracle和预算核对通过。原始计时150个配对批次/1800事件，无无效或替换批次。
+
+整体模型及选择质量仍未通过：组合主时间比0.940789，但exp32×32退化44.9%；固定新搜索时，新成本模型反慢6.38%。自然域regret和单例保护失败，默认保持legacy-v2，不进入公平对比版本冻结。收益主要来自搜索修复，不能称新模型已经取得性能优势。新模型CPU solve合计约为legacy的9.25倍，仍需优化。
+
+完整报告：`guoqiao/inference_detail/demand_cost_search_repair_report.md`；证据与保留的CPU失败历史在`guoqiao/optimize_plan/demand_cost_search_repair_artifacts/`。新性能标签只在冻结后的R4读取，没有调权或换case；以下原文逐字节保留，作为历史状态。
+
+---
+
+## 2026-11-02：模型及选择质量验收完成，整体资格未通过
+
+84/84配置通过严格GPU闭环；11508条普通数值/保护/stream/graph/ABI记录、136真实sanitizer进程、50配置安全精确复用通过。15组/34组内执行镜像完成150配对批次、1700event，24受控精确oracle通过；恢复前29配置与首轮47重叠包保持。
+
+calibrated-J在六个新自然程序相对legacy-J的几何平均时间比1.279 [95%CI 1.261,1.289]，晋升失败，默认保留legacy。legacy-J相对充分知情LI在该自然已选镜像并集快1.362×，但受控diamond两种J最差regret1.1126、未过1.10门槛；保留默认不代表已全面合格。Attention三层四臂同镜像，无独立J收益。
+
+已证明两类缺口：mixed成本计价覆盖4192而真实demand逻辑warp-value覆盖128（32.75×，不是时延比）；六个自然calJ模型成本均高于合法LI赋值。后者在GPU上多数仍比calLI快，必须先对齐执行覆盖/排序，再做同预算incumbent保底与新留出验收。当前不进入跨框架版本冻结。
+
+详见[本阶段报告](inference_detail/model_selection_quality_report.md)；旧内容完整保留于下方。
+
+---
+
+## 2026-11-02：支持域与当前GPU闭环完成
+
+当前GF(2)/legacy-v2/calibrated-v3版本的11自然程序/形状/ABI×2模型全部22配置完成推断→紧凑/普通导出→native→GPU闭环；3654数值/保护/stream/graph/ABI记录通过，60真实sanitizer进程与7精确安全复用。四个calibrated大图Eall导出缺口已用符号Register计划和同线程需求驱动标量化解决，保持selected布局与原形状。
+
+支持域分五层登记，GPU已验证范围是SM90a单CTA128线程、四根f16/f32/固定行主序与分层ABI；保留更广shape/控制流/多CTA/非dyadic等边界。资源实测不当作时延收益，无GPU性能比较或静态GPR预测达标声明。详细支持矩阵、数值/安全/身份与失败记录见[本阶段报告](inference_detail/current_gpu_closure_report.md)。下一阶段仍为模型/选择质量资格与公平框架，未自动开展或提交。
+
+## 2026-11-01：GF(2) 符号化成本覆盖修复
+
+原五个自然候选域 cost-failure 已通过商空间读计数、最小 first_owner 截面与正交补转换证明修复；保留原形状、候选域和搜索预算。正式 64 CLI 对照中，新版 32 次均成功，五原失败配置的缓存开/关 10 次均 committed；其余 11 配置的 IR、成本和搜索行为保持一致。
+
+成本语义版本为 legacy/static-v2、calibrated-v3；冻结 v2 系数文件格式与 SHA 保持不变。访问逻辑 footprint 65536、非 dyadic fallback 及其他执行/证明上限仍明确保留。本轮不形成 GPU 性能结论。完整数学依据、验证与源码桥接见[本阶段报告](inference_detail/symbolic_access_cost_repair_report.md)。
+
+> 2026-11-01 搜索开销优化更新：实现状态：raw StorageAccess与静态(type,attribute)成功验证复用已接入正常求解；支持memoize-costs=false并保持目标、域和probe计数。
+> 已先提交旧修改为`9f79155`，本阶段新代码留供复核。613主单测、45选择质量、CTest10/10、14驱动测试通过；438 CLI（408成功+30预期失败）及90主配对完整验收，IR/non-timing stats/trace与预算/目标保持一致。free/weak Attention CLI中位数13.221→1.751s、7.394→1.416s，配对7.559×/5.221×；9成功用例均提升。3小图进程RSS峰增加约2.48–3.07MiB，4原大shape+v2diamond仍为cost-failure/N/A，未删样本或改预算。
+> [统一报告](inference_detail/search_overhead_optimization_report.md)；证据为`guoqiao/optimize_plan/search_overhead_optimization_artifacts/evidence-index.json`。旧24Attention开发观测及失败run不混正式统计；下方原文逐字节保留。
+
 > 2026-10-31 资源预测修复更新：实现状态：正常cost_calibration编译/执行和默认资源分析已接入；Shared planner与emitter共用，physical反馈绑定实际cubin/tool/entry/loaded image。
 > Shared按实际root、对齐、串行max scratch和TMA barrier作编译前结构预测：known42+prospective24全部0B误差；寄存器撤下未验证SSA点模型，PTX仅typed虚拟压力，精确数量由编译器与loaded driver交叉确认66/66。纯静态物理寄存器点预测coverage0/24、MAE=None、not-qualified，不能称预测0误差。136项兼容Python回归、额外backend6/export3、CTest10/10通过；216次sanitizer实跑与12配置精确复用。
 > [详细报告](inference_detail/resource_prediction_repair_report.md)；证据为`guoqiao/optimize_plan/resource_prediction_repair_artifacts/evidence-index.json`。下方保留更新前原文，历史结论不回写。
@@ -5121,3 +5176,11 @@ ctest --test-dir build-m6-release -R FriskLayoutConversionGeneratorTest --output
 6. 只有 review 通过才进入下一个 Task。
 
 建议在每个 M0–M6 Gate 后由用户进行一次阶段验收。M2、M3、M4、M5 的 Gate 是架构关口，不建议并行跨越。
+
+
+## 任务1：候选保留与成本决策联合修复（受限源域）
+
+已实现GF(2)通信切分/所有权子空间归档、完整静态摘要与有理排序锥/严格fallback改善；最终显式recipe为 `calibrated-source-grammar-v1`，生产默认仍legacy。Exp开发实测耗时降低9.64%；强制全域GF2在Mixed掉旧优选导致2.527×退化，未隐去。保守源域路由已使Mixed/Div完整恢复旧K4和预算，Exp J/LI保持GF2；Exp两模式最终同镜像，不能声称J胜LI。六池严格选择/镜像桥接和GPU缺项已验收，scalar统一族/Attention校准仍fallback，未作新留出、全域晋升或Triton/TileLang公平比较。完整报告：`/home/baopeihua/frisk/guoqiao/inference_detail/selection_refinement_report.md`。下一阶段为任务2开销收敛。
+
+
+任务2（2026-11-06）：任务2已通过登记域的冷／热全链路执行验收；保留已有默认策略。 见 [全链路开销报告](/home/baopeihua/frisk/guoqiao/inference_detail/pipeline_overhead_report.md)。

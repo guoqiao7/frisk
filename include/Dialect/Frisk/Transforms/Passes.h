@@ -24,11 +24,13 @@ std::unique_ptr<Pass> createFriskInferLayoutsPass(const SolverOptions &options,
                                               LayoutTrace *trace = nullptr,
                                               LayoutProfile *profile = nullptr,
                                               LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy,
-                                              const SM90CostProfile *calibratedProfile = nullptr);
+                                              const SM90CostProfile *calibratedProfile = nullptr,
+    bool nativeVector = false);
 std::unique_ptr<Pass> createNormalizeLayoutIRPass();
 std::unique_ptr<Pass> createOptimizeLayoutConversionsPass();
 std::unique_ptr<Pass> createOptimizeLayoutConversionsPass(LayoutBoundaryFrequencyMode mode,
-    const SM90CostProfile *calibratedProfile = nullptr);
+    const SM90CostProfile *calibratedProfile = nullptr,
+    bool nativeVector = false);
 std::unique_ptr<Pass> createTestLowerLayoutConversionsPass();
 std::unique_ptr<Pass> createExportExecutionPass();
 
