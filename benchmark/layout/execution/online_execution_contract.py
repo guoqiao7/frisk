@@ -9,11 +9,13 @@ def _int(value, lo, hi):
     return value
 
 
-def single_group(wait_batch=1):
+def single_group(wait_batch=1, threads=256):
+    if type(threads) is not int or threads not in (128,256):
+        raise ValueError("unsupported synchronous attention domain")
     if wait_batch not in (1, 4) or type(wait_batch) is not int:
         raise ValueError('unsupported synchronous wait batch')
-    return dict(version=1, kind='single', cta=256,
-                groups=[dict(base=0, threads=256)], roles={k:0 for k in ('q','k','v','qk','pv','reduce')},
+    return dict(version=1, kind='single', cta=threads,
+                groups=[dict(base=0, threads=threads)], roles={k:0 for k in ('q','k','v','qk','pv','reduce')},
                 buffers={k:dict(versions=1) for k in ('q','k','v')},
                 publication='cta_barrier', batch=wait_batch, wait_pending=0)
 
@@ -107,7 +109,7 @@ def from_overlap(plan):
 
 def validate(plan):
     if plan['kind']=='single':
-        if plan != single_group(plan['batch']): raise ValueError('unsupported synchronous execution contract')
+        if plan != single_group(plan['batch'],plan['cta']): raise ValueError('unsupported synchronous execution contract')
         return
     if plan['kind'] not in FA3_KINDS or (plan['version'],plan['batch'],plan['wait_pending']) != (1,8,0):
         raise ValueError('unsupported FA3 intrinsic protocol')

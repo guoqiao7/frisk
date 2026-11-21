@@ -153,6 +153,9 @@ public:
   OptimizeLayoutConversionsPass(const OptimizeLayoutConversionsPass &other)
       : impl::OptimizeLayoutConversionsBase<OptimizeLayoutConversionsPass>(other),
         calibratedProfile(other.calibratedProfile) {}
+  Option<bool> producerStore{*this, "producer-store",
+      llvm::cl::desc("Try the producer's existing ownership for a single-use native attention store"),
+      llvm::cl::init(false)};
   std::optional<SM90CostProfile> calibratedProfile;
   explicit OptimizeLayoutConversionsPass(LayoutBoundaryFrequencyMode mode,
                                          const SM90CostProfile *profile, bool nativeVector) {
@@ -184,6 +187,23 @@ public:
       signalPassFailure(); return;
     }
     OwningOpRef<ModuleOp> staged(cast<ModuleOp>(original->clone()));
+    // Keep instruction bindings intact. The driver measures this physical
+    // alternative against the solver's original terminal delivery.
+    if (producerStore && (*staged)->hasAttr("frisk.online_launch")) {
+      staged->walk([&](TileStoreOp store) {
+        auto delivery = store->getOperand(0).getDefiningOp<ConvertLayoutOp>();
+        if (!delivery || !delivery->hasOneUse() || hasHardAttributes(delivery) ||
+            hasHardAttributes(store))
+          return;
+        auto old = delivery.getResult();
+        store->setOperand(0, delivery.getSource());
+        if (!verifiedCandidate(*staged, *target)) {
+          store->setOperand(0, old);
+          return;
+        }
+        delivery.erase();
+      });
+    }
     bool changed;
     do {
       RewritePatternSet patterns(&getContext());

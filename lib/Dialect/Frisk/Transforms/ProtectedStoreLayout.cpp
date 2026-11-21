@@ -5,6 +5,7 @@
 #include "Dialect/Frisk/Analysis/LayoutBoundaryFrequency.h"
 #include "Dialect/Frisk/Analysis/LayoutSolver.h"
 #include "Dialect/Frisk/Analysis/LayoutStatistics.h"
+#include "Dialect/Frisk/Analysis/StorageRootContracts.h"
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
 #include "Dialect/Frisk/Analysis/LinearExecutionLayout.h"
 #include "Dialect/Frisk/IR/FriskDialect.h"
@@ -13,6 +14,8 @@
 #include "Dialect/Frisk/Transforms/PassPipelines.h"
 #include "Dialect/Frisk/Transforms/Passes.h"
 #include "MultiAnchorSolver.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/SHA256.h"
 #include "PreserveStorageContracts.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -837,8 +840,10 @@ FailureOr<SmallVector<Candidate, 2>> certify(ModuleOp module, MmaOp mma) {
   if (!threads || (threads.getInt() != 128 && threads.getInt() != 256))
     return mma.emitOpError("protection requires one or two explicit warpgroups");
   auto grids = getSM90MmaGeometries(mma, threads.getInt(), true);
+  if (failed(grids) || grids->empty())
+    return mma.emitOpError("no certifiable SM90 MMA geometry within the supported tile and proof bounds");
   auto isolated = projectAnchor(module, mma);
-  if (failed(grids) || grids->empty() || failed(isolated))
+  if (failed(isolated))
     return mma.emitOpError("cannot project the MMA operand boundary");
   SmallVector<Candidate, 2> candidates;
   for (auto g : *grids) {
@@ -975,7 +980,7 @@ std::optional<int64_t> gluonScratchService(RankedTensorType from,
 // A single integer problem spans all producers and uses in one function.
 LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
                                    unsigned timeout, unsigned oracleLimit, bool scoreReduction, bool allowStripes,
-                                   bool replayScratch, bool bankFloor, StringRef globalAccess) {
+                                   bool replayScratch, bool bankFloor, StringRef globalAccess, bool subgroupCandidates) {
   PassManager prepare(module.getContext());
   prepare.addPass(createNormalizeLayoutIRPass());
   if (failed(prepare.run(module)))
@@ -1049,7 +1054,7 @@ LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
   auto solved = solveCertifiedMultiAnchor(module, certificates, price, striped,
                                           freeBits, timeout, oracleLimit, scoreReduction,
                                           !replayScratch && (globalAccess == "native" ||
-                                            (globalAccess == "pointwise" && anchors.empty() && !hasReduction(module))));
+                                            (globalAccess == "pointwise" && anchors.empty() && !hasReduction(module))), subgroupCandidates);
   if (failed(solved))
     return failure();
   SmallVector<int64_t> selected(domains.size(), -1);
@@ -1254,6 +1259,8 @@ public:
   Option<std::string> anchorSolver{*this, "anchor-solver",
                                    llvm::cl::desc("enumerate or integer"),
                                    llvm::cl::init("enumerate")};
+  Option<bool> subgroupCandidates{*this, "integer-subgroup-candidates",
+      llvm::cl::desc("Propose warp- and warpgroup-compatible consumer bases"), llvm::cl::init(false)};
   Option<unsigned> completionBits{
       *this, "integer-free-bits",
       llvm::cl::desc("Expand full-rank intermediate F2 completions up to this "
@@ -1322,13 +1329,62 @@ public:
     if (original->hasAttr("frisk.compiled_sum_spill") &&
         (scratchBackend != "gluon34" || anchorSolver != "integer"))
       return error("compiled Sum spill evidence requires the Gluon integer scoring path");
-    auto select = [&](ModuleOp mod) {
-      return anchorSolver == "integer"
-                 ? selectIntegerAnchors(mod, completionBits, integerTimeout,
-                                        oracleLimit, scoreReduction, allowStripes,
-                                        scratchBackend == "gluon34", bankFloor, globalAccess)
-                 : selectAnchors(mod, scorePressure, stripedReplay,
-                                 maxCombinations);
+    if (subgroupCandidates && anchorSolver != "integer")
+      return error("subgroup candidates require integer anchor solving");
+    auto select = [&](ModuleOp mod) -> LogicalResult {
+      if (anchorSolver != "integer")
+        return selectAnchors(mod, scorePressure, stripedReplay, maxCombinations);
+      auto solve = [&](ModuleOp graph, bool expand) {
+        return selectIntegerAnchors(graph, completionBits, integerTimeout,
+                                    oracleLimit, scoreReduction, allowStripes,
+                                    scratchBackend == "gluon34", bankFloor,
+                                    globalAccess, expand);
+      };
+      if (!subgroupCandidates)
+        return solve(mod, false);
+
+      // An enlarged Z3 domain can change an existing witness even when
+      // none of the added bases is selected. Preserve the incumbent IR on
+      // objective ties, rather than penalizing only newly selected bases.
+      OwningOpRef<ModuleOp> challenger(cast<ModuleOp>(mod->clone()));
+      bool feasible;
+      {
+        ScopedDiagnosticHandler optional(mod.getContext(), [](Diagnostic &) { return success(); });
+        feasible = succeeded(solve(mod, false));
+      }
+      bool expanded;
+      if (feasible) {
+        ScopedDiagnosticHandler optional(mod.getContext(), [](Diagnostic &) { return success(); });
+        expanded = succeeded(solve(*challenger, true));
+      } else {
+        expanded = succeeded(solve(*challenger, true));
+        if (!expanded) return failure();
+      }
+      auto receipt = [](ModuleOp graph) {
+        return graph->getAttrOfType<DictionaryAttr>("frisk.protected_graph");
+      };
+      auto objective = [](DictionaryAttr proof) {
+        // billWitness has checked the full sum for signed overflow.
+        int64_t service = 0;
+        for (StringRef k : {"main_loop_units", "reduction_units", "access_units",
+                            "conversion_units", "compiled_spill_units"})
+          if (auto v = proof.getAs<IntegerAttr>(k)) service += v.getInt();
+        return std::make_pair(service, proof.getAs<IntegerAttr>("distinct_conversions").getInt());
+      };
+      auto candidate = expanded ? receipt(*challenger) : DictionaryAttr{};
+      bool promote = expanded && (!feasible || objective(candidate) < objective(receipt(mod)));
+      if (promote) {
+        mod->setAttrs((*challenger)->getAttrs());
+        mod.getBodyRegion().takeBody(challenger->getBodyRegion());
+      }
+      Builder b(mod.getContext());
+      NamedAttrList report(receipt(mod));
+      report.set("subgroup_challenger_certified", b.getBoolAttr(expanded));
+      report.set("subgroup_promoted", b.getBoolAttr(promote));
+      if (expanded)
+        report.set("subgroup_challenger_candidates", candidate.get("subgroup_candidates"));
+      mod->setAttr("frisk.protected_graph", report.getDictionary(mod.getContext()));
+      return success();
     };
     if (materialize != "auto" && (!fixedAnchors || stripedReplay ||
         (materialize != "direct" && materialize != "striped")))
@@ -1395,12 +1451,213 @@ public:
     original.getBodyRegion().takeBody(staged->getBodyRegion());
   }
 };
+// A spill is a property of a complete compiled SSA placement. Price that
+// placement once, after lowering. Never attach the same traffic independently
+// to its reductions, broadcasts, or operands.
+// Charge the actual scalar/64-bit/128-bit instruction mix against the
+// materialized, root-relative addresses. For mixed widths the histogram is
+// sufficient only if the sector count does not depend on the register group.
+static FailureOr<int64_t> globalSectorCount(Value storage, RankedTensorType type,
+    ArrayRef<int64_t> counts, int64_t &warpIssues) {
+  auto view = storage.getDefiningOp<LayoutViewOp>();
+  auto layout = view ? view->getAttrOfType<StorageLayoutAttr>("layout") : StorageLayoutAttr{};
+  auto enc = dyn_cast_or_null<DistributedEncodingAttr>(type.getEncoding());
+  if (!layout || !enc || layout.getMemorySpace().getValue() != attr::MemorySpace::Global ||
+      type.getRank() != 2 || !type.getElementType().isF32() || !type.hasStaticShape())
+    return failure();
+  auto root = analyzeStorageAlias(storage);
+  if (failed(root)) return failure();
+  DominanceInfo dominance(view->getParentOfType<ModuleOp>());
+  for (Operation *user : root->root.getUsers()) {
+    auto contract = dyn_cast<StorageContractOp>(user);
+    if (contract && contract.getRoot() == root->root &&
+        storageContractDominates(contract, view, dominance))
+      root->rootAlignment = std::max<uint64_t>(root->rootAlignment,
+          contract.getLayout().getAlignment().getInt());
+  }
+  if (root->rootAlignment < 32) return failure();
+  auto footprint = buildStorageAliasFootprint(*root, layout);
+  ExecutionEnumeration e;
+  if (footprint.proof.status != ProofStatus::Proven ||
+      enumerateExecutionLayout(enc, type, e).status != ProofStatus::Proven ||
+      e.topology[1] != 32 || e.topology[2] != 4 || e.topology[3] != 1 ||
+      e.topology[4] != 1 || e.logical.size() != footprint.entries.size() ||
+      e.logical.size() != size_t(type.getNumElements()))
+    return failure();
+  const uint64_t regs = e.topology[0];
+  uint64_t covered = 0;
+  for (auto [i,count] : llvm::enumerate(counts)) {
+    if (count < 0 || uint64_t(count) > regs) return failure();
+    covered += uint64_t(count) << i;
+  }
+  if (covered != regs) return failure();
+  SmallVector<uint64_t> addresses(e.logical.size(), UINT64_MAX);
+  for (const auto &entry : footprint.entries) {
+    if (entry.view.size() != 2 || entry.end - entry.begin != 32 || entry.begin % 32)
+      return failure();
+    int64_t i = entry.view[0], j = entry.view[1];
+    if (i < 0 || i >= type.getDimSize(0) || j < 0 || j >= type.getDimSize(1))
+      return failure();
+    auto &address = addresses[i * type.getDimSize(1) + j];
+    if (address != UINT64_MAX) return failure();
+    address = entry.begin / 8;
+  }
+  auto address = [&](uint64_t lane, uint64_t reg) {
+    return addresses[e.logical[lane * regs + reg]];
+  };
+  int64_t sectors = 0;
+  for (auto [i,count] : llvm::enumerate(counts)) {
+    if (!count) continue;
+    uint64_t width = 1u << i;
+    int64_t perIssue = -1, allGroups = 0;
+    for (uint64_t reg = 0; reg < regs; reg += width) {
+      int64_t group = 0;
+      for (unsigned warp = 0; warp < 4; ++warp) {
+        llvm::SmallDenseSet<uint64_t,32> touched;
+        for (unsigned t = warp * 32; t < (warp + 1) * 32; ++t) {
+          auto start = address(t, reg);
+          if (start % (4 * width)) return failure();
+          for (unsigned k = 1; k < width; ++k)
+            if (address(t, reg + k) != start + 4 * k) return failure();
+          touched.insert(start / 32);
+        }
+        group += touched.size();
+      }
+      if (perIssue < 0) perIssue = group;
+      if (uint64_t(count) != regs / width && group != perIssue) return failure();
+      allGroups += group;
+    }
+    sectors += uint64_t(count) == regs / width ? allGroups : count * perIssue;
+    warpIssues += count * 4;
+  }
+  return sectors;
+}
+
+struct PriceNormalizationSpill : PassWrapper<PriceNormalizationSpill, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PriceNormalizationSpill)
+  PriceNormalizationSpill() = default;
+  PriceNormalizationSpill(const PriceNormalizationSpill &other) : PassWrapper(other) {}
+  StringRef getArgument() const final { return "frisk-price-normalization-spill"; }
+  StringRef getDescription() const final { return "Bind SM90 Gluon local traffic to one certified whole-graph normalization layout"; }
+  Option<std::string> graph{*this,"graph",llvm::cl::desc("Sealed materialized graph SHA-256"), llvm::cl::init("")};
+  Option<std::string> cubin{*this,"cubin",llvm::cl::desc("Disassembled cubin SHA-256"), llvm::cl::init("")};
+  Option<int64_t> loads{*this,"load-words",llvm::cl::init(-1)};
+  Option<int64_t> stores{*this,"store-words",llvm::cl::init(-1)};
+  Option<int64_t> exposed{*this,"exposed-reloads",llvm::cl::desc("Certified immediate arithmetic uses of local reloads per warp"),llvm::cl::init(-1)};
+  Option<std::string> ldg{*this,"ldg",llvm::cl::desc("Unpredicated 32/64/128-bit load counts"),llvm::cl::init("")};
+  Option<std::string> stg{*this,"stg",llvm::cl::desc("Unpredicated 32/64/128-bit store counts"),llvm::cl::init("")};
+  void runOnOperation() override {
+    ModuleOp mod = getOperation();
+    auto fail = [&](StringRef msg) { mod.emitError(msg); signalPassFailure(); };
+    auto proof = mod->getAttrOfType<DictionaryAttr>("frisk.protected_graph");
+    if (!proof || !proof.get("normalization_reduction_choices") || proof.get("compiled_spill_units"))
+      return fail("expected an unpriced certified normalization alternative");
+    unsigned blocks = 0;
+    bool legal = true;
+    mod.walk([&](ParallelOp op) { ++blocks; legal &= op.getThreads() == 128; });
+    if (blocks != 1 || !legal || !anchorsIn(mod).empty())
+      return fail("expected a single four-warp normalization scope");
+    std::string printed;
+    llvm::raw_string_ostream stream(printed);
+    // The seal is metadata about the graph, not part of its identity.
+    OwningOpRef<ModuleOp> canonical(cast<ModuleOp>(mod->clone()));
+    auto seal = (*canonical)->removeAttr("frisk.normalization_graph_digest");
+    canonical->print(stream, OpPrintingFlags().useLocalScope());
+    stream.flush();
+    std::string digest = llvm::toHex(llvm::SHA256::hash(llvm::arrayRefFromStringRef(printed)), true);
+    Builder b(mod.getContext());
+    if (seal && seal != b.getStringAttr(digest))
+      return fail("stale normalization graph seal");
+    const bool physical = !ldg.getValue().empty() || !stg.getValue().empty();
+    if (exposed < -1 || (exposed >= 0 && (!physical || exposed > loads)))
+      return fail("invalid exposed local reload evidence");
+    if (!physical && graph.getValue().empty() && cubin.getValue().empty() && loads == -1 && stores == -1) {
+      mod->setAttr("frisk.normalization_graph_digest", b.getStringAttr(digest));
+      return;
+    }
+    if (graph.getValue() != digest || cubin.getValue().size() != 64 ||
+        !llvm::all_of(cubin.getValue(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }) ||
+        loads < 0 || stores < 0)
+      return fail("mismatched normalization graph, cubin or local traffic evidence");
+    int64_t words, sectors, total;
+    if (llvm::AddOverflow(loads.getValue(), stores.getValue(), words) ||
+        llvm::MulOverflow(words, int64_t{16}, sectors))
+      return fail("normalization spill sector overflow");
+    total = sectors;
+    for (StringRef key : {"access_units","conversion_units","main_loop_units","reduction_units"}) {
+      auto v = proof.getAs<IntegerAttr>(key);
+      if (!v || v.getInt() < 0 || llvm::AddOverflow(total,v.getInt(),total))
+        return fail("invalid normalization service receipt");
+    }
+    NamedAttrList result(proof);
+    if (physical) {
+      // Replace the pre-lowering global term; it includes both scalar issue
+      // work and scalar coalescing, so adding the new term would double count.
+      SmallVector<TileLoadOp> reads;
+      SmallVector<TileStoreOp> writes;
+      mod.walk([&](TileLoadOp op) { reads.push_back(op); });
+      mod.walk([&](TileStoreOp op) { writes.push_back(op); });
+      if (reads.size() != 1 || writes.size() != 1)
+        return fail("global access evidence requires one load and one store");
+      auto counts = [](StringRef text) -> FailureOr<SmallVector<int64_t>> {
+        SmallVector<StringRef> fields;
+        text.split(fields, ',');
+        SmallVector<int64_t> values;
+        for (auto field : fields) {
+          int64_t n;
+          if (field.getAsInteger(10,n) || n < 0) return failure();
+          values.push_back(n);
+        }
+        if (values.size() != 3) return failure();
+        return values;
+      };
+      auto rd = counts(ldg.getValue()), wr = counts(stg.getValue());
+      if (failed(rd) || failed(wr)) return fail("invalid global instruction histogram");
+      int64_t readIssues = 0, writeIssues = 0;
+      auto r = globalSectorCount(reads[0].getSource(),
+          cast<RankedTensorType>(reads[0].getResult().getType()), *rd, readIssues);
+      auto w = globalSectorCount(writes[0].getTarget(),
+          cast<RankedTensorType>(writes[0]->getOperand(0).getType()), *wr, writeIssues);
+      if (failed(r) || failed(w))
+        return fail("global instruction footprint is not certified");
+      constexpr int64_t issueWeight = 8;
+      int64_t globalUnits = *r + *w + issueWeight * (readIssues + writeIssues);
+      total -= proof.getAs<IntegerAttr>("access_units").getInt();
+      if (llvm::AddOverflow(total, globalUnits, total)) return fail("global service overflow");
+      if (exposed >= 0) {
+        // A wait with no intervening instruction exposes a separate issue
+        // opportunity for each of the four warps. Reuse the global issue unit.
+        int64_t units, dependent;
+        if (llvm::MulOverflow(exposed.getValue(), 4 * issueWeight, units) ||
+            llvm::AddOverflow(total, units, dependent))
+          return fail("compiled local dependency cost overflow");
+        result.set("compiled_exposed_reloads", b.getI64IntegerAttr(exposed));
+        result.set("compiled_exposed_reload_units", b.getI64IntegerAttr(units));
+        result.set("compiled_dependency_service_units", b.getI64IntegerAttr(dependent));
+      }
+      result.set("compiled_global_read_sectors", b.getI64IntegerAttr(*r));
+      result.set("compiled_global_write_sectors", b.getI64IntegerAttr(*w));
+      result.set("compiled_global_read_issues", b.getI64IntegerAttr(readIssues));
+      result.set("compiled_global_write_issues", b.getI64IntegerAttr(writeIssues));
+      result.set("compiled_global_issue_weight", b.getI64IntegerAttr(issueWeight));
+      result.set("compiled_ldg_counts", b.getDenseI64ArrayAttr(*rd));
+      result.set("compiled_stg_counts", b.getDenseI64ArrayAttr(*wr));
+    }
+    result.set("normalization_graph_digest", b.getStringAttr(digest));
+    result.set("compiled_spill_units", b.getI64IntegerAttr(sectors));
+    result.set("compiled_spill_cubin", b.getStringAttr(cubin.getValue()));
+    result.set("compiled_service_units", b.getI64IntegerAttr(total));
+    mod->setAttr("frisk.protected_graph",result.getDictionary(mod.getContext()));
+  }
+};
 } // namespace
 
 namespace mlir::frisk {
 void registerProtectedStoreLayoutPass() {
   static PassRegistration<ProtectedStoreLayoutPass> registration;
   (void)registration;
+  static PassRegistration<PriceNormalizationSpill> normalization;
+  (void)normalization;
   // A top-level opt-in pipeline on raw Frisk IR. The incumbent and each
   // pinned candidate continue to use the ordinary layout pipeline internally.
   static PassPipelineRegistration<> pipeline("frisk-protected-layout-pipeline",

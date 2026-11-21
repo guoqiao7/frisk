@@ -933,7 +933,7 @@ class Emitter:
     elif n=='frisk.reduce_tensor':self.reduce(o)
     elif n=='linalg.broadcast':self.broadcast(o)
     elif n=='frisk.tile_store':self.store(o)
-    elif n in ('arith.addf','arith.maximumf','arith.mulf','arith.subf','arith.divf','math.exp','math.rsqrt','arith.truncf'):
+    elif n in ('arith.addf','arith.maximumf','arith.mulf','arith.subf','arith.divf','math.exp','math.exp2','math.rsqrt','arith.truncf'):
      v=o['results'][0];out=self.newregs(v);args=[self.regs(x) for x in o['operands']]
      if n in ('arith.addf','arith.maximumf','math.rsqrt'):
       expected_args=1 if n=='math.rsqrt' else 2
@@ -945,6 +945,7 @@ class Emitter:
        self.emit(f'rsqrt.approx.f32 {z}, {args[0][i]};')
       elif n=='math.exp':
        t=self.tmp('f32');self.emit(f'mul.rn.f32 {t}, {args[0][i]}, 0f3fb8aa3b;');self.emit(f'ex2.approx.f32 {z}, {t};')
+      elif n=='math.exp2':self.emit(f'ex2.approx.f32 {z}, {args[0][i]};')
       elif n=='arith.truncf':self.emit(f'cvt.rn.f16.f32 {z}, {args[0][i]};')
       else:self.emit({'arith.maximumf':'max.NaN.f32','arith.addf':'add.rn.f32','arith.mulf':'mul.rn.f32','arith.subf':'sub.rn.f32','arith.divf':'div.rn.f32'}[n]+f' {z}, {args[0][i]}, {args[1][i]};')
     else:raise ValueError('unsupported lowering operation '+n)
@@ -971,7 +972,7 @@ class Emitter:
 
 def emit(data, *, demand_query_observer=None, demand_query_budget=65536, shuffle_network_policy='auto',
          access_policy='vector', reduction_policy='auto', mma_group_size=None, shared_policy='declared',
-         store_policy='direct', copy_batch=False, trace_execution=False):
+         store_policy='direct', copy_batch=False, trace_execution=False, aligned_online_inputs=False, defer_v_wait=False, flush_exp_subnormals=False, online_query_start=0, online_head_pitches=None):
  from online_execution_contract import packet_contract
  plan = packet_contract(data) if any('frisk.execution_contract' in o.get('attrs',{}) for o in data.get('operations',[])) else None
  if plan is not None:
@@ -984,16 +985,32 @@ def emit(data, *, demand_query_observer=None, demand_query_budget=65536, shuffle
  wide = any(op.get('name') == 'frisk.parallel' and op.get('attrs', {}).get('threads') == 256 for op in operations)
  online = any('frisk.online_launch' in op.get('attrs', {}) for op in operations)
  if online:
-  if not wide: raise ValueError('native online launch requires a certified 256-thread parallel region')
+  if not wide and not (plan and plan['kind']=='single' and plan['cta']==128):
+   raise ValueError('native online launch requires a certified 256-thread region or an explicit 128-thread execution contract')
   from native_online_launch import NativeOnlineEmitter
   emitter = NativeOnlineEmitter
  elif wide:
   from wide_execution import WideEmitter
   emitter = WideEmitter
- result = emitter(data, demand_query_observer=demand_query_observer, demand_query_budget=demand_query_budget,
+ if defer_v_wait and not (online and aligned_online_inputs):
+  raise ValueError("deferring the V wait requires the aligned online attention path")
+ if aligned_online_inputs and not online:
+  raise ValueError("aligned_online_inputs requires a packed attention launch")
+ instance = emitter(data, demand_query_observer=demand_query_observer, demand_query_budget=demand_query_budget,
                 shuffle_network_policy=shuffle_network_policy, access_policy=access_policy,
                 reduction_policy=reduction_policy, mma_group_size=mma_group_size, shared_policy=shared_policy,
-                store_policy=store_policy, copy_batch=copy_batch, trace_execution=trace_execution).run()
+                store_policy=store_policy, copy_batch=copy_batch, trace_execution=trace_execution)
+ if flush_exp_subnormals and not online:
+  raise ValueError("explicit exponential FTZ requires an online attention launch")
+ instance.flush_exp_subnormals = flush_exp_subnormals
+ instance.defer_v_wait = defer_v_wait
+ if (online_query_start or online_head_pitches is not None) and not online:
+  raise ValueError("query slicing requires a native online attention packet")
+ instance.online_query_start = online_query_start
+ instance.online_head_pitches = online_head_pitches
+ instance.aligned_online_inputs = aligned_online_inputs
+ result = instance.run()
+ if online: result[1]["required_input_alignment"] = 16 if aligned_online_inputs else 1
  if plan is not None: result[1]["execution_contract"]=plan
  return result
 

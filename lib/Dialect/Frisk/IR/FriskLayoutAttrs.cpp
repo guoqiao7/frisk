@@ -1524,7 +1524,54 @@ std::optional<PositiveCoefficients> positiveCoefficients(AffineExpr expr,
   }
   return out;
 }
+// On a bounded positive rectangle, the larger stride separates adjacent
+// rows (or columns) if it exceeds the entire span of the other axis.
+bool proveWideStridedStorage(Attribute map, ArrayRef<int64_t> shape,
+                            uint64_t elementBits, uint64_t lowerBit, uint64_t upperBit) {
+  auto a = dyn_cast<AffineLayoutMapAttr>(map);
+  if (!a || shape.size() != 2 || shape[0] <= 0 || shape[1] <= 0 ||
+      shape[0] <= 65536 / shape[1] || !a.getInputExtents() ||
+      a.getInputExtents().asArrayRef() != shape || !a.getOutputExtents() ||
+      a.getOutputExtents().size() != 2) return false;
+  auto f = a.getAffineMap().getValue();
+  if (f.getNumDims() != 2 || f.getNumSymbols() || f.getNumResults() != 2)
+    return false;
+  auto bit = dyn_cast<AffineConstantExpr>(f.getResult(1));
+  if (!bit || bit.getValue() < 0 || bit.getValue() >= 8 ||
+      bit.getValue() >= a.getOutputExtents()[1]) return false;
+  unsigned budget = 4096;
+  auto bytes = positiveCoefficients(f.getResult(0), budget);
+  if (!bytes || a.getOutputExtents()[0] <= 0) return false;
+  uint64_t span[2], end = (*bytes)[2];
+  for (unsigned i = 0; i < 2; ++i) {
+    if (shape[i] > 1 && !(*bytes)[i]) return false;
+    uint64_t steps = shape[i] - 1;
+    if (steps && (*bytes)[i] > (uint64_t(INT64_MAX) - end) / steps) return false;
+    span[i] = steps * (*bytes)[i];
+    end += span[i];
+  }
+  uint64_t width = llvm::divideCeil(elementBits, uint64_t{8});
+  if (end >= uint64_t(a.getOutputExtents()[0]) ||
+      __int128((*bytes)[2])*8 + bit.getValue() < lowerBit ||
+      __int128(end)*8 + bit.getValue() + elementBits > upperBit ||
+      (shape[0]>1 && (*bytes)[0]<width) || (shape[1]>1 && (*bytes)[1]<width))
+    return false;
+  return shape[0]==1 || shape[1]==1 ||
+         ((*bytes)[0]>=span[1] && (*bytes)[0]-span[1]>=width) ||
+         ((*bytes)[1]>=span[0] && (*bytes)[1]-span[0]>=width);
+}
 } // namespace
+
+bool proveWideStridedStorageRange(StorageLayoutAttr layout, MemRefType type,
+                                  uint64_t lowerBit, uint64_t upperBit) {
+  if (!layout || !type || !type.getElementType().isIntOrFloat()) return false;
+  auto a = dyn_cast<AffineLayoutMapAttr>(layout.getMap());
+  if (!a || a.getOutputNames().size()!=2) return false;
+  Builder b(type.getContext());
+  if (a.getOutputNames()[0]!=b.getStringAttr("byte_offset") ||
+      a.getOutputNames()[1]!=b.getStringAttr("bit_offset")) return false;
+  return proveWideStridedStorage(a,type.getShape(),type.getElementTypeBitWidth(),lowerBit,upperBit);
+}
 
 std::optional<ContiguousIdentityStorage>
 matchContiguousIdentityStorage(StorageLayoutAttr layout, MemRefType type) {
@@ -1633,7 +1680,8 @@ LogicalResult StorageLayoutAttr::verifyForType(ShapedType type,
   if (failed(verifyMapDomainMatchesType(getMap(), type, loc)))
     return failure();
 
-  if (matchContiguousIdentityStorage(*this, memref))
+  if (matchContiguousIdentityStorage(*this, memref) ||
+      proveWideStridedStorageRange(*this, memref, 0, UINT64_MAX))
     return success();
 
   LayoutProof injective = checkInjectivity(getMap(), type.getShape());

@@ -14,7 +14,7 @@ SUPPORTED_OPERATIONS = frozenset({
     "frisk.storage_contract", "frisk.layout_view", "memref.alloc", "tensor.empty", "linalg.yield",
     "arith.constant", "frisk.copy", "frisk.tile_load", "frisk.convert_layout", "frisk.mma",
     "frisk.reduce_tensor", "linalg.broadcast", "frisk.tile_store", "arith.addf", "arith.mulf", "arith.subf",
-    "arith.divf", "math.exp", "math.rsqrt", "arith.truncf",
+    "arith.divf", "math.exp", "math.exp2", "math.rsqrt", "arith.truncf",
 })
 
 
@@ -103,7 +103,9 @@ def plan_shared_allocation(data, *, redistribution_validator=None, lifetimes=Non
     if execution_threads not in (128, 256):
         raise ValueError("unsupported execution thread count")
     supported = SUPPORTED_OPERATIONS | {"arith.maximumf"}
-    if execution_threads == 256:
+    if execution_threads == 256 or any(o.get("name")=="builtin.module" and
+                                      "frisk.online_launch" in o.get("attrs",{}) and
+                                      "frisk.execution_contract" in o["attrs"] for o in data["operations"]):
         supported |= {"scf.for", "scf.if", "scf.yield", "arith.cmpi"}
     for index, operation in enumerate(data["operations"]):
         if type(operation) is not dict or operation.get("name") not in supported:

@@ -83,18 +83,27 @@ struct ExportExecutionPass: impl::ExportExecutionBase<ExportExecutionPass> {
    reject(module,"module verification failed","invalid-ir","ir-verification","not-Proven");
    signalPassFailure();return;
   }
-  bool wide = false;
-  module.walk([&](ParallelOp op) { wide |= op.getThreads() == 256; });
+  auto plan = module->getAttrOfType<DictionaryAttr>("frisk.execution_contract");
+  auto kind = plan ? plan.getAs<StringAttr>("kind") : StringAttr();
+  auto cta = plan ? plan.getAs<IntegerAttr>("cta") : IntegerAttr();
+  const bool singleWarpgroupOnline =
+      module->getAttrOfType<DictionaryAttr>("frisk.online_launch") &&
+      kind && kind.getValue() == "single" && cta && cta.getInt() == 128;
+  bool structured = false;
+  module.walk([&](ParallelOp op) {
+    structured |= op.getThreads() == 256 ||
+                  (singleWarpgroupOnline && op.getThreads() == 128);
+  });
   // Preflight every op before file creation, including unused/unknown operations.
   module.walk([&](Operation *op){
    StringRef n=op->getName().getStringRef();
-   if (wide && isa<scf::ForOp,scf::IfOp,scf::YieldOp>(op)) {
+   if (structured && isa<scf::ForOp,scf::IfOp,scf::YieldOp>(op)) {
     if (auto branch = dyn_cast<scf::IfOp>(op))
      if (!branch.getElseRegion().empty() || branch->getNumResults())
       reject(op,"wide execution supports result-free then regions","control-flow");
     return;
    }
-   if (wide && n == "arith.cmpi") return;
+   if (structured && n == "arith.cmpi") return;
    if (n == "arith.addf" || n == "arith.maximumf" || n == "math.rsqrt") {
     unsigned arity = n == "math.rsqrt" ? 1 : 2;
     auto result = op->getNumResults() == 1
@@ -106,7 +115,7 @@ struct ExportExecutionPass: impl::ExportExecutionBase<ExportExecutionPass> {
             "elementwise-type");
     return;
    }
-   if(!llvm::is_contained(ArrayRef<StringRef>{"builtin.module","frisk.kernel","frisk.parallel","frisk.end","frisk.storage_contract","frisk.layout_view","memref.alloc","frisk.copy","frisk.mma","frisk.reduce_tensor","frisk.tile_load","frisk.tile_store","frisk.convert_layout","arith.constant","arith.mulf","arith.subf","arith.divf","arith.truncf","math.exp","tensor.empty","linalg.broadcast","linalg.yield"},n))
+   if(!llvm::is_contained(ArrayRef<StringRef>{"builtin.module","frisk.kernel","frisk.parallel","frisk.end","frisk.storage_contract","frisk.layout_view","memref.alloc","frisk.copy","frisk.mma","frisk.reduce_tensor","frisk.tile_load","frisk.tile_store","frisk.convert_layout","arith.constant","arith.mulf","arith.subf","arith.divf","arith.truncf","math.exp","math.exp2","tensor.empty","linalg.broadcast","linalg.yield"},n))
     reject(op,"unsupported execution operation");
   });
   int kernels=0,parallels=0;
@@ -184,14 +193,14 @@ struct ExportExecutionPass: impl::ExportExecutionBase<ExportExecutionPass> {
    llvm::json::Object attrs;
    for(NamedAttribute a:op->getAttrs())attrs[a.getName().strref()]=attributeJSON(a.getValue());
    llvm::json::Object o{{"name",op->getName().getStringRef().str()},{"operands",std::move(operands)},{"results",std::move(results)},{"attrs",std::move(attrs)}};
-   if (wide && isa<scf::ForOp,scf::IfOp>(op)) {
+   if (structured && isa<scf::ForOp,scf::IfOp>(op)) {
     Block &body = op->getRegion(0).front();
     llvm::json::Array args;
     for (auto argument : body.getArguments()) args.push_back(id(argument));
     o["body_arguments"] = std::move(args);
     o["body_terminator"] = ordinals.lookup(body.getTerminator());
    }
-   if (auto kernel = dyn_cast<KernelOp>(op); wide && kernel) {
+   if (auto kernel = dyn_cast<KernelOp>(op); structured && kernel) {
     llvm::json::Array args;
     for (auto argument : kernel.getRegion().front().getArguments()) args.push_back(id(argument));
     o["arguments"] = std::move(args);

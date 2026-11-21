@@ -14,5 +14,9 @@ struct ContiguousIdentityStorage {
 /// Unsupported expressions/metadata deliberately retain the original proof.
 std::optional<ContiguousIdentityStorage>
 matchContiguousIdentityStorage(StorageLayoutAttr layout, MemRefType type);
+/// Prove all element intervals of a large positive rank-two strided map
+/// are disjoint and contained in this half-open bit interval.
+bool proveWideStridedStorageRange(StorageLayoutAttr layout, MemRefType type,
+                                  uint64_t lowerBit, uint64_t upperBit);
 } // namespace mlir::frisk
 #endif

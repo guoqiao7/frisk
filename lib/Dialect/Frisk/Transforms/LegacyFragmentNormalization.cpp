@@ -76,7 +76,7 @@ LogicalResult verifyImportAttributes(Operation *scope, bool allowLegacyThreads) 
         op->emitError("execution-domain-contract: expected module-level sm90-scalar-f32-dag-v1");
         return WalkResult::interrupt();
       }
-      if (name == "frisk.compiled_sum_spill" && isa<ModuleOp>(op) &&
+      if ((name == "frisk.compiled_sum_spill" || name == "frisk.normalization_trial") && isa<ModuleOp>(op) &&
           isa<DictionaryAttr>(named.getValue())) continue;
       if (name == "frisk.execution_contract" && isa<ModuleOp>(op) && isa<DictionaryAttr>(named.getValue())) continue;
       if (name == "frisk.execution_role" && isa<MmaOp, CopyOp, ReduceTensorOp>(op) && isa<StringAttr>(named.getValue())) continue;
@@ -118,6 +118,14 @@ LogicalResult verifyImportAttributes(Operation *scope, bool allowLegacyThreads) 
               name == "frisk.drain_delta_q10" || name == "frisk.wave_delta_q10") && isa<IntegerAttr>(value)) ||
             (name == "frisk.protected_store_use" && isa<UnitAttr>(value)))
           continue;
+      }
+      if (name == "frisk.serial_column_width" && isa<MmaOp>(op)) {
+        auto width = dyn_cast<IntegerAttr>(named.getValue());
+        auto n = cast<MmaOp>(op).getN();
+        if (width && width.getType().isSignlessInteger(64) && width.getInt() > 0 &&
+            uint64_t(width.getInt()) < n && n % width.getInt() == 0)
+          continue;
+        return op->emitError("invalid serial column width for MMA");
       }
       if (name == "frisk.row_partition") {
         auto partition = dyn_cast<StringAttr>(named.getValue());

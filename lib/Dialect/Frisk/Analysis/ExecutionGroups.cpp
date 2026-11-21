@@ -24,7 +24,8 @@ LogicalResult verifyOnlineResources(ModuleOp module, DictionaryAttr plan,
   bool grouped = kind.getValue() == "fa3_qk_next" || kind.getValue() == "fa3_same_tile";
   if (!grouped) {
     auto publication = plan.getAs<StringAttr>("publication");
-    if (kind.getValue() != "single" || widths.size()!=1 || widths.front()!=256 ||
+    if (kind.getValue() != "single" || widths.size()!=1 ||
+        (widths.front()!=128 && widths.front()!=256) ||
         (batch!=1 && batch!=4) || !publication || publication.getValue()!="cta_barrier")
       return module.emitError("invalid single-group publication or wait protocol");
     for (StringRef key : {"q","k","v"})

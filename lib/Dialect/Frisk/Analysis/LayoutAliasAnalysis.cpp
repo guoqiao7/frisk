@@ -482,6 +482,19 @@ LayoutProof mlir::frisk::verifyStorageAliasCandidate(const StorageAliasInfo &inf
                                                    StorageLayoutAttr candidate) {
   if (matchContiguousIdentityStorageAlias(info, candidate))
     return proof(ProofStatus::Proven, "exact contiguous identity bit intervals");
+  // This shortcut verifies a single whole-root candidate only. Pairwise
+  // alias comparisons and consumers of a footprint still require evidence.
+  if (candidate && info.root && info.root.getType()==info.rootType &&
+      info.rootType==info.viewType && info.viewToRoot &&
+      info.viewToRoot.getNumDims()==2 && info.viewToRoot.getNumResults()==2 &&
+      !info.viewToRoot.getNumSymbols() && info.viewToRoot.isIdentity() &&
+      candidate.getVectorGranularity().getInt()==1 &&
+      candidate.getAlignment().getInt()>0 &&
+      llvm::isPowerOf2_64(candidate.getAlignment().getInt()) && info.rootAlignment &&
+      info.rootAlignment % uint64_t(candidate.getAlignment().getInt())==0 &&
+      getFriskMemorySpace(info.viewType)==candidate.getMemorySpace().getValue() &&
+      proveWideStridedStorageRange(candidate,info.viewType,info.lowerBit,info.upperBit))
+    return proof(ProofStatus::Proven, "non-overlapping strided intervals within the whole root");
   return buildStorageAliasFootprint(info, candidate).proof;
 }
 

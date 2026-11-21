@@ -1,4 +1,5 @@
 #include "MultiAnchorSolver.h"
+#include "Dialect/Frisk/Analysis/LayoutBoundaryFrequency.h"
 #include "Dialect/Frisk/Analysis/InstructionLayoutConstraints.h"
 #include "Dialect/Frisk/Analysis/LayoutConversionChoice.h"
 #include "Dialect/Frisk/Analysis/LayoutCostModel.h"
@@ -6,6 +7,7 @@
 #include "Dialect/Frisk/Analysis/LayoutVerifier.h"
 #include "Dialect/Frisk/Analysis/LinearExecutionLayout.h"
 #include "Dialect/Frisk/Analysis/ReductionLayoutConstraints.h"
+#include "Dialect/Frisk/Analysis/ReductionLayoutProof.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
 #include "Dialect/Frisk/Target/SM90/SM90CostModel.h"
 #include "Dialect/Frisk/Target/SM90/SM90LayoutTarget.h"
@@ -25,12 +27,83 @@ namespace {
 // Expand a common ownership matrix only at ordinary unencoded endpoints.
 // The local MMA tuple table remains authoritative at instruction roles.
 struct Completions {
-  DenseMap<LayoutVarID, SmallVector<Attribute>> matrices, writers;
+  DenseMap<LayoutVarID, SmallVector<Attribute>> matrices, writers, subgroup;
   unsigned skippedWide = 0;
 };
+// A warp (or warpgroup) owns a coset of the span of its low input
+// columns. Preserve each source coset while importing independent columns
+// in the consumer's preferred order. Full-rank permutations only.
+static DistributedEncodingAttr spliceWithinGroup(RankedTensorType type,
+    DistributedEncodingAttr source, DistributedEncodingAttr preferred,
+    unsigned groupAxis) {
+  if (source == preferred || source.getTopology() != preferred.getTopology() ||
+      source.getReplication().getInt() != 1 || preferred.getReplication().getInt() != 1)
+    return {};
+  auto src = dyn_cast<BitLinearLayoutMapAttr>(source.getMap());
+  auto dst = dyn_cast<BitLinearLayoutMapAttr>(preferred.getMap());
+  if (!src || !dst || src.getInputNames() != dst.getInputNames() ||
+      src.getOutputNames() != dst.getOutputNames() ||
+      src.getInputBitWidths() != dst.getInputBitWidths() ||
+      src.getOutputBitWidths() != dst.getOutputBitWidths()) return {};
+  LinearExecutionLayout a, b;
+  if (analyzeLinearExecutionLayout(source,type,a).status != ProofStatus::Proven ||
+      analyzeLinearExecutionLayout(preferred,type,b).status != ProofStatus::Proven ||
+      a.hardwareBits != a.logicalBits || a.logicalBits > 31) return {};
+  unsigned n = a.logicalBits, cut = a.hardwareOffsets[groupAxis];
+  if (!cut || cut >= n) return {};
+  auto columns = [&](const LinearExecutionLayout &layout) {
+    SmallVector<uint32_t> cols(n,0);
+    for (unsigned i=0; i<n; ++i)
+      for (unsigned j=0; j<n; ++j)
+        if (layout.rows[i][j]) cols[j] |= uint32_t{1} << i;
+    return cols;
+  };
+  auto x = columns(a), y = columns(b);
+  SmallVector<uint32_t> span(n,0), used(n,0), cols;
+  auto residual = [&](uint32_t v, ArrayRef<uint32_t> pivots) {
+    for (unsigned i=n; i-- > 0;)
+      if (v & (uint32_t{1} << i)) v ^= pivots[i];
+    return v;
+  };
+  auto insert = [&](uint32_t v, SmallVectorImpl<uint32_t> &pivots) {
+    v = residual(v,pivots);
+    if (!v) return false;
+    pivots[llvm::Log2_32(v)] = v;
+    return true;
+  };
+  for (uint32_t v : ArrayRef<uint32_t>(x).take_front(cut))
+    if (!insert(v,span)) return {};
+  for (uint32_t v : y)
+    if (!residual(v,span) && insert(v,used)) cols.push_back(v);
+  for (uint32_t v : ArrayRef<uint32_t>(x).take_front(cut))
+    if (insert(v,used)) cols.push_back(v);
+  for (unsigned i=cut; i<n; ++i)
+    cols.push_back(residual(x[i] ^ y[i],span) ? x[i] : y[i]);
+  if (cols==x || cols==y) return {};
+  // Analysis uses canonical carrier order. The attribute may serialize
+  // these carriers in another order, which must be retained in the result.
+  constexpr std::array<StringLiteral,5> carriers = {"register","lane","warp","warp_group","cta"};
+  SmallVector<unsigned> serialized;
+  for (Attribute name : src.getInputNames()) {
+    auto it = llvm::find(carriers,cast<StringAttr>(name).getValue());
+    if (it == carriers.end()) return {};
+    unsigned axis = it - carriers.begin();
+    for (unsigned bit=0; bit<a.hardwareWidths[axis]; ++bit)
+      serialized.push_back(a.hardwareOffsets[axis]+bit);
+  }
+  SmallVector<APInt> entries;
+  for (unsigned i=0; i<n; ++i)
+    for (unsigned j : serialized) entries.emplace_back(1,(cols[j] >> i) & 1);
+  auto matrix = DenseIntElementsAttr::get(src.getMatrix().getType(),entries);
+  auto m = BitLinearLayoutMapAttr::get(type.getContext(),src.getInputNames(),
+      src.getInputBitWidths(),src.getOutputNames(),src.getOutputBitWidths(),matrix);
+  auto gf = m.getMatrixValue();
+  if (failed(gf) || gf->rank()!=n) return {};
+  return DistributedEncodingAttr::get(type.getContext(),m,source.getTopology(),source.getReplication());
+}
 Completions addCompletions(LayoutConstraintGraph &graph, LayoutTarget &target,
                            ModuleOp mod, unsigned limit, StoreMap storeMap,
-                           bool offerConsecutiveWriters) {
+                           bool offerConsecutiveWriters, bool subgroupCandidates) {
   Completions out;
   for (auto &var : graph.getVariables()) {
     auto type = dyn_cast<RankedTensorType>(var.shapedType);
@@ -54,7 +127,7 @@ Completions addCompletions(LayoutConstraintGraph &graph, LayoutTarget &target,
                                         "protected-completion", reason);
       var.candidates.push_back({a, origin, var.id});
       (reason == "existing consecutive writer" ? out.writers
-                                               : out.matrices)[var.id]
+                                               : reason == "group-compatible basis" ? out.subgroup : out.matrices)[var.id]
           .push_back(a);
     };
     auto seeds = var.candidates;
@@ -66,6 +139,18 @@ Completions addCompletions(LayoutConstraintGraph &graph, LayoutTarget &target,
         if (enc)
           add(storeMap(type, enc), "existing consecutive writer");
       }
+    if (subgroupCandidates && seeds.size() >= 2) {
+      // Bound optional work per endpoint independently of free-bit completion.
+      auto seedRange = ArrayRef<LayoutCandidate>(seeds).take_front(std::min<size_t>(4,seeds.size()));
+      for (auto first : seedRange) for (auto second : seedRange) {
+        auto src = dyn_cast<DistributedEncodingAttr>(first.value);
+        auto dst = dyn_cast<DistributedEncodingAttr>(second.value);
+        if (!src || !dst) continue;
+        for (unsigned axis : {2u,3u})
+          if (out.subgroup[var.id].size() < 8)
+            add(spliceWithinGroup(type,src,dst,axis),"group-compatible basis");
+      }
+    }
     if (limit == 0 || seeds.size() < 2)
       continue;
     SmallVector<Attribute> seen;
@@ -131,9 +216,36 @@ Completions addCompletions(LayoutConstraintGraph &graph, LayoutTarget &target,
   return out;
 }
 
-// Use the same bounded loop-frequency proxy for memory service and transfers.
+// A factor of two remains the documented proxy for data-dependent loops.
 int64_t frequency(Operation *op) {
-  return int64_t{1} << std::min<uint64_t>(getLayoutLoopDepth(op), 16);
+  auto f = getLayoutBoundaryFrequency(op, LayoutBoundaryFrequencyMode::StaticTripCount);
+  return f.saturated || f.factor > uint64_t(INT64_MAX) ? -1 : int64_t(f.factor);
+}
+
+// A column band replays the K loop once. Within a warpgroup each additional
+// 64-row fragment addresses another A panel. Count its descriptor service
+// once per band and iteration, independently of the post-loop consumers.
+FailureOr<int64_t> columnLoopUnits(const LayoutConstraint &c,
+                                   const InstructionLayoutTuple &tuple) {
+  auto op = dyn_cast<MmaOp>(c.instruction->source);
+  if (!op || !op->hasAttr("frisk.serial_column_width")) return int64_t{0};
+  auto width = op->getAttrOfType<IntegerAttr>("frisk.serial_column_width");
+  if (!width || !width.getType().isSignlessInteger(64) || width.getInt() <= 0 ||
+      width.getInt() >= op.getN() || op.getN() % width.getInt())
+    return op.emitOpError("serial column width must divide N into multiple equal bands");
+  // Register-source WGMMA has no shared A descriptor to re-address.
+  if (!isa<MemRefType>(op->getOperand(0).getType())) return int64_t{0};
+  auto geometry = dyn_cast<DictionaryAttr>(tuple.encodings.back());
+  auto repeats = geometry ? geometry.getAs<DenseI64ArrayAttr>("repeats") : DenseI64ArrayAttr{};
+  if (!repeats || repeats.size() != 3) return failure();
+  int64_t visits = frequency(op), work = repeats[0] - 1;
+  if (visits < 0 || work < 0 ||
+      llvm::MulOverflow(work, repeats[2], work) ||
+      llvm::MulOverflow(work, int64_t(op.getN()) / width.getInt(), work) ||
+      llvm::MulOverflow(work, int64_t{2}, work) ||
+      llvm::MulOverflow(work, visits, work))
+    return op.emitOpError("serial column loop service exceeds supported range");
+  return work;
 }
 FailureOr<int64_t> accessUnits(const LayoutConstraintGraph &graph,
                                const LayoutConstraint &c,
@@ -143,6 +255,8 @@ FailureOr<int64_t> accessUnits(const LayoutConstraintGraph &graph,
     return failure();
   auto &v = cost->cost;
   auto weight = frequency(graph.getProvenances()[c.provenance].source);
+  if (weight < 0) return failure();
+  if (!weight) return int64_t{0};
   auto maxTerm = uint64_t(INT64_MAX / weight / 3);
   if (v.memoryTransactions > maxTerm || v.bankConflictDegree > maxTerm ||
       v.instructionPathAndWork > maxTerm)
@@ -319,6 +433,7 @@ FailureOr<int64_t> reductionService(const LayoutConstraintGraph &graph,
   LinearExecutionLayout layout;
   if (analyzeLinearExecutionLayout(encoding, type, layout).status != ProofStatus::Proven)
     return failure();
+  if (frequency(c.reduction->source) < 0) return failure();
   unsigned axis = c.reduction->axis;
   unsigned first = 0;
   for (unsigned i = 0; i < axis; ++i) first += layout.logicalWidths[i];
@@ -356,8 +471,88 @@ FailureOr<int64_t> reductionService(const LayoutConstraintGraph &graph,
   int64_t packets = llvm::divideCeil(outputs, int64_t{32});
   int64_t merges = (int64_t{1} << levels) - 1;
   int64_t weight = frequency(c.reduction->source);
+  if (!weight) return int64_t{0};
   if (packets > (INT64_MAX / weight - 2 * warps * levels) / (2 * merges)) return failure();
   return weight * (2 * packets * merges + 2 * warps * levels);
+}
+
+// Compile alternatives in independent solver transactions. The incumbent and
+// conditional solutions retain the original domains. A uniform challenger
+// uses an explicitly projected rank-one layout and obtains fresh target proofs.
+struct NormalizationTrial {
+  unsigned reductionChoices = 0;
+  bool inOriginalDomain = true;
+};
+
+FailureOr<NormalizationTrial> prepareNormalizationTrial(ModuleOp mod,
+    LayoutConstraintGraph &graph, LayoutTarget &target, DictionaryAttr trial) {
+  NormalizationTrial result;
+  const LayoutConstraint *first = nullptr;
+  for (const auto &c : graph.getConstraints()) {
+    if (c.instruction)
+      return mod.emitError("normalization trial does not support MMA");
+    if (!c.reduction) continue;
+    if (!first) first = &c;
+    if (c.reduction->axis != first->reduction->axis ||
+        graph.getVariable(c.vars.front()).shapedType !=
+        graph.getVariable(first->vars.front()).shapedType)
+      return mod.emitError("expected matching normalization reductions");
+  }
+  if (!first) return mod.emitError("normalization trial requires a reduction");
+  auto &input = graph.getVariable(first->vars.front());
+  result.reductionChoices = input.candidates.size();
+  if (trial.empty()) return result;
+  if (trial.size() != 1) return mod.emitError("ambiguous normalization trial");
+  if (auto index = trial.getAs<IntegerAttr>("reduction_index")) {
+    if (!index.getType().isInteger(64) || index.getInt() < 0 ||
+        size_t(index.getInt()) >= input.candidates.size())
+      return mod.emitError("normalization reduction candidate out of range");
+    auto selected = input.candidates[index.getInt()];
+    input.candidates.assign(1, selected);
+    return result;
+  }
+  if (auto indices = trial.getAs<DenseI64ArrayAttr>("reduction_indices")) {
+    unsigned ordinal = 0;
+    for (const auto &c : graph.getConstraints()) {
+      if (!c.reduction) continue;
+      auto &var = graph.getVariable(c.vars.front());
+      if (ordinal >= indices.size()) return mod.emitError("missing normalization reduction index");
+      int64_t index = indices[ordinal++];
+      if (index < 0 || size_t(index) >= var.candidates.size())
+        return mod.emitError("normalization reduction candidate out of range");
+      auto selected = var.candidates[index];
+      var.candidates.assign(1, selected);
+    }
+    if (ordinal != indices.size()) return mod.emitError("unexpected normalization reduction index");
+    return result;
+  }
+  auto parent = trial.getAs<DistributedEncodingAttr>("uniform");
+  if (!parent) return mod.emitError("expected uniform normalization encoding");
+  auto source = cast<RankedTensorType>(input.shapedType);
+  auto reduced = cast<RankedTensorType>(graph.getVariable(first->vars.back()).shapedType);
+  auto slice = projectReductionEncoding(parent, source, reduced, first->reduction->axis);
+  if (failed(slice)) return mod.emitError("invalid normalization projection");
+  for (auto &v : graph.getVariables()) {
+    if (v.kind != LayoutKind::Distributed) continue;
+    auto t = dyn_cast<RankedTensorType>(v.shapedType);
+    if (!t || t.getElementType() != source.getElementType() ||
+        (t.getShape() != source.getShape() && t.getShape() != reduced.getShape()))
+      return mod.emitError("incompatible tensor in uniform normalization graph");
+    Attribute enc = t.getRank() == source.getRank() ? parent : *slice;
+    if (failed(target.verifyCandidate(v, enc, mod.getLoc()))) return failure();
+    result.inOriginalDomain &= llvm::any_of(v.candidates,
+        [&](const LayoutCandidate &c) { return c.value == enc; });
+    auto origin = graph.addProvenance(std::nullopt, v.anchor,
+        "normalization-trial", "uniform tile ownership and exact reduction projection");
+    v.candidates.assign(1, LayoutCandidate{enc, origin, v.id});
+  }
+  for (const auto &c : graph.getConstraints())
+    if (c.reduction)
+      result.inOriginalDomain &= llvm::any_of(c.reduction->pairs, [&](const auto &p) {
+        return p.sourceEncoding == parent && p.resultEncoding == *slice;
+      });
+  if (failed(prepareReductionPairs(graph, target, mod.getLoc()))) return failure();
+  return result;
 }
 
 struct Domain {
@@ -372,6 +567,7 @@ struct Model {
   RoutePrice price;
   z3::context ctx;
   z3::optimize solver{ctx};
+  z3::expr mainLoop{ctx.int_val(0)};
   z3::expr access{ctx.int_val(0)}, movement{ctx.int_val(0)}, reduction{ctx.int_val(0)},
       spill{ctx.int_val(0)}, routes{ctx.int_val(0)};
   std::vector<Domain> vars;
@@ -733,7 +929,7 @@ struct Model {
           }
           auto *at = c.use->getOwner();
           int64_t weight = frequency(at);
-          if (unitsPerUse > INT64_MAX / weight)
+          if (weight < 0 || (weight && unitsPerUse > INT64_MAX / weight))
             return module.emitError("multi-anchor route cost overflow");
           int64_t units = unitsPerUse * weight;
           Key k{x, a, b, at->getBlock(),
@@ -757,9 +953,10 @@ struct Model {
 // Reprice a concrete assignment through the native materializer's list of
 // sharing leaders. This traversal is independent of the Z3 factor tables.
 struct Bill {
+  int64_t mainLoop = 0;
   int64_t access = 0, movement = 0, reduction = 0, spill = 0, count = 0;
   auto objective() const {
-    return std::pair<int64_t, int64_t>(access + movement + reduction + spill, count);
+    return std::pair<int64_t, int64_t>(access + movement + reduction + spill + mainLoop, count);
   }
 };
 
@@ -780,13 +977,20 @@ std::optional<Bill> billWitness(Model &m, const CandidateAssignment &assignment,
     if (work < 0)
       return false;
     int64_t weight = frequency(c.use->getOwner());
-    if (work > (INT64_MAX - bill.movement) / weight)
+    if (weight < 0 || (weight && work > (INT64_MAX - bill.movement) / weight))
       return false;
     bill.movement += work * weight;
     ++bill.count;
     return true;
   };
   for (const auto &c : m.graph.getConstraints()) {
+    if (c.instruction) {
+      auto tuple = findInstructionSupport(m.graph, c, assignment.values);
+      if (!tuple) return std::nullopt;
+      auto units = columnLoopUnits(c, *tuple);
+      if (failed(units) || llvm::AddOverflow(bill.mainLoop, *units, bill.mainLoop))
+        return std::nullopt;
+    }
     if (m.scoreReduction && c.reduction) {
       auto work = reductionService(m.graph, c, assignment.values.lookup(c.vars[0]));
       if (failed(work) || *work > INT64_MAX - bill.reduction) return std::nullopt;
@@ -810,7 +1014,8 @@ std::optional<Bill> billWitness(Model &m, const CandidateAssignment &assignment,
       return std::nullopt;
   if (bill.access > INT64_MAX - bill.movement ||
       bill.access + bill.movement > INT64_MAX - bill.reduction ||
-      bill.access + bill.movement + bill.reduction > INT64_MAX - bill.spill)
+      bill.access + bill.movement + bill.reduction > INT64_MAX - bill.spill ||
+      bill.access + bill.movement + bill.reduction + bill.spill > INT64_MAX - bill.mainLoop)
     return std::nullopt;
   return bill;
 }
@@ -888,7 +1093,7 @@ LogicalResult verifyByEnumeration(Model &m, unsigned limit,
 FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
     ModuleOp module, const CertifiedInstructionDomains &domains,
     RoutePrice price, StoreMap storeMap, unsigned freeBits, unsigned timeoutMs,
-    unsigned oracleLimit, bool scoreReduction, bool nativeVector) {
+    unsigned oracleLimit, bool scoreReduction, bool nativeVector, bool subgroupCandidates) {
 #ifndef FRISK_HAS_Z3
   return module.emitError(
       "multi-anchor integer solver requires Z3; configure FRISK_Z3_ROOT");
@@ -903,9 +1108,17 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
   // Pointwise stores already propose layouts through their storage access.
   // Honor the ordinary F2 expansion budget independently of that choice.
   auto completions = addCompletions(*graph, *target, module, freeBits, storeMap,
-                                    /*offerConsecutiveWriters=*/!memorySeeds);
+                                    /*offerConsecutiveWriters=*/!memorySeeds, subgroupCandidates);
   if (failed(propagateCommonToFixedPoint(*graph)))
     return failure();
+  std::optional<NormalizationTrial> normalization;
+  if (auto attr = module->removeAttr("frisk.normalization_trial")) {
+    auto request = dyn_cast<DictionaryAttr>(attr);
+    if (!request) return module.emitError("expected normalization trial dictionary");
+    auto trial = prepareNormalizationTrial(module, *graph, *target, request);
+    if (failed(trial)) return failure();
+    normalization = *trial;
+  }
   Model m(module, *graph, *target, price);
   m.scoreReduction = scoreReduction;
   m.nativeVector = nativeVector;
@@ -913,6 +1126,14 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
     return failure();
   for (const auto &c : graph->getConstraints()) {
     m.constrain(c);
+    if (c.instruction) {
+      for (const auto &tuple : c.instruction->tuples) {
+        auto units = columnLoopUnits(c, tuple);
+        if (failed(units)) return failure();
+        if (*units)
+          m.mainLoop = m.mainLoop + m.charge(m.row(c.vars, tuple.encodings), *units);
+      }
+    }
     if (scoreReduction && c.reduction && failed(m.reductionFactor(c))) return failure();
     if (c.kind == ConstraintKind::StorageAccess && failed(m.accessFactor(c)))
       return failure();
@@ -922,7 +1143,7 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
   z3::params p(m.ctx);
   p.set("timeout", timeoutMs);
   m.solver.set(p);
-  auto service = m.solver.minimize(m.access + m.movement + m.reduction + m.spill);
+  auto service = m.solver.minimize(m.access + m.movement + m.reduction + m.spill + m.mainLoop);
   auto unique = m.solver.minimize(m.routes);
   auto status = m.solver.check();
   if (status == z3::unsat)
@@ -937,7 +1158,7 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
            z3::eq(model.eval(objective, true).simplify(),
                   m.solver.lower(h).simplify());
   };
-  if (!optimal(service, m.access + m.movement + m.reduction + m.spill) || !optimal(unique, m.routes))
+  if (!optimal(service, m.access + m.movement + m.reduction + m.spill + m.mainLoop) || !optimal(unique, m.routes))
     return module.emitError(
         "multi-anchor integer objective has no optimality certificate");
 
@@ -975,7 +1196,8 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
   if (failed(conversion) || failed(cost) || cost->saturated)
     return failure();
   auto bill = billWitness(m, assignment, *conversion);
-  if (!bill || bill->access != model.eval(m.access, true).get_numeral_int64() ||
+  if (!bill || bill->mainLoop != model.eval(m.mainLoop,true).get_numeral_int64() ||
+      bill->access != model.eval(m.access, true).get_numeral_int64() ||
       bill->movement != model.eval(m.movement, true).get_numeral_int64() ||
       bill->reduction != model.eval(m.reduction,true).get_numeral_int64() ||
       bill->spill != model.eval(m.spill,true).get_numeral_int64() ||
@@ -999,6 +1221,7 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
     }
     return std::pair<int64_t, int64_t>{offered, used};
   };
+  auto subgroup = count(completions.subgroup);
   auto matrices = count(completions.matrices),
        writers = count(completions.writers);
   if (failed(materializeLayouts(module, *graph, solution, false, target.get(),
@@ -1007,7 +1230,14 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
     return failure();
   Builder b(module.getContext());
   NamedAttrList receipt;
+  if (normalization) {
+    receipt.set("normalization_reduction_choices", b.getI64IntegerAttr(normalization->reductionChoices));
+    receipt.set("normalization_original_domain", b.getBoolAttr(normalization->inOriginalDomain));
+  }
   receipt.set("solver", b.getStringAttr("certified-f2-integer-v1"));
+  receipt.set("subgroup_candidates", b.getI64IntegerAttr(subgroup.first));
+  receipt.set("subgroup_selected", b.getI64IntegerAttr(subgroup.second));
+  receipt.set("main_loop_units", b.getI64IntegerAttr(bill->mainLoop));
   receipt.set("reduction_units",b.getI64IntegerAttr(bill->reduction));
   if (m.spillInput) {
     const auto &arm = m.compiledArms.find(assignment.values.lookup(*m.spillInput))->second;

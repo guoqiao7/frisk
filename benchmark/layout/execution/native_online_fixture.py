@@ -4,11 +4,18 @@ import math
 import struct
 
 
-def _copy_layout(rows, cols, threads=256):
+def _copy_layout(rows, cols, threads=256, packed=False):
     row_bits, col_bits = (n.bit_length()-1 for n in (rows, cols))
     thread_bits = threads.bit_length()-1
     regs = row_bits + col_bits - thread_bits
     order = list(range(regs+col_bits, regs+thread_bits)) + list(range(regs)) + list(range(regs, regs+col_bits))
+    if packed:
+        # The three lowest register bits hold eight adjacent halves. Give the
+        # next column bits to adjacent lanes, then distribute rows.
+        column_lane_bits = col_bits - 3
+        order = (list(range(regs+column_lane_bits, regs+thread_bits))
+                 + list(range(3, regs)) + list(range(3))
+                 + list(range(regs, regs+column_lane_bits)))
     matrix = [[int(i==j) for j in range(regs+thread_bits)] for i in order]
     wg_name = ',"warp_group"' if threads>128 else ''
     wg_bits = ',1' if threads>128 else ''
@@ -17,7 +24,7 @@ def _copy_layout(rows, cols, threads=256):
             f'matrix=dense<{matrix}>:tensor<{regs+thread_bits}x{regs+thread_bits}xi1>>,topology=[{1<<regs},32,4,{threads//128},1],replication=1>')
 
 
-def _storage(rows, cols, width, role):
+def _storage(rows, cols, width, role, *, output_half=False):
     if role in ('Q','K'):
         base = f'((i mod 8)*128+(i floordiv 8)*1024+(j mod 64)*2+(j floordiv 64)*{rows*128})'
         swizzle = 128
@@ -36,15 +43,19 @@ def _storage(rows, cols, width, role):
     return (f'#frisk.storage<map=#frisk.affine_layout<inputs=["dim0","dim1"],input_extents=[{rows},{cols}],'
             f'outputs=["byte_offset","bit_offset"],output_extents=[{rows*cols*width},8],'
             f'map=affine_map<(i,j)->({offset},0)>>,memory_space=#frisk<memory_space {"Shared" if role else "Global"}>,'
-            f'alignment={1024 if role else 128 if width==4 else 1},vector_granularity=1>')
+            f'alignment={1024 if role else 16 if output_half else 128 if width==4 else 1},vector_granularity=1>')
 
 
-def online_fixture(qtile, dim, rows, heads=8, kv_heads=8, causal=False, *, kv_rows=None, value_dim=None, execution_contract=None):
+def online_fixture(qtile, dim, rows, heads=8, kv_heads=8, causal=False, *, kv_rows=None, value_dim=None, execution_contract=None, packed_copy=False, row_reciprocal=False, half_output=False, base2_logits=False):
     from online_execution_contract import FA3_KINDS, validate
     if execution_contract is not None: validate(execution_contract)
     fa3 = execution_contract is not None and execution_contract['kind'] in FA3_KINDS
+    threads = execution_contract["cta"] if execution_contract and not fa3 else 256
     kv_tile = 128 if fa3 else 64
-    if fa3 and (qtile,dim,value_dim or dim,rows,kv_rows or rows,heads,kv_heads,causal)!=(128,128,128,8192,8192,16,16,False):
+    if fa3 and (row_reciprocal or base2_logits):
+        raise ValueError('FA3 uses its certified graph and its own lowering options')
+    if fa3 and ((qtile,dim,value_dim or dim)!=(128,128,128) or rows<=128 or
+                (kv_rows is not None and (type(kv_rows) is not int or kv_rows <= 128)) or not 1<=heads==kv_heads<=65535 or max(rows,kv_rows if kv_rows is not None else rows)*heads*128>=2**31):
         raise ValueError('unsupported FA3 replay workload')
     kv_rows = rows if kv_rows is None else kv_rows
     if type(kv_rows) is not int or kv_rows<=0 or type(rows) is not int:
@@ -53,20 +64,20 @@ def online_fixture(qtile, dim, rows, heads=8, kv_heads=8, causal=False, *, kv_ro
     if value_dim not in (32,64,128) or type(value_dim) is not int:
         raise ValueError('unsupported native online value dimension')
     kv_attr = f'kv_rows={kv_rows}:i64,' if kv_rows!=rows else ''
-    if qtile not in (128,256,512) or dim not in (64,128,256) or rows<=0 or kv_heads<=0 or heads%kv_heads:
+    if (qtile == 64 and threads != 128) or qtile not in (64,128,256,512) or dim not in (64,128,256) or rows<=0 or kv_heads<=0 or heads%kv_heads:
         raise ValueError('unsupported native online geometry')
     # Keep the SSA operations and copy policy common to the original native fixture.
     template=Path(__file__).with_name('native_online_q256.mlir').read_text()
     body=template[template.index('%zero ='):].splitlines()
     spec=[('Q',qtile,'Q'),('K0',kv_tile,'K'),('V0',kv_tile,'V'),('O',qtile,'')]
     columns={'Q':dim,'K0':dim,'V0':value_dim,'O':value_dim}
-    types=[f'memref<{r}x{columns[v]}x{"f32" if v=="O" and not fa3 else "f16"},1>' for v,r,_ in spec]
+    types=[f'memref<{r}x{columns[v]}x{"f32" if v=="O" and not (fa3 or half_output) else "f16"},1>' for v,r,_ in spec]
     lines=[f'module attributes {{frisk.target="sm_90a", frisk.online_launch={{rows={rows}:i64,{kv_attr}heads={heads}:i64,kv_heads={kv_heads}:i64,causal={str(causal).lower()}}}}} {{',
            '"frisk.kernel"() <{sym_name="native_online",function_type=('+','.join(types)+')->()}> ({',
            '^bb0('+','.join(f'%{v}:{t}' for (v,_,_),t in zip(spec,types))+'):']
     for (v,r,_),t in zip(spec,types):
-        w=4 if v=='O' and not fa3 else 2
-        lines.append(f'frisk.storage_contract %{v} {{layout={_storage(r,columns[v],w,None)}}} : {t}')
+        w=4 if v=='O' and not (fa3 or half_output) else 2
+        lines.append(f'frisk.storage_contract %{v} {{layout={_storage(r,columns[v],w,None,output_half=half_output and v=="O")}}} : {t}')
     for (v,r,role),t in zip(spec[:3],types):
         lines.append(f'%{role.lower()}s = memref.alloc() {{alignment=1024:i64}} : '+t.replace(',1>',',3>'))
     lines+=['"frisk.parallel"() <{ranges=array<i64:1>,threads=256:i64}> ({','^bb0(%i:index):']
@@ -78,14 +89,14 @@ def online_fixture(qtile, dim, rows, heads=8, kv_heads=8, causal=False, *, kv_ro
     def copy(index):
         (v,r,role),t=spec[index],types[index]
         binding = f'frisk.execution_role="{role.lower()}",' if fa3 else 'frisk.execution_threads=256:i64,'
-        width = execution_contract['groups'][execution_contract['roles'][role.lower()]]['threads'] if fa3 else 256
+        width = execution_contract['groups'][execution_contract['roles'][role.lower()]]['threads'] if fa3 else threads
         return (f'frisk.copy %g{v}[], %s{role.lower()}s[] {{{binding}'
-                f'frisk.execution_layout={_copy_layout(r,columns[v],width)},frisk.writer_policy="first_owner",'
+                f'frisk.execution_layout={_copy_layout(r,columns[v],width,packed_copy)},frisk.writer_policy="first_owner",'
                 f'frisk.vector_bytes=1:i64,srcExtents=array<i64:{r},{columns[v]}>,dstExtents=array<i64:{r},{columns[v]}>}} : '
                 + t+', '+t.replace(',1>',',3>'))
     lines.append(copy(0))
     logits=f'tensor<{qtile}x{kv_tile}xf32>'; out=f'tensor<{qtile}x{value_dim}xf32>'
-    bits=struct.unpack('>I',struct.pack('>f',1/math.sqrt(dim)))[0]
+    bits=struct.unpack('>I',struct.pack('>f',(math.log2(math.e) if base2_logits else 1.0)/math.sqrt(dim)))[0]
     for line in body:
         if line.startswith('frisk.copy'):
             copied = copy(1 if '%gK0' in line else 2)
@@ -105,6 +116,16 @@ def online_fixture(qtile, dim, rows, heads=8, kv_heads=8, causal=False, *, kv_ro
         line=line.replace('dense<0.125>',f'dense<0x{bits:08X}>').replace('%bound = arith.constant 16 :',f'%bound = arith.constant {(kv_rows+kv_tile-1)//kv_tile} :')
         if line.startswith('%s1 ='):line=line.replace('k=64:i64',f'k={dim}:i64')
         if line.startswith('%out1 ='):line=line.replace('n=64:i64',f'n={value_dim}:i64')
+        if base2_logits and line.startswith(('%alpha1 =', '%exp1 =')):
+            line = line.replace('math.exp ', 'math.exp2 ')
+        if row_reciprocal and not fa3:
+            if line.startswith('%denom3 ='):
+                vector_type = f'tensor<{qtile}xf32>'
+                lines.extend([f'%ones = arith.constant dense<1.0> : {vector_type}',
+                              f'%inv = arith.divf %ones, %lfinal : {vector_type}'])
+                line = line.replace('%lfinal', '%inv')
+            if line.startswith('%out ='):
+                line = line.replace('arith.divf', 'arith.mulf')
         if fa3:
             if line.startswith('%s1 ='):
                 line=line.replace('n=64:i64','n=128:i64')
@@ -113,12 +134,14 @@ def online_fixture(qtile, dim, rows, heads=8, kv_heads=8, causal=False, *, kv_ro
             if 'frisk.execution_threads=256:i64' in line:
                 role='qk' if line.startswith('%s1 =') else 'pv' if line.startswith('%out1 =') else 'reduce'
                 line=line.replace('frisk.execution_threads=256:i64',f'frisk.execution_role="{role}"')
-            if line.startswith('frisk.tile_store'):
-                half_out=out.replace('xf32','xf16')
-                lines.append(f'%out_half = arith.truncf %out : {out} to {half_out}')
-                line=f'frisk.tile_store %out_half, %gO : {half_out}, {types[3]}'
+        if (fa3 or half_output) and line.startswith('frisk.tile_store'):
+            half_out=out.replace('xf32','xf16')
+            lines.append(f'%out_half = arith.truncf %out : {out} to {half_out}')
+            line=f'frisk.tile_store %out_half, %gO : {half_out}, {types[3]}'
         lines.append(line)
     ir='\n'.join(lines)+'\n'
+    if threads == 128:
+        ir = ir.replace('threads=256:i64', 'threads=128:i64').replace('frisk.row_partition="contiguous",','')
     if execution_contract is None: return ir
     from online_execution_contract import bind_module
     return bind_module(ir,execution_contract)

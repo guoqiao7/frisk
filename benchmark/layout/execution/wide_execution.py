@@ -16,7 +16,7 @@ class WideEmitter(Emitter):
     def tensor_slots(self, value):
         layout = self.v[value]['distributed']
         nr, *topology = layout['topology']
-        if topology != [32, 4, 2, 1] or len(layout['logical']) != self.threads * nr:
+        if topology != [32, 4, self.threads//128, 1] or len(layout['logical']) != self.threads * nr:
             raise ValueError('inconsistent two-warpgroup carrier')
         return [layout['logical'][r::nr] for r in range(nr)]
 
@@ -34,7 +34,7 @@ class WideEmitter(Emitter):
         if (contract['path'] != 'vector' or contract['vector_bytes'] not in (1, 2)
                 or contract['completion'] != 'synchronous' or contract.get('guarded')
                 or attrs['frisk.writer_policy'] != 'first_owner'
-                or layout['topology'][1:] != [32,4,2,1]
+                or layout['topology'][1:] != [32,4,self.threads//128,1]
                 or any('xf16' not in self.v[x]['type'] for x in (a,b))
                 or any(attrs[key] != 'affine_map<() -> ()>' for key in ('srcMap','dstMap'))
                 or attrs['srcExtents'] != attrs['dstExtents'] or attrs['srcExtents'] != layout['shape']):
@@ -84,8 +84,8 @@ class WideEmitter(Emitter):
             if base % 16 or base >= 1<<18 or not 0 <= phase < 8:
                 raise ValueError('invalid descriptor address')
             values.append((base,phase))
-        addr = self.map([values[t//128][0] for t in range(256)])
-        phase = self.map([values[t//128][1] for t in range(256)])
+        addr = self.map([values[t//128][0] for t in range(self.threads)])
+        phase = self.map([values[t//128][1] for t in range(self.threads)])
         packed = self.tmp('b64')
         high = self.tmp('b64')
         self.emit(f'add.u32 {addr}, smem, {addr};')
@@ -104,7 +104,7 @@ class WideEmitter(Emitter):
         d = op['attrs']['frisk.mma_contract']
         grid, atom = d['grid'], d['atom']
         if (d['target'] != 'sm_90a' or d['version'] != 1 or atom not in ([64,32,16], [64,64,16], [64,128,16])
-                or grid != [2,1] or d['repeats'][1] != 1
+                or grid != [self.threads//128,1] or d['repeats'][1] != 1
                 or d['input_type'] != 'f16' or d['accumulator_type'] != 'f32'):
             raise ValueError('wide WGMMA requires a certified 2x1 m64nNk16 contract')
         rows, _, depth = d['repeats']
@@ -134,20 +134,20 @@ class WideEmitter(Emitter):
 
         out = self.newregs(result)
         for i,(z,old) in enumerate(zip(out,self.regs(c),strict=True)):
-            if slots[i] != [element(t,i//width,i%width)*cols+column(t,i%width) for t in range(256)]:
+            if slots[i] != [element(t,i//width,i%width)*cols+column(t,i%width) for t in range(self.threads)]:
                 raise ValueError('WGMMA accumulator ownership mismatch')
             self.emit(f'mov.f32 {z}, {old};')
         source = self.tensor_slots(a) if rs else None
         for r in range(rows):
             pending = []
             for k in range(depth):
-                bd = self.group_descriptor(b,d['b_descriptor'],[0,0],16*k)
+                bd = self.group_descriptor(b,d['b_descriptor'],[0]*(self.threads//128),16*k)
                 if rs:
                     packed = []
                     for j in range(4):
                         i = (r*depth+k)*8 + j*2
                         for h in (0,1):
-                            expected = [element(t,r,2*j+h)*(16*depth)+16*k+column(t,2*j+h) for t in range(256)]
+                            expected = [element(t,r,2*j+h)*(16*depth)+16*k+column(t,2*j+h) for t in range(self.threads)]
                             if source[i+h] != expected:
                                 raise ValueError('WGMMA RS packing disagrees with holder map')
                         z = self.tmp()
@@ -155,7 +155,7 @@ class WideEmitter(Emitter):
                         packed.append(z)
                     operands = '{'+', '.join(packed)+'}, '+bd+', mma_acc, 1, 1, 1'
                 else:
-                    ad = self.group_descriptor(a,d['a_descriptor'],[start(r,w) for w in (0,1)],16*k)
+                    ad = self.group_descriptor(a,d['a_descriptor'],[start(r,w) for w in range(self.threads//128)],16*k)
                     operands = f'{ad}, {bd}, mma_acc, 1, 1, 0, 0'
                 pending.append(operands)
                 if len(pending) == self.mma_group_size:
@@ -352,17 +352,23 @@ class WideEmitter(Emitter):
         instructions = {'arith.mulf':'mul.rn.f32','arith.addf':'add.rn.f32','arith.subf':'sub.rn.f32',
                         'arith.maximumf':'max.NaN.f32','arith.divf':'div.rn.f32',
                         'arith.truncf':'cvt.rn.f16.f32','math.rsqrt':'rsqrt.approx.f32'}
-        if name not in instructions and name!='math.exp': raise ValueError('unhandled wide op '+name)
+        if name not in instructions and name not in ('math.exp','math.exp2'): raise ValueError('unhandled wide op '+name)
         if any(self.tensor_slots(v)!=self.tensor_slots(value) for v in args):
             raise ValueError('elementwise operand holder mismatch')
         for i,z in enumerate(self.newregs(value)):
             operands = [self.regs(v)[i] for v in args]
-            if name == 'math.exp':
-                x = self.tmp('f32')
-                self.emit(f'mul.rn.f32 {x}, {operands[0]}, 0f3fb8aa3b;')
-                self.emit(f'ex2.approx.f32 {z}, {x};')
+            if name in ('math.exp','math.exp2'):
+                x = operands[0]
+                if name == 'math.exp':
+                    x = self.tmp('f32')
+                    self.emit(f'mul.rn.f32 {x}, {operands[0]}, 0f3fb8aa3b;')
+                ftz = '.ftz' if getattr(self,'flush_exp_subnormals',False) else ''
+                self.emit(f'ex2.approx{ftz}.f32 {z}, {x};')
             else:
                 self.emit(instructions[name]+' '+z+', '+', '.join(operands)+';')
+
+    def loop_upper_bound(self, op, static_bound):
+        return static_bound
 
     def sequence(self, ops, begin, end):
         i = begin
@@ -392,6 +398,7 @@ class WideEmitter(Emitter):
                 index = self.tmp()
                 self.indices[iv] = index
                 self.emit(f'mov.u32 {index}, {low};')
+                high = self.loop_upper_bound(op,high)
                 self.emit(f'frisk_loop_{i}:')
                 pred = self.tmp('pred')
                 self.emit(f'setp.ge.s32 {pred}, {index}, {high};')
@@ -418,7 +425,7 @@ class WideEmitter(Emitter):
                 self.shuffle_network_policy!='auto' or self.execution_trace is not None):
             raise ValueError('wide execution requires the declared synchronous schedule')
         ops = self.data['operations']
-        allocation = plan_shared_allocation(self.data,redistribution_validator=self.validate_route,execution_threads=256)
+        allocation = plan_shared_allocation(self.data,redistribution_validator=self.validate_route,execution_threads=self.threads)
         kernel, = [o for o in ops if o['name']=='frisk.kernel']
         roots = kernel['arguments']
         if set(roots)!=set(allocation['global_roots']) or len(roots)!=len(set(roots)):
@@ -437,7 +444,7 @@ class WideEmitter(Emitter):
         asm = asm.replace('\\','\\5C').replace('"','\\22').replace('\n','\\0A')
         names = ['%arg'+str(i) for i in range(len(roots))]
         ptr = '!tt.ptr<i8>'
-        text = ('module attributes {"ttg.num-warps" = 8 : i32, "ttg.num-ctas" = 1 : i32, '
+        text = ('module attributes {"ttg.num-warps" = '+str(self.threads//32)+' : i32, "ttg.num-ctas" = 1 : i32, '
                 '"ttg.threads-per-warp" = 32 : i32, "ttg.target" = "cuda:90"} {\n'
                 ' llvm.mlir.global external @frisk_dynamic() {addr_space = 3 : i32, alignment = 1024 : i64} : !llvm.array<0 x i8>\n'
                 ' tt.func public @frisk_execution('+', '.join(n+': '+ptr for n in names)+') {\n'
@@ -446,5 +453,5 @@ class WideEmitter(Emitter):
                 '  %done = tt.elementwise_inline_asm "'+asm+'" {constraints = "=r'+',l'*len(names)+',r", '
                 'pure = false, packed_element = 1 : i32} '+', '.join(names)+', %addr : '+
                 ', '.join([ptr]*len(names))+', i32 -> i32\n tt.return\n }\n}\n')
-        return text,dict(threads=256,root_order=roots,dynamic_shared_bytes=shared,
+        return text,dict(threads=self.threads,root_order=roots,dynamic_shared_bytes=shared,
                          shared_allocation_plan=allocation,emitted_operations=len(ops),mma_group_size=self.mma_group_size)
