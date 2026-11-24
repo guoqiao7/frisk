@@ -122,6 +122,11 @@ class AccumulatorSlicesTest(unittest.TestCase):
         self.assertIn("saved_b_bytes = 163840 : i64", gemm.layout_ir)
         with self.assertRaisesRegex(ValueError, "staging"):
             read_layouts(gemm.layout_ir.replace("repeated_a_bytes = 61440", "repeated_a_bytes = 1"))
+        with self.assertRaisesRegex(ValueError, "staging"):
+            read_layouts(re.sub(r"idle_copy_lanes = \d+", "idle_copy_lanes = 999", gemm.layout_ir))
+        for options in (dict(grid_ctas=0), dict(grid_ctas=True), dict(sm_count=0)):
+            with self.assertRaisesRegex(ValueError, "grid and SM"):
+                DenseGemm.from_open_layout(ir, 240, **options)
         for options in (dict(resident_atoms=2), dict(staged_k_tiles=1)):
             with self.assertRaisesRegex(ValueError, "slice contract"):
                 emit(plan, 240, **options)

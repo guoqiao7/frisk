@@ -222,6 +222,13 @@ def read_layouts(ir):
             raise ValueError("incomplete native slice receipt")
         k, width, slots = (fields[key] for key in ("k_extent", "resident_atoms", "staged_k_tiles"))
         expected = native_slice_traffic(plan, k, width, slots)
+        # Receipts generated before copy-issue pricing contain byte traffic only.
+        if fields.keys().isdisjoint(("copy_range_visits", "idle_copy_lanes", "grid_ctas", "sm_count")):
+            del expected["copy_range_visits"], expected["idle_copy_lanes"]
+        if "grid_ctas" in fields or "sm_count" in fields:
+            if not (0 <= fields.get("grid_ctas", -1) < 2**31 and 0 < fields.get("sm_count", 0) < 2**31):
+                raise ValueError("invalid native grid pricing receipt")
+            expected.update(grid_ctas=fields["grid_ctas"], sm_count=fields["sm_count"])
         if "issued_a_bytes" in fields:
             delivery = delivery_traffic(plan,k,expected)
             graph = _one(r"(?m)^.*frisk\.protected_graph = (.*)$", ir)
@@ -424,16 +431,22 @@ def native_slice_traffic(plan, k, width, slots):
     if k <= 0 or k % 16 or slots not in (1, 2) or not 1 <= width <= len(plan.origins):
         raise ValueError("invalid native slice contract")
     issued_a = issued_b = slices = 0
+    visits = idle = 0
+    steps = k // 16
+    staging = _b_staging(plan, k, width, slots)
     for group in _atom_groups(plan, width):
         rows, cols = _copy_regions(group, plan.atom)
         issued_a += sum(hi - lo for lo, hi in rows) * 2 * k
         issued_b += sum(hi - lo for lo, hi in cols) * 2 * k
+        for ranges, repeats in ((rows, steps), (cols, steps - (staging.retained if slices else 0))):
+            visits += len(ranges) * repeats
+            idle += sum((-(hi - lo) * 2) % 256 for lo, hi in ranges) * repeats
         slices += 1
-    staging = _b_staging(plan, k, width, slots)
     repeated_a = issued_a - 2 * k * plan.m
     repeated_b = issued_b - 2 * k * plan.n
     saved_b = (slices - 1) * staging.retained * plan.n * 32
     return dict(k_extent=k, resident_atoms=width, staged_k_tiles=slots,
+                copy_range_visits=visits, idle_copy_lanes=idle,
                 repeated_a_bytes=repeated_a, repeated_b_bytes=repeated_b,
                 retained_b_k16=staging.retained, saved_b_bytes=saved_b,
                 shared_bytes=staging.shared_bytes,

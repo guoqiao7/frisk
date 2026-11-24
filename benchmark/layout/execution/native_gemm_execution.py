@@ -20,16 +20,28 @@ class DenseGemm:
     k: int
 
     @classmethod
-    def from_open_layout(cls, layout_ir, k, *, resident_atoms=None, staged_k_tiles=2, delivery="auto", frisk_opt=None):
-        """Jointly solve the protected anchor, residency and independent store owners."""
+    def from_open_layout(cls, layout_ir, k, *, resident_atoms=None, staged_k_tiles=2, delivery="auto",
+                         grid_ctas=None, sm_count=114, frisk_opt=None):
+        """Jointly solve the protected anchor, residency and independent store owners.
+
+        Pass the number of independent GEMM CTAs and available SMs to price
+        partially filled launches. An unknown grid uses the throughput estimate.
+        """
         if (resident_atoms is not None and (type(resident_atoms) is not int or resident_atoms < 1)) or staged_k_tiles not in (1, 2):
             raise ValueError("expected positive resident width and one or two K16 slots")
+        if ((grid_ctas is not None and (type(grid_ctas) is not int or not 0 < grid_ctas < 2**31))
+                or type(sm_count) is not int or not 0 < sm_count < 2**31):
+            raise ValueError("expected positive grid and SM counts within signed i32")
         solver = frisk_opt or os.environ.get("FRISK_OPT", "frisk-opt")
         if delivery not in ("auto", "dd", "ds", "sd", "ss"):
             raise ValueError("delivery must be auto or a pair of d/s owners for C and R")
         residency = "native-auto-residency=true" if resident_atoms is None else f"native-resident-atoms={resident_atoms}"
         option = ("--frisk-protected-store-layout=anchor-solver=integer "
                   f"{residency} native-delivery={delivery} native-k-slots={staged_k_tiles}")
+        if grid_ctas is not None:
+            option += f" native-grid-ctas={grid_ctas} native-sm-count={sm_count}"
+        elif sm_count != 114:
+            option += f" native-sm-count={sm_count}"
         solved = subprocess.run([solver, option, "--canonicalize", "-verify-each"],
                                 input=layout_ir, capture_output=True, text=True)
         if solved.returncode:

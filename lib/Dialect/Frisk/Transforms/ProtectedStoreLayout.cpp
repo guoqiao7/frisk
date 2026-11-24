@@ -1015,7 +1015,8 @@ static FailureOr<int64_t> slicedReductionExchange(RankedTensorType from) {
 LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
                                    unsigned timeout, unsigned oracleLimit, bool scoreReduction, bool allowStripes,
                                    bool replayScratch, bool bankFloor, StringRef globalAccess, bool subgroupCandidates,
-                                   unsigned residentAtoms, unsigned stagedKTiles, StringRef delivery, bool autoWidth) {
+                                   unsigned residentAtoms, unsigned stagedKTiles, StringRef delivery, bool autoWidth,
+                                   unsigned gridCtas, unsigned smCount) {
   PassManager prepare(module.getContext());
   prepare.addPass(createNormalizeLayoutIRPass());
   if (failed(prepare.run(module)))
@@ -1102,7 +1103,7 @@ LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
              w <= (autoWidth ? atoms : residentAtoms); ++w) {
           auto t = priceNativeSlices(g, extent, w, stagedKTiles, partials, reductionAxis >= 0);
           if (!t) continue;
-          int64_t score = nativeResidencySectors(g, *t, reductionAxis, partials);
+          int64_t score = nativeResidencySectors(g, *t, reductionAxis, partials, gridCtas, smCount);
           widthScores[c.anchor.front()].push_back(score);
           widths.push_back(b.getDictionaryAttr({
               b.getNamedAttr("resident_atoms", b.getI64IntegerAttr(w)),
@@ -1202,6 +1203,8 @@ LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
     selected[idx] = it - d.begin();
     if (autoWidth || residentAtoms) {
       NamedAttrList receipt(sliceReceipts.lookup(tuple.front()));
+      receipt.set("grid_ctas", b.getI64IntegerAttr(gridCtas));
+      receipt.set("sm_count", b.getI64IntegerAttr(smCount));
       receipt.set("width_units", b.getDenseI64ArrayAttr(widthScores.lookup(tuple.front())));
       op->setAttr("frisk.native_slice_traffic", receipt.getDictionary(b.getContext()));
     }
@@ -1422,6 +1425,10 @@ public:
   Option<unsigned> nativeResidentAtoms{*this, "native-resident-atoms",
       llvm::cl::desc("Fix native dense SS GEMM residency and price its independent C/R writers (0 disables)"),
       llvm::cl::init(0)};
+  Option<unsigned> nativeGridCtas{*this, "native-grid-ctas",
+      llvm::cl::desc("Independent GEMM CTAs in the launch (0 uses throughput estimate)"), llvm::cl::init(0)};
+  Option<unsigned> nativeSmCount{*this, "native-sm-count",
+      llvm::cl::desc("Available SMs for GEMM grid pricing"), llvm::cl::init(114)};
   Option<bool> nativeAutoWidth{*this, "native-auto-residency",
       llvm::cl::desc("Rank legal accumulator widths within each certified anchor"), llvm::cl::init(false)};
   Option<std::string> nativeDelivery{*this, "native-delivery",
@@ -1478,6 +1485,8 @@ public:
   void runOnOperation() override {
     ModuleOp original=getOperation();
     auto error=[&](StringRef msg){original.emitError(msg);signalPassFailure();};
+    if (!nativeSmCount || nativeSmCount > INT32_MAX || nativeGridCtas > INT32_MAX)
+      return error("native SM count must be positive and launch dimensions must fit i32");
     if (nativeAutoWidth && nativeResidentAtoms) return error("choose fixed or open native residency");
     if (nativeDelivery != "auto" && nativeDelivery != "dd" && nativeDelivery != "ds" &&
         nativeDelivery != "sd" && nativeDelivery != "ss") return error("invalid native C/R delivery");
@@ -1510,7 +1519,8 @@ public:
         return selectIntegerAnchors(graph, completionBits, integerTimeout,
                                     oracleLimit, scoreReduction, allowStripes,
                                     scratchBackend == "gluon34", bankFloor,
-                                    globalAccess, expand, nativeResidentAtoms, nativeKSlots, nativeDelivery, nativeAutoWidth);
+                                    globalAccess, expand, nativeResidentAtoms, nativeKSlots, nativeDelivery, nativeAutoWidth,
+                                    nativeGridCtas, nativeSmCount);
       };
       if (!subgroupCandidates)
         return solve(mod, false);

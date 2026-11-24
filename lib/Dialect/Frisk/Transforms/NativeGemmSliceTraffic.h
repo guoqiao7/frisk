@@ -11,6 +11,28 @@ struct NativeSliceTraffic {
   int64_t repeatedA = 0, repeatedB = 0, retainedSteps = 0, savedB = 0;
   int64_t sharedBytes = 0;
 
+  int64_t copyRanges = 0, idleCopyLanes = 0;
+
+  // Both copy_a and copy_b issue two 16-byte vectors per panel element
+  // per K16. A new contiguous interval restarts the loop at thread zero.
+  void countCopy(int64_t elements, int64_t visits) {
+    int64_t vectors = 2 * elements;
+    copyRanges += visits;
+    idleCopyLanes += visits * (llvm::alignTo(vectors, 256) - vectors);
+  }
+  void countPanels(const llvm::SmallBitVector &panels, int64_t panelSize,
+                   int64_t visits) {
+    int64_t run = 0;
+    for (unsigned i = 0; i < panels.size(); ++i) {
+      if (panels.test(i))
+        ++run;
+      if (run && (i + 1 == panels.size() || !panels.test(i + 1))) {
+        countCopy(run * panelSize, visits);
+        run = 0;
+      }
+    }
+  }
+
   int64_t sectors() const { return (repeatedA + repeatedB - savedB) / 32; }
   DictionaryAttr receipt(Builder &b) const {
     NamedAttrList out;
@@ -24,6 +46,8 @@ struct NativeSliceTraffic {
     add("saved_b_bytes", savedB);
     add("shared_bytes", sharedBytes);
     add("extra_global_sectors", sectors());
+    add("copy_range_visits", copyRanges);
+    add("idle_copy_lanes", idleCopyLanes);
     return out.getDictionary(b.getContext());
   }
 };
@@ -53,6 +77,8 @@ priceNativeSlices(const SM90MmaGeometry &g, int64_t extent, int64_t width,
     }
     result.repeatedA += int64_t(rows.count()) * 64 * extent * 2;
     result.repeatedB += int64_t(cols.count()) * g.atomN * extent * 2;
+    result.countPanels(rows, 64, extent / 16);
+    result.countPanels(cols, g.atomN, extent / 16);
     fullB &= cols.all();
   }
   result.repeatedA -= g.m * extent * 2;
@@ -76,6 +102,7 @@ priceNativeSlices(const SM90MmaGeometry &g, int64_t extent, int64_t width,
   if (retained <= 0) return result;
   result.retainedSteps = retained;
   result.savedB = (slices - 1) * retained * slab;
+  result.countCopy(g.n, -(slices - 1) * retained);
   int64_t used = retained == steps ? steps : retained + stages;
   result.sharedBytes = std::max(result.sharedBytes, base + used * slab + partials);
   return result;
@@ -83,12 +110,25 @@ priceNativeSlices(const SM90MmaGeometry &g, int64_t extent, int64_t width,
 // Express the existing native pre-ptxas spill and residency estimates in
 // 32-byte units. Charge the real retained-B copy ranges for this width.
 inline int64_t nativeResidencySectors(const SM90MmaGeometry &g, const NativeSliceTraffic &t,
-                                      int reductionAxis, int64_t partialBytes) {
+                                      int reductionAxis, int64_t partialBytes,
+                                      unsigned gridCtas, unsigned smCount) {
   int64_t atoms = g.mRepeat * g.nRepeat;
   int64_t steps = t.extent / 16;
   int64_t loopTemps = 28 + 4 * std::min(steps, t.stages);
   int64_t tailTemps = 16 + (reductionAxis >= 0 ? g.atomN / 4 : 0);
-  int64_t sectors = t.sectors();
+  // Keep actual bytes in the traffic receipt. Range setup is one warp
+  // issue unit per warp. Unused lanes in a copy round cost 16 bytes of
+  // issue capacity each. Only the exposed fraction of the grid pays the
+  // latter: pair a CTA in the last wave with at most one empty SM slot.
+  // With no launch grid, use the throughput estimate.
+  int64_t sectors = t.sectors() + t.copyRanges * (g.threads / 32);
+  if (gridCtas) {
+    unsigned tail = gridCtas % smCount;
+    int64_t exposed = std::min(tail, smCount - tail);
+    int64_t idleUnits = t.idleCopyLanes / 2;
+    sectors += (idleUnits / gridCtas) * exposed +
+               (idleUnits % gridCtas) * exposed / gridCtas;
+  }
   for (int64_t i = 0; i < atoms; i += t.width) {
     int64_t regs = std::min(t.width, atoms - i) * g.atomN / 2;
     // One spilled word stored and reloaded by 256 lanes is 64 sectors.
