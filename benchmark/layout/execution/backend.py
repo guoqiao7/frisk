@@ -1048,12 +1048,17 @@ def emit(data, *, demand_query_observer=None, demand_query_budget=65536, shuffle
 def compile_execution(data, **emission_options):
  """Compile a checked single-CTA execution packet and prepare its launch ABI.
 
- Returns (Triton CompiledKernel, emission metadata). The kernel takes the
+ For a DenseGemm layout/extent contract, return its launchable native image
+ and static residency ranking. Other packets return a backend kernel and
+ emission metadata. The packet kernel takes the
  Global buffers in root_order. Static tile arguments may be contiguous views
  into the same read-only input. For online K TMA, append the prepared map
  selected by info["k_tensor_map"]["abi"] and use the reported launch grid.
  The value ABI takes a host CUtensorMap, the global ABI a device pointer.
  """
+ from native_gemm_execution import DenseGemm, compile_dense_gemm
+ if isinstance(data, DenseGemm):
+  return compile_dense_gemm(data, **emission_options)
  from online_execution_contract import FA3_KINDS
  for op in data.get('operations',[]):
   if op.get('name')=='builtin.module' and op.get('attrs',{}).get('frisk.execution_contract',{}).get('kind') in FA3_KINDS:

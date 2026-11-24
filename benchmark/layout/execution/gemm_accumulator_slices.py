@@ -5,11 +5,13 @@ It does not interpret arbitrary surrounding MLIR. Each CTA owns an independent
 row-major f16 A/B (16-byte aligned), f32 C and optional f32 R. Launch one block
 per independent problem with 256 threads and the returned dynamic shared byte
 count. By default both residency modes stage adjacent K16 steps in distinct slots; the
-wait policy controls how many WGMMA instructions precede the drain. A sliced
-kernel completes all K steps and delivers each original atom before the next.
+wait policy controls how many WGMMA instructions precede the drain. Static
+selection ranks all contiguous resident atom counts and compiles one image.
+An explicit atom count or the legacy full/slice controls override selection.
 Use --output kernel.cu to inspect CUDA, or --output kernel.cubin to compile.
 """
 import argparse
+import json
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -179,6 +181,96 @@ def _intervals(starts, width):
     return result
 
 
+def _atom_groups(plan, width):
+    for start in range(0, len(plan.origins), width):
+        yield plan.origins[start:start + width]
+
+
+def _copy_regions(group, atom):
+    rows = _intervals([v for r, c, s, d in group for v in (r, s)], 64)
+    cols = _intervals([v for r, c, s, d in group for v in (c, d)], atom)
+    return rows, cols
+
+
+def rank_residencies(plan, k, *, staged_k_tiles=2, grid_ctas=None, sm_count=114):
+    """Pre-ptxas relative byte-cost estimates per CTA, with a fixed atom order.
+
+    Each group retains its accumulators for all K. Charge the actual copy
+    intervals once per group, even when the two warpgroups share an operand.
+    Estimate one local store/load per excess live FP32 word per K16 update.
+    The temporary register allowance is a proxy, not a ptxas allocation.
+    """
+    if type(k) is not int or k <= 0 or k % 16 or staged_k_tiles not in (1, 2):
+        raise ValueError("positive K multiple of 16 and one or two K slots required")
+    if type(sm_count) is not int or sm_count < 1 or (
+            grid_ctas is not None and (type(grid_ctas) is not int or grid_ctas < 1)):
+        raise ValueError("positive SM and CTA counts required")
+    # A standalone compile targets throughput unless a smaller grid is known.
+    target_ctas = 2 if grid_ctas is None or grid_ctas > sm_count else 1
+    # H100 has a 228 KiB shared arena, including 1 KiB reserved per CTA.
+    shared_limit = (228 * 1024) // (shared_bytes(plan) + 1024)
+    if not shared_limit:
+        raise ValueError("operand slots and reduction scratch exceed the SM90 CTA shared budget")
+    target_ctas = min(target_ctas, shared_limit)
+    depth = min(k // 16, staged_k_tiles)
+    # CTA addressing, vector copy temporaries, and two 64-bit descriptors/slot.
+    loop_temps = 16 + 8 + 4 + 4 * depth  # Four 64-bit base pointers.
+    # Reduction values/shuffles coexist with the undelivered C registers.
+    delivery_temps = 16 + (plan.atom // 4 if plan.reduced_writers is not None else 0)
+    overhead = max(loop_temps, delivery_temps)
+    base_bytes = 2 * k * (plan.m + plan.n)
+    candidates = []
+    for width in range(1, len(plan.origins) + 1):
+        a_bytes = b_bytes = spill_bytes = groups = peak = 0
+        for group in _atom_groups(plan, width):
+            rows, cols = _copy_regions(group, plan.atom)
+            a_bytes += 2 * k * sum(end - start for start, end in rows)
+            b_bytes += 2 * k * sum(end - start for start, end in cols)
+            live = len(group) * (plan.atom // 2)
+            peak = max(peak, live + overhead)
+            # Delivery executes once; avoid multiplying epilogue-only pressure by K.
+            loop_excess = max(0, live + loop_temps - 255)
+            delivery_excess = max(0, live + delivery_temps - 255)
+            spill_bytes += 2 * 4 * 256 * (loop_excess * (k // 16) + delivery_excess)
+            groups += 1
+        candidates.append(dict(resident_atoms=width, slices=groups,
+                               peak_register_estimate=peak, a_bytes=a_bytes, b_bytes=b_bytes,
+                               repeated_ab_bytes=a_bytes + b_bytes - base_bytes,
+                               estimated_spill_bytes=spill_bytes,
+                               score_bytes=a_bytes + b_bytes + spill_bytes))
+    # Estimate the latency-sensitive fraction using the larger of the two
+    # compulsory workloads (operand staging and C/R delivery). Extra copy
+    # and local traffic are always additive. The maximum is a scoring proxy;
+    # it does not imply that the epilogue physically overlaps the K loop.
+    output_bytes = 4 * (plan.m * plan.n + (plan.n if plan.reduced_writers is not None else 0))
+    compulsory = max(base_bytes, output_bytes)
+    for candidate in candidates:
+        registers = min(255, candidate["peak_register_estimate"])
+        allocated = ((registers + 7) // 8) * 8  # 256 register words per warp.
+        resident = min(shared_limit, 65536 // (256 * allocated))
+        lost = max(0, target_ctas - resident)
+        charge = max(output_bytes, base_bytes * (1 + lost)) - compulsory
+        candidate.update(resident_ctas_estimate=resident, target_ctas=target_ctas,
+                         compulsory_units=compulsory, residency_cost_units=charge,
+                         score_units=compulsory + charge + candidate["repeated_ab_bytes"]
+                                     + candidate["estimated_spill_bytes"])
+    return sorted(candidates, key=lambda c: (c["score_units"], c["slices"],
+                                             c["peak_register_estimate"], c["resident_atoms"]))
+
+
+def _residency(plan, k, staged_k_tiles, sliced, resident_atoms, grid_ctas, sm_count):
+    if sliced is not None:
+        if type(sliced) is not bool or resident_atoms is not None:
+            raise ValueError("choose either sliced or resident_atoms")
+        resident_atoms = 1 if sliced else len(plan.origins)
+    if resident_atoms is None:
+        return rank_residencies(plan, k, staged_k_tiles=staged_k_tiles, grid_ctas=grid_ctas, sm_count=sm_count)[0]["resident_atoms"]
+    if type(resident_atoms) is not int or not 1 <= resident_atoms <= len(plan.origins):
+        raise ValueError("resident_atoms outside the certified atom count")
+    return resident_atoms
+
+
+
 def _mma(atom, count):
     regs = atom//2
     dest = ", ".join(f"%{i}" for i in range(regs))
@@ -216,7 +308,7 @@ def _write_columns(plan):
             f"int j = {index};", f"R[j]=finish_column<{plan.m//64},{plan.n}>(partial,j);", "}}"]
 
 
-def emit(plan, k, *, sliced=True, wait_group=1, staged_k_tiles=2):
+def emit(plan, k, *, sliced=None, resident_atoms=None, wait_group=1, staged_k_tiles=2, grid_ctas=None, sm_count=114):
     if k<=0 or k%16 or wait_group not in (1,2):
         raise ValueError("positive K multiple of 16 and wait group 1 or 2 required")
     if staged_k_tiles not in (1,2) or wait_group > staged_k_tiles:
@@ -234,8 +326,9 @@ def emit(plan, k, *, sliced=True, wait_group=1, staged_k_tiles=2):
               f"float* partial=(float*)(sm+{scratch}); int tid=threadIdx.x,wg=tid/128;"]
     if plan.reduced_writers is not None:
         source.append(f"R+=(size_t)blockIdx.x*{n};")
-    groups = [(origin,) for origin in plan.origins] if sliced else [plan.origins]
-    for group in groups:
+    width = _residency(plan, k, staged_k_tiles, sliced, resident_atoms, grid_ctas, sm_count)
+    for group in _atom_groups(plan, width):
+        rows, cols = _copy_regions(group, atom)
         source += ["{", f"float acc[{len(group)}][{atom//2}]={{}};"]
         # The odd final K16 step gets a single-buffer tail in all four arms.
         steps = ((1,0,k),) if staged_k_tiles==1 else ((2,0,k//32*32),(1,k//32*32,k))
@@ -245,9 +338,9 @@ def emit(plan, k, *, sliced=True, wait_group=1, staged_k_tiles=2):
             source += ["#pragma unroll 1", f"for(int kt={start}; kt<{stop}; kt+={16*depth}) {{",
                        "__syncthreads();"]
             for step in range(depth):
-                for lo,hi in _intervals([v for r,c,s,d in group for v in (r,s)],64):
+                for lo,hi in rows:
                     source.append(f"copy_a<{m},{k},{lo},{hi}>(sm+{step*pitch},A,kt+{step*16});")
-                for lo,hi in _intervals([v for r,c,s,d in group for v in (c,d)],atom):
+                for lo,hi in cols:
                     source.append(f"copy_b<{n},{lo},{hi}>(sm+{step*pitch+m*32},B,kt+{step*16});")
             source += ["__syncthreads();", 'asm volatile("fence.proxy.async.shared::cta;" ::: "memory");']
             for i,(r,c,s,d) in enumerate(group):
@@ -273,10 +366,13 @@ def emit(plan, k, *, sliced=True, wait_group=1, staged_k_tiles=2):
     return "\n".join(source+_write_columns(plan)+["}",""])
 
 
-def compile_accumulator_gemm(layout_ir, k, *, sliced=True, wait_group=1, staged_k_tiles=2, nvcc="nvcc"):
+def compile_accumulator_gemm(layout_ir, k, *, sliced=None, resident_atoms=None, wait_group=1, staged_k_tiles=2, grid_ctas=None, sm_count=114, nvcc="nvcc"):
     """Return a CUDA driver-loadable cubin and its launch contract."""
     plan = read_layouts(layout_ir)
-    source = emit(plan,k,sliced=sliced,wait_group=wait_group,staged_k_tiles=staged_k_tiles)
+    ranked = rank_residencies(plan, k, staged_k_tiles=staged_k_tiles, grid_ctas=grid_ctas, sm_count=sm_count)
+    width = (ranked[0]["resident_atoms"] if sliced is None and resident_atoms is None else
+             _residency(plan, k, staged_k_tiles, sliced, resident_atoms, grid_ctas, sm_count))
+    source = emit(plan, k, resident_atoms=width, wait_group=wait_group, staged_k_tiles=staged_k_tiles)
     with tempfile.TemporaryDirectory(prefix="frisk-accumulator-") as tmp:
         path = Path(tmp)
         (path/"kernel.cu").write_text(source)
@@ -285,27 +381,42 @@ def compile_accumulator_gemm(layout_ir, k, *, sliced=True, wait_group=1, staged_
         if result.returncode:
             raise RuntimeError(result.stderr)
         image = (path/"kernel.cubin").read_bytes()
-    return image, {"symbol":"replay","threads":256,"dynamic_shared_bytes":shared_bytes(plan),
-                   "slices":len(plan.origins) if sliced else 1,"ptxas":result.stderr}
+    return image, {"problem_shape":(plan.m,plan.n,k),"column_sum":plan.reduced_writers is not None,
+                   "symbol":"replay","threads":256,"dynamic_shared_bytes":shared_bytes(plan),
+                   "resident_atoms":width,"slices":(len(plan.origins)+width-1)//width,
+                   "ranked_residencies":ranked,"ptxas":result.stderr}
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("solved_layouts",type=Path)
     parser.add_argument("--k",type=int,required=True)
-    parser.add_argument("--resident",choices=("full","slice"),default="slice")
+    choice = parser.add_mutually_exclusive_group()
+    choice.add_argument("--resident", choices=("auto", "full", "slice"), default="auto")
+    choice.add_argument("--resident-atoms", type=int)
+    parser.add_argument("--grid-ctas", type=int, help="known number of independent output tiles")
+    parser.add_argument("--sm-count", type=int, default=114, help="available SMs (default H100 PCIe)")
+    parser.add_argument("--explain", type=Path, help="write the pre-compile ranking as JSON")
     parser.add_argument("--wait-group",type=int,choices=(1,2),default=1)
     parser.add_argument("--staged-k-tiles",type=int,choices=(1,2),default=2)
     parser.add_argument("--output",type=Path,required=True)
     args = parser.parse_args()
     ir = args.solved_layouts.read_text()
-    options = dict(sliced=args.resident=="slice",wait_group=args.wait_group,staged_k_tiles=args.staged_k_tiles)
+    sliced = {"auto":None, "slice":True, "full":False}[args.resident]
+    options = dict(sliced=sliced, resident_atoms=args.resident_atoms, wait_group=args.wait_group,
+                   staged_k_tiles=args.staged_k_tiles, grid_ctas=args.grid_ctas, sm_count=args.sm_count)
     if args.output.suffix == ".cubin":
         image,info = compile_accumulator_gemm(ir,args.k,**options)
         args.output.write_bytes(image)
         smem = info["dynamic_shared_bytes"]
+        width = info["resident_atoms"]
+        ranked = info["ranked_residencies"]
     else:
         layouts = read_layouts(ir)
         args.output.write_text(emit(layouts,args.k,**options))
         smem = shared_bytes(layouts)
-    print(f"threads=256 dynamic_shared_bytes={smem}")
+        width = _residency(layouts,args.k,args.staged_k_tiles,sliced,args.resident_atoms,args.grid_ctas,args.sm_count)
+        ranked = rank_residencies(layouts,args.k,staged_k_tiles=args.staged_k_tiles, grid_ctas=args.grid_ctas, sm_count=args.sm_count)
+    if args.explain:
+        args.explain.write_text(json.dumps(dict(selected_atoms=width,candidates=ranked),indent=2)+"\n")
+    print(f"threads=256 dynamic_shared_bytes={smem} resident_atoms={width}")
