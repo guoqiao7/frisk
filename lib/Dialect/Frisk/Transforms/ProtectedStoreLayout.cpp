@@ -1726,6 +1726,7 @@ struct PriceNormalizationSpill : PassWrapper<PriceNormalizationSpill, OperationP
   Option<int64_t> loads{*this,"load-words",llvm::cl::init(-1)};
   Option<int64_t> stores{*this,"store-words",llvm::cl::init(-1)};
   Option<int64_t> exposed{*this,"exposed-reloads",llvm::cl::desc("Certified immediate arithmetic uses of local reloads per warp"),llvm::cl::init(-1)};
+  Option<int64_t> fp32{*this,"fp32-issues",llvm::cl::desc("Certified straight-line FP32 arithmetic instructions per warp"),llvm::cl::init(-1)};
   Option<std::string> ldg{*this,"ldg",llvm::cl::desc("Unpredicated 32/64/128-bit load counts"),llvm::cl::init("")};
   Option<std::string> stg{*this,"stg",llvm::cl::desc("Unpredicated 32/64/128-bit store counts"),llvm::cl::init("")};
   void runOnOperation() override {
@@ -1751,6 +1752,8 @@ struct PriceNormalizationSpill : PassWrapper<PriceNormalizationSpill, OperationP
     if (seal && seal != b.getStringAttr(digest))
       return fail("stale normalization graph seal");
     const bool physical = !ldg.getValue().empty() || !stg.getValue().empty();
+    if (fp32 < -1 || (fp32 >= 0 && exposed < 0))
+      return fail("FP32 issue evidence requires a certified straight-line dependency bill");
     if (exposed < -1 || (exposed >= 0 && (!physical || exposed > loads)))
       return fail("invalid exposed local reload evidence");
     if (!physical && graph.getValue().empty() && cubin.getValue().empty() && loads == -1 && stores == -1) {
@@ -1816,6 +1819,16 @@ struct PriceNormalizationSpill : PassWrapper<PriceNormalizationSpill, OperationP
         result.set("compiled_exposed_reloads", b.getI64IntegerAttr(exposed));
         result.set("compiled_exposed_reload_units", b.getI64IntegerAttr(units));
         result.set("compiled_dependency_service_units", b.getI64IntegerAttr(dependent));
+        // reductionService prices data exchange. The arithmetic actually
+        // issued by each warp also depends on layout and row replication.
+        if (fp32 >= 0) {
+          int64_t computeUnits, combined;
+          if (llvm::MulOverflow(fp32.getValue(), int64_t{4}, computeUnits) ||
+              llvm::AddOverflow(dependent, computeUnits, combined))
+            return fail("compiled FP32 issue cost overflow");
+          result.set("compiled_fp32_issue_units", b.getI64IntegerAttr(computeUnits));
+          result.set("compiled_compute_service_units", b.getI64IntegerAttr(combined));
+        }
       }
       result.set("compiled_global_read_sectors", b.getI64IntegerAttr(*r));
       result.set("compiled_global_write_sectors", b.getI64IntegerAttr(*w));

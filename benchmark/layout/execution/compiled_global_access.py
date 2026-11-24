@@ -13,6 +13,7 @@ class GlobalAccess:
     stores: tuple
     interior_reloads: int
     exposed_reloads: int | None = None
+    fp32_issues: int | None = None
 
 
 # On SM90, the high instruction word holds the producer's write-dependency
@@ -24,28 +25,44 @@ _ENCODED = re.compile(
 _FP_CONSUMERS = {"FADD", "FMUL", "FFMA", "FSEL", "MUFU", "F2F", "F2I", "I2F"}
 
 
-def exposed_reload_uses(body):
-    """Immediately consumed local reloads inside straight-line, I/O-free BAR phases.
+# Ordinary real FP32 arithmetic emitted by the supported normalization lowering.
+# Keep address arithmetic, lane communication and memory issues on their own bills.
+_FP32 = {"FADD", "FMUL", "FFMA", "FMNMX", "FSEL"}
+_FP32_MUFU = {".RSQ", ".RCP", ".EX2", ".LG2", ".SIN", ".COS", ".TANH"}
 
-    Require both the register RAW edge and the scoreboard wait on the actual
-    producer. Missing instruction words or nonuniform control flow disable this
-    additional charge, while allowing the independent global bill to be used.
+
+def _compiled_work(body):
+    """Return exposed local dependencies and uniform FP32 issues per warp.
+
+    Count dependencies only in closed I/O-free BAR phases. Count arithmetic
+    across the executed function up to its unconditional exit. Missing words
+    or a control edge invalidate both counts. Predicated arithmetic invalidates
+    its issue count independently of the local dependency evidence.
     """
+    fp32 = 0
+    uniform_fp32 = True
     previous = None
     closed = has_global = False
     phase = total = 0
     for index, match in enumerate(_ENCODED.finditer(body)):
         address, pred, op, mods, operands, high = match.groups()
         if int(address, 16) != 16 * index:
-            return None
+            return None, None
         if op == "EXIT":
-            return None if pred else total
+            if pred:
+                return None, None
+            return total, fp32 if uniform_fp32 else None
         if op in {"BRA", "BRX", "BSSY", "BREAK", "BSYNC", "CALL", "RET", "JMP", "JMX"}:
-            return None
+            return None, None
+        if op in _FP32 or op == "MUFU":
+            # 64-bit approximation opcodes also use MUFU.
+            if pred or (op == "MUFU" and mods not in _FP32_MUFU):
+                uniform_fp32 = False
+            fp32 += 1
         control = int(high, 16)
         if op == "BAR" and "SYNC" in mods.split("."):
             if pred:
-                return None
+                return None, None
             if closed and not has_global:
                 total += phase
             closed, has_global, phase = True, False, 0
@@ -64,7 +81,11 @@ def exposed_reload_uses(body):
             if dest and slot < 6:
                 width = 4 if ".128" in mods else 2 if ".64" in mods else 1
                 previous = slot, int(dest[1]), width
-    return None
+    return None, None
+
+
+def exposed_reload_uses(body):
+    return _compiled_work(body)[0]
 
 
 def global_access(listing, entry):
@@ -115,7 +136,7 @@ def global_access(listing, entry):
             raise UnsupportedGlobalAccess("path-dependent global instruction count")
     if not all(sum(v) for v in hist.values()):
         raise UnsupportedGlobalAccess("missing global load or store")
-    return GlobalAccess(tuple(hist["LDG"]), tuple(hist["STG"]), interior, exposed_reload_uses(bodies[0]))
+    return GlobalAccess(tuple(hist["LDG"]), tuple(hist["STG"]), interior, *_compiled_work(bodies[0]))
 
 
 def physical_choice(records, previous):
@@ -128,5 +149,7 @@ def physical_choice(records, previous):
         saved_loads = sum(reference["ldg"]) - sum(r["ldg"])
         return extra_reloads <= max(saved_loads, 0)
     price = "dependency_total" if all("dependency_total" in r for r in records.values()) else "physical_total"
+    if all("compute_total" in r for r in records.values()):
+        price = "compute_total"
     return min((k for k,r in records.items() if eligible(r)),
                key=lambda k:(records[k][price], records[k]["conversions"], k != previous))

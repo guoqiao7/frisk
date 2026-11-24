@@ -89,6 +89,8 @@ def bind_graph_price(opt, ir, cubin_digest, load_words, store_words, *, access=N
         options = f" ldg={histogram(access.loads)} stg={histogram(access.stores)}"
         if access.exposed_reloads is not None:
             options += f" exposed-reloads={access.exposed_reloads}"
+        if access.fp32_issues is not None:
+            options += f" fp32-issues={access.fp32_issues}"
         priced = ir.parent / "vector-priced.mlir"
     try:
         run("--frisk-price-normalization-spill=" + f"graph={match[1]} cubin={cubin_digest} "
@@ -126,6 +128,12 @@ def attach_global_price(opt, ir, record, listing, entry):
                 total != physical + units):
             raise ValueError("compiled local dependency receipt mismatch")
         record.update(exposed_reloads=access.exposed_reloads, dependency_total=total)
+    if access.fp32_issues is not None:
+        units = amount("compiled_fp32_issue_units")
+        total = amount("compiled_compute_service_units")
+        if units != 4 * access.fp32_issues or total != record["dependency_total"] + units:
+            raise ValueError("compiled FP32 issue receipt mismatch")
+        record.update(fp32_issues=access.fp32_issues, compute_total=total)
     return path
 
 
@@ -211,6 +219,7 @@ def compile_normalization_layout(source, opt, output_dir, rows, columns, prepare
     receipt = dict(source_sha256=sha256(Path(source).read_bytes()).hexdigest(), selected=winner,
                    previous=previous, global_certified=complete,
                    dependencies_certified=all("dependency_total" in r for r in records.values()),
+                   fp32_certified=all("compute_total" in r for r in records.values()),
                    directory=str(work), records=records, rejected=errors)
     (work / "selection.json").write_text(json.dumps(receipt, indent=2))
     return NormalizationSelection(image, ir, receipt)

@@ -55,3 +55,10 @@ assert "compiled_exposed_reload_units = 64 : i64" in dep.stdout
 assert f"compiled_dependency_service_units = {vector_amount('compiled_service_units') + 64} : i64" in dep.stdout
 assert run(dependency_flag + " exposed-reloads=4").returncode
 assert run(vector_flag + " exposed-reloads=1").returncode
+
+fp32 = run(dependency_flag + " exposed-reloads=2 fp32-issues=7")
+fp32.check_returncode()
+assert "compiled_fp32_issue_units = 28 : i64" in fp32.stdout
+assert f"compiled_compute_service_units = {vector_amount('compiled_service_units') + 64 + 28} : i64" in fp32.stdout
+assert run(dependency_flag + " fp32-issues=7").returncode
+assert run(dependency_flag + " exposed-reloads=0 fp32-issues=9223372036854775807").returncode
