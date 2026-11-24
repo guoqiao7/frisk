@@ -15,5 +15,6 @@ using StoreMap = llvm::function_ref<DistributedEncodingAttr(
 FailureOr<DictionaryAttr> solveCertifiedMultiAnchor(
     ModuleOp module, const CertifiedInstructionDomains &domains,
     RoutePrice price, StoreMap storeMap, unsigned freeBits, unsigned timeoutMs,
-    unsigned oracleLimit, bool scoreReduction, bool nativeVector, bool subgroupCandidates);
+    unsigned oracleLimit, bool scoreReduction, bool nativeVector, bool subgroupCandidates,
+    const DenseMap<Attribute, int64_t> &sliceUnits);
 } // namespace mlir::frisk

@@ -1,10 +1,12 @@
 """Native execution of a dense batch of independent solved-layout SM90 GEMMs."""
 import ctypes
+import os
+import subprocess
 from dataclasses import dataclass
 from threading import Lock
 from weakref import finalize
 
-from gemm_accumulator_slices import compile_accumulator_gemm
+from gemm_accumulator_slices import compile_accumulator_gemm, read_layouts
 
 
 @dataclass(frozen=True)
@@ -16,6 +18,22 @@ class DenseGemm:
     """
     layout_ir: str
     k: int
+
+    @classmethod
+    def from_open_layout(cls, layout_ir, k, *, resident_atoms, staged_k_tiles=2, frisk_opt=None):
+        """Solve a fixed-width native SS GEMM with direct C and optional column sum."""
+        if type(resident_atoms) is not int or resident_atoms < 1 or staged_k_tiles not in (1, 2):
+            raise ValueError("expected positive resident width and one or two K16 slots")
+        solver = frisk_opt or os.environ.get("FRISK_OPT", "frisk-opt")
+        option = ("--frisk-protected-store-layout=anchor-solver=integer "
+                  f"native-resident-atoms={resident_atoms} native-k-slots={staged_k_tiles}")
+        solved = subprocess.run([solver, option, "--canonicalize", "-verify-each"],
+                                input=layout_ir, capture_output=True, text=True)
+        if solved.returncode:
+            raise ValueError(solved.stderr.strip())
+        if read_layouts(solved.stdout).slice_contract != (k, resident_atoms, staged_k_tiles):
+            raise ValueError("native solve returned a different slice contract")
+        return cls(solved.stdout, k)
 
 
 class NativeGemmImage:

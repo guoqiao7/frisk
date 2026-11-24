@@ -78,6 +78,7 @@ class GemmLayouts:
     atom: int
     origins: tuple  # In original register order: (row0, col0, row1, col1).
     reduced_writers: tuple | None  # thread and register column basis
+    slice_contract: tuple | None = None  # (K extent, resident atoms, staged K16 slots)
 
 
 def _check_row_major_writer(ir, store, shape):
@@ -168,7 +169,17 @@ def read_layouts(ir):
             raise ValueError("expected a separable first-owner R map")
         rbits = table.shape[1].bit_length()-1
         writers = (basis[rbits:], basis[:rbits])
-    return GemmLayouts(m, n, atom, tuple(origins), writers)
+    plan = GemmLayouts(m, n, atom, tuple(origins), writers)
+    if "frisk.native_slice_traffic" in mma:
+        record = _one(r"frisk\.native_slice_traffic = \{([^{}]*)\}", mma)
+        fields = {key: int(value) for key, value in re.findall(r"(\w+) = (\d+) : i64", record)}
+        if not {"k_extent", "resident_atoms", "staged_k_tiles"} <= fields.keys():
+            raise ValueError("incomplete native slice receipt")
+        k, width, slots = (fields[key] for key in ("k_extent", "resident_atoms", "staged_k_tiles"))
+        if fields != native_slice_traffic(plan, k, width, slots):
+            raise ValueError("solver slice traffic disagrees with native operand staging")
+        plan = GemmLayouts(m, n, atom, tuple(origins), writers, (k, width, slots))
+    return plan
 
 
 def _intervals(starts, width):
@@ -197,6 +208,7 @@ def rank_residencies(plan, k, *, staged_k_tiles=2, grid_ctas=None, sm_count=114)
 
     Each group retains its accumulators for all K. Charge the actual copy
     intervals once per group, even when the two warpgroups share an operand.
+    This ranking precedes shared-B retention, which lowers a fixed partition.
     Estimate one local store/load per excess live FP32 word per K16 update.
     The temporary register allowance is a proxy, not a ptxas allocation.
     """
@@ -263,6 +275,13 @@ def _residency(plan, k, staged_k_tiles, sliced, resident_atoms, grid_ctas, sm_co
         if type(sliced) is not bool or resident_atoms is not None:
             raise ValueError("choose either sliced or resident_atoms")
         resident_atoms = 1 if sliced else len(plan.origins)
+    if resident_atoms is not None and type(resident_atoms) is not int:
+        raise ValueError("resident_atoms must be an integer")
+    if plan.slice_contract is not None:
+        extent, width, slots = plan.slice_contract
+        if k != extent or staged_k_tiles != slots or resident_atoms not in (None, width):
+            raise ValueError("launch options disagree with the solved native slice contract")
+        return width
     if resident_atoms is None:
         return rank_residencies(plan, k, staged_k_tiles=staged_k_tiles, grid_ctas=grid_ctas, sm_count=sm_count)[0]["resident_atoms"]
     if type(resident_atoms) is not int or not 1 <= resident_atoms <= len(plan.origins):
@@ -294,6 +313,82 @@ def shared_bytes(plan):
     return max(65536, scratch+partials)
 
 
+@dataclass(frozen=True)
+class BStaging:
+    retained: int
+    base: int
+    partial_offset: int
+    shared_bytes: int
+
+
+def _b_staging(plan, k, width, depth):
+    """Budget shared B reuse across fused row slices using estimated CTA residency."""
+    pitch = (plan.m + plan.n) * 32
+    scratch = max(2 * pitch, 8 * plan.atom * 4)
+    legacy = BStaging(0, 0, scratch, shared_bytes(plan))
+    groups = list(_atom_groups(plan, width))
+    if plan.reduced_writers is None or len(groups) < 2:
+        return legacy
+    if any(_copy_regions(group, plan.atom)[1] != [(0, plan.n)] for group in groups):
+        return legacy
+
+    # Estimate the live accumulator plus four addressing words. This is a
+    # pre-ptxas occupancy estimate; descriptor operands can use uniform
+    # registers. The shared limit below is a separate hardware constraint.
+    live = width * (plan.atom // 2) + 4
+    if live > 255:
+        return legacy  # Avoid enlarging shared storage for an over-budget group.
+    regs = (live + 7) // 8 * 8
+    ctas = min(65536 // (256 * regs), (228 * 1024) // (legacy.shared_bytes + 1024))
+    if not ctas:
+        return legacy
+    budget = (228 * 1024) // ctas - 1024
+    # The epilogue borrows the start of shared memory after each WGMMA
+    # drain. Keep both A slots and its warp scratch disjoint from retained B.
+    base = max(depth * plan.m * 32, 8 * plan.atom * 4)
+    slab = plan.n * 32
+    partial_bytes = (plan.m // 64) * plan.n * 4
+    slots = (budget - base - partial_bytes) // slab
+    steps = k // 16
+    if slots >= steps:
+        retained = steps
+        used = steps
+    else:
+        retained = (slots - depth) // depth * depth
+        if retained <= 0:
+            return legacy
+        used = retained + depth
+    partial = base + used * slab
+    return BStaging(retained, base, partial, max(legacy.shared_bytes, partial + partial_bytes))
+
+
+def native_slice_traffic(plan, k, width, slots):
+    """Observable copy traffic per CTA at the fixed native partition."""
+    if k <= 0 or k % 16 or slots not in (1, 2) or not 1 <= width <= len(plan.origins):
+        raise ValueError("invalid native slice contract")
+    issued_a = issued_b = slices = 0
+    for group in _atom_groups(plan, width):
+        rows, cols = _copy_regions(group, plan.atom)
+        issued_a += sum(hi - lo for lo, hi in rows) * 2 * k
+        issued_b += sum(hi - lo for lo, hi in cols) * 2 * k
+        slices += 1
+    staging = _b_staging(plan, k, width, slots)
+    repeated_a = issued_a - 2 * k * plan.m
+    repeated_b = issued_b - 2 * k * plan.n
+    saved_b = (slices - 1) * staging.retained * plan.n * 32
+    return dict(k_extent=k, resident_atoms=width, staged_k_tiles=slots,
+                repeated_a_bytes=repeated_a, repeated_b_bytes=repeated_b,
+                retained_b_k16=staging.retained, saved_b_bytes=saved_b,
+                shared_bytes=staging.shared_bytes,
+                extra_global_sectors=(repeated_a + repeated_b - saved_b) // 32)
+
+
+def _stages(plan, requested):
+    if requested is not None:
+        return requested
+    return plan.slice_contract[2] if plan.slice_contract else 2
+
+
 def _write_columns(plan):
     if plan.reduced_writers is None:
         return []
@@ -308,7 +403,8 @@ def _write_columns(plan):
             f"int j = {index};", f"R[j]=finish_column<{plan.m//64},{plan.n}>(partial,j);", "}}"]
 
 
-def emit(plan, k, *, sliced=None, resident_atoms=None, wait_group=1, staged_k_tiles=2, grid_ctas=None, sm_count=114):
+def emit(plan, k, *, sliced=None, resident_atoms=None, wait_group=1, staged_k_tiles=None, grid_ctas=None, sm_count=114):
+    staged_k_tiles = _stages(plan, staged_k_tiles)
     if k<=0 or k%16 or wait_group not in (1,2):
         raise ValueError("positive K multiple of 16 and wait group 1 or 2 required")
     if staged_k_tiles not in (1,2) or wait_group > staged_k_tiles:
@@ -317,7 +413,9 @@ def emit(plan, k, *, sliced=None, resident_atoms=None, wait_group=1, staged_k_ti
     if max(m*n,m*k,k*n) >= 1<<31:
         raise ValueError("per-CTA addressing requires signed 32-bit offsets")
     pitch = (m+n)*32
-    scratch = max(pitch*2,8*atom*4)
+    width = _residency(plan, k, staged_k_tiles, sliced, resident_atoms, grid_ctas, sm_count)
+    staging = _b_staging(plan, k, width, staged_k_tiles)
+    scratch = staging.partial_offset
     source = [Path(__file__).with_suffix(".cuh").read_text(), _mma(atom,1), _mma(atom,2),
               'extern "C" __global__ __launch_bounds__(256) void replay('
               'const uint16_t* A,const uint16_t* B,float* C,float* R) {',
@@ -326,22 +424,35 @@ def emit(plan, k, *, sliced=None, resident_atoms=None, wait_group=1, staged_k_ti
               f"float* partial=(float*)(sm+{scratch}); int tid=threadIdx.x,wg=tid/128;"]
     if plan.reduced_writers is not None:
         source.append(f"R+=(size_t)blockIdx.x*{n};")
-    width = _residency(plan, k, staged_k_tiles, sliced, resident_atoms, grid_ctas, sm_count)
-    for group in _atom_groups(plan, width):
+    for group_index, group in enumerate(_atom_groups(plan, width)):
         rows, cols = _copy_regions(group, atom)
         source += ["{", f"float acc[{len(group)}][{atom//2}]={{}};"]
         # The odd final K16 step gets a single-buffer tail in all four arms.
         steps = ((1,0,k),) if staged_k_tiles==1 else ((2,0,k//32*32),(1,k//32*32,k))
-        for depth, start, stop in steps:
-            if start == stop:
+        boundary = 16 * staging.retained
+        sections = [(depth, lo, hi) for depth, start, stop in steps
+                    for lo, hi in ((start, min(stop, boundary)), (max(start, boundary), stop))]
+        for depth, start, stop in sections:
+            if start >= stop:
                 continue
             source += ["#pragma unroll 1", f"for(int kt={start}; kt<{stop}; kt+={16*depth}) {{",
                        "__syncthreads();"]
+            retained = stop <= boundary
+            a_stride = m * 32 if staging.retained else pitch
+            b_offsets = []
             for step in range(depth):
+                if retained:
+                    offset = f"({staging.base}+(kt/16+{step})*{n*32})"
+                elif staging.retained:
+                    offset = str(staging.base + (staging.retained + step) * n * 32)
+                else:
+                    offset = str(step * pitch + m * 32)
+                b_offsets.append(offset)
                 for lo,hi in rows:
-                    source.append(f"copy_a<{m},{k},{lo},{hi}>(sm+{step*pitch},A,kt+{step*16});")
-                for lo,hi in cols:
-                    source.append(f"copy_b<{n},{lo},{hi}>(sm+{step*pitch+m*32},B,kt+{step*16});")
+                    source.append(f"copy_a<{m},{k},{lo},{hi}>(sm+{step*a_stride},A,kt+{step*16});")
+                if not retained or group_index == 0:
+                    for lo,hi in cols:
+                        source.append(f"copy_b<{n},{lo},{hi}>(sm+{offset},B,kt+{step*16});")
             # Every lane completes its own copies before the CTA publishes the slots.
             source += ['asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");',
                        "__syncthreads();", 'asm volatile("fence.proxy.async.shared::cta;" ::: "memory");']
@@ -349,8 +460,8 @@ def emit(plan, k, *, sliced=None, resident_atoms=None, wait_group=1, staged_k_ti
                 source.append(f"{{int row={r}+wg*({s-r}), col={c}+wg*({d-c});")
                 args = []
                 for j in range(depth):
-                    source += [f"auto a{j}=descriptor(sm+{j*pitch}+row*16,{(m<<16)|(8<<32)}ull);",
-                               f"auto b{j}=descriptor(sm+{j*pitch+m*32}+col*16,{(16<<16)|(n<<32)|(3<<62)}ull);"]
+                    source += [f"auto a{j}=descriptor(sm+{j*a_stride}+row*16,{(m<<16)|(8<<32)}ull);",
+                               f"auto b{j}=descriptor(sm+{b_offsets[j]}+col*16,{(16<<16)|(n<<32)|(3<<62)}ull);"]
                     args.extend([f"a{j}",f"b{j}"])
                 if depth==2 and wait_group==2:
                     source.append(f"issue2(acc[{i}],"+",".join(args)+");")
@@ -368,11 +479,12 @@ def emit(plan, k, *, sliced=None, resident_atoms=None, wait_group=1, staged_k_ti
     return "\n".join(source+_write_columns(plan)+["}",""])
 
 
-def compile_accumulator_gemm(layout_ir, k, *, sliced=None, resident_atoms=None, wait_group=1, staged_k_tiles=2, grid_ctas=None, sm_count=114, nvcc="nvcc"):
+def compile_accumulator_gemm(layout_ir, k, *, sliced=None, resident_atoms=None, wait_group=1, staged_k_tiles=None, grid_ctas=None, sm_count=114, nvcc="nvcc"):
     """Return a CUDA driver-loadable cubin and its launch contract."""
     plan = read_layouts(layout_ir)
+    staged_k_tiles = _stages(plan, staged_k_tiles)
     ranked = rank_residencies(plan, k, staged_k_tiles=staged_k_tiles, grid_ctas=grid_ctas, sm_count=sm_count)
-    width = (ranked[0]["resident_atoms"] if sliced is None and resident_atoms is None else
+    width = (ranked[0]["resident_atoms"] if plan.slice_contract is None and sliced is None and resident_atoms is None else
              _residency(plan, k, staged_k_tiles, sliced, resident_atoms, grid_ctas, sm_count))
     source = emit(plan, k, resident_atoms=width, wait_group=wait_group, staged_k_tiles=staged_k_tiles)
     with tempfile.TemporaryDirectory(prefix="frisk-accumulator-") as tmp:
@@ -383,8 +495,10 @@ def compile_accumulator_gemm(layout_ir, k, *, sliced=None, resident_atoms=None, 
         if result.returncode:
             raise RuntimeError(result.stderr)
         image = (path/"kernel.cubin").read_bytes()
-    return image, {"problem_shape":(plan.m,plan.n,k),"column_sum":plan.reduced_writers is not None,
-                   "symbol":"replay","threads":256,"dynamic_shared_bytes":shared_bytes(plan),
+    staging = _b_staging(plan, k, width, staged_k_tiles)
+    return image, {"retained_b_k16":staging.retained, "problem_shape":(plan.m,plan.n,k),"column_sum":plan.reduced_writers is not None,
+                   "symbol":"replay","threads":256,"dynamic_shared_bytes":staging.shared_bytes,
+                   "slice_traffic":native_slice_traffic(plan,k,width,staged_k_tiles),
                    "resident_atoms":width,"slices":(len(plan.origins)+width-1)//width,
                    "ranked_residencies":ranked,"ptxas":result.stderr}
 
@@ -400,7 +514,7 @@ if __name__ == "__main__":
     parser.add_argument("--sm-count", type=int, default=114, help="available SMs (default H100 PCIe)")
     parser.add_argument("--explain", type=Path, help="write the pre-compile ranking as JSON")
     parser.add_argument("--wait-group",type=int,choices=(1,2),default=1)
-    parser.add_argument("--staged-k-tiles",type=int,choices=(1,2),default=2)
+    parser.add_argument("--staged-k-tiles",type=int,choices=(1,2))
     parser.add_argument("--output",type=Path,required=True)
     args = parser.parse_args()
     ir = args.solved_layouts.read_text()
@@ -415,9 +529,10 @@ if __name__ == "__main__":
         ranked = info["ranked_residencies"]
     else:
         layouts = read_layouts(ir)
+        args.staged_k_tiles = _stages(layouts, args.staged_k_tiles)
         args.output.write_text(emit(layouts,args.k,**options))
-        smem = shared_bytes(layouts)
         width = _residency(layouts,args.k,args.staged_k_tiles,sliced,args.resident_atoms,args.grid_ctas,args.sm_count)
+        smem = _b_staging(layouts, args.k, width, args.staged_k_tiles).shared_bytes
         ranked = rank_residencies(layouts,args.k,staged_k_tiles=args.staged_k_tiles, grid_ctas=args.grid_ctas, sm_count=args.sm_count)
     if args.explain:
         args.explain.write_text(json.dumps(dict(selected_atoms=width,candidates=ranked),indent=2)+"\n")

@@ -563,6 +563,7 @@ struct Model {
   ModuleOp module;
   LayoutConstraintGraph &graph;
   LayoutTarget &target;
+  DenseMap<Attribute, int64_t> sliceUnits;
   bool scoreReduction = true;
   RoutePrice price;
   z3::context ctx;
@@ -999,7 +1000,8 @@ std::optional<Bill> billWitness(Model &m, const CandidateAssignment &assignment,
       auto tuple = findInstructionSupport(m.graph, c, assignment.values);
       if (!tuple) return std::nullopt;
       auto units = columnLoopUnits(c, *tuple);
-      if (failed(units) || llvm::AddOverflow(bill.mainLoop, *units, bill.mainLoop))
+      if (failed(units) || llvm::AddOverflow(bill.mainLoop, *units, bill.mainLoop) ||
+          llvm::AddOverflow(bill.mainLoop, m.sliceUnits.lookup(tuple->binding), bill.mainLoop))
         return std::nullopt;
     }
     if (m.scoreReduction && c.reduction) {
@@ -1028,6 +1030,7 @@ std::optional<Bill> billWitness(Model &m, const CandidateAssignment &assignment,
       bill.access + bill.movement + bill.reduction > INT64_MAX - bill.spill ||
       bill.access + bill.movement + bill.reduction + bill.spill > INT64_MAX - bill.mainLoop)
     return std::nullopt;
+  if (!m.sliceUnits.empty() && bill.count) return std::nullopt;
   return bill;
 }
 
@@ -1058,10 +1061,16 @@ LogicalResult verifyByEnumeration(Model &m, unsigned limit,
       return;
     }
     ++nodes;
-    for (const auto &c : m.graph.getConstraints())
+    for (const auto &c : m.graph.getConstraints()) {
+      if (!m.sliceUnits.empty() && c.kind == ConstraintKind::Convertible) {
+        auto from = a.values.lookup(c.vars[0]), to = a.values.lookup(c.vars[1]);
+        if (from && to && !layoutEncodingsEqual(from, to))
+          return; // The native direct-delivery contract forbids this edge.
+      }
       if (!satisfiesLayoutConstraint(m.graph, c, a.values,
                                      level == order.size()))
         return;
+    }
     if (level < order.size()) {
       auto id = order[level];
       for (const auto &v : m.graph.getVariable(id).candidates) {
@@ -1104,7 +1113,8 @@ LogicalResult verifyByEnumeration(Model &m, unsigned limit,
 FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
     ModuleOp module, const CertifiedInstructionDomains &domains,
     RoutePrice price, StoreMap storeMap, unsigned freeBits, unsigned timeoutMs,
-    unsigned oracleLimit, bool scoreReduction, bool nativeVector, bool subgroupCandidates) {
+    unsigned oracleLimit, bool scoreReduction, bool nativeVector, bool subgroupCandidates,
+    const DenseMap<Attribute, int64_t> &sliceUnits) {
 #ifndef FRISK_HAS_Z3
   return module.emitError(
       "multi-anchor integer solver requires Z3; configure FRISK_Z3_ROOT");
@@ -1131,6 +1141,7 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
     normalization = *trial;
   }
   Model m(module, *graph, *target, price);
+  m.sliceUnits = sliceUnits;
   m.scoreReduction = scoreReduction;
   m.nativeVector = nativeVector;
   if (failed(m.buildDomains()) || failed(m.bindCompiledSpill()))
@@ -1141,8 +1152,9 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
       for (const auto &tuple : c.instruction->tuples) {
         auto units = columnLoopUnits(c, tuple);
         if (failed(units)) return failure();
-        if (*units)
-          m.mainLoop = m.mainLoop + m.charge(m.row(c.vars, tuple.encodings), *units);
+        int64_t work = *units + sliceUnits.lookup(tuple.binding);
+        if (work)
+          m.mainLoop = m.mainLoop + m.charge(m.row(c.vars, tuple.encodings), work);
       }
     }
     if (scoreReduction && c.reduction && failed(m.reductionFactor(c))) return failure();
@@ -1151,6 +1163,7 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
   }
   if (failed(m.boundaryFactors()))
     return failure();
+  if (!sliceUnits.empty()) m.solver.add(m.routes == 0); // Native C and R keep their solved owners.
   z3::params p(m.ctx);
   p.set("timeout", timeoutMs);
   m.solver.set(p);

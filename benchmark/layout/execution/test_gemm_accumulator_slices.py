@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import unittest
 
-from gemm_accumulator_slices import GemmLayouts, emit, rank_residencies, read_layouts, shared_bytes
+from gemm_accumulator_slices import _b_staging, GemmLayouts, emit, rank_residencies, read_layouts, shared_bytes
 
 
 class AccumulatorSlicesTest(unittest.TestCase):
@@ -28,10 +28,19 @@ class AccumulatorSlicesTest(unittest.TestCase):
             src = emit(plan,208,sliced=sliced,wait_group=2)
             self.assertEqual(src.count("float acc["),count)
             self.assertEqual(src.count("kt=192; kt<208; kt+=16"),count)
-            self.assertEqual(src.count("issue2(acc["),4)
+            # A retained prefix may split a static loop. Count executed
+            # instructions so this still catches a missing/duplicate K16.
+            issued = 0
+            for lo, hi, inc, body in re.findall(
+                    r"for\(int kt=(\d+); kt<(\d+); kt\+=(\d+)\) \{(.*?)(?=#pragma unroll 1|deliver_atom<)",
+                    src, re.S):
+                issued += len(range(int(lo), int(hi), int(inc))) * body.count("issue2(acc[")
+            self.assertEqual(issued, 4 * 6)
             self.assertEqual(src.count("issue1(acc["),4)
         single = emit(plan,208,staged_k_tiles=1)
-        self.assertEqual(single.count("kt=0; kt<208; kt+=16"),4)
+        trip_counts = [len(range(*map(int, bounds))) for bounds in re.findall(
+            r"for\(int kt=(\d+); kt<(\d+); kt\+=(\d+)\)", single)]
+        self.assertEqual(sum(trip_counts), 4 * 13)
         with self.assertRaises(ValueError):
             emit(plan,208,staged_k_tiles=1,wait_group=2)
         with self.assertRaises(ValueError):
@@ -44,7 +53,8 @@ class AccumulatorSlicesTest(unittest.TestCase):
             loops = source.split("for(int kt=")[1:]
             self.assertTrue(loops)
             for loop in loops:
-                copy_end = loop.rindex("copy_b<")
+                # Retained B needs no new copy, but A still needs publication.
+                copy_end = max(loop.rindex("copy_a<"), loop.rfind("copy_b<"))
                 commit = loop.index("cp.async.commit_group; cp.async.wait_group 0;", copy_end)
                 publish = loop.index("__syncthreads();", commit)
                 fence = loop.index("fence.proxy.async.shared::cta;", publish)
@@ -73,6 +83,53 @@ class AccumulatorSlicesTest(unittest.TestCase):
         self.assertEqual(emit(plan, 208, sliced=False), emit(plan, 208, resident_atoms=4))
         with self.assertRaisesRegex(ValueError, "either"):
             emit(plan, 208, sliced=False, resident_atoms=2)
+
+    def test_shared_b_survives_reduction_and_fits_residency(self):
+        rows = ((0, 0, 0, 256), (64, 0, 64, 256))
+        fan = GemmLayouts(128, 512, 256, rows, ((), ()))
+        for slots in (1, 2):
+            for k in (16, 96, 240):
+                stage = _b_staging(fan, k, 1, slots)
+                self.assertGreater(stage.retained, 0)
+                self.assertGreaterEqual(stage.base, max(slots * 128 * 32, 8 * 256 * 4))
+                slabs = stage.retained + (slots if stage.retained < k // 16 else 0)
+                self.assertGreaterEqual(stage.partial_offset, stage.base + slabs * 512 * 32)
+                self.assertLessEqual(stage.shared_bytes, 227 * 1024)
+                sections = emit(fan, k, resident_atoms=1, staged_k_tiles=slots).split("float acc[")[1:]
+                copies = []
+                for section in sections:
+                    count = 0
+                    for lo, hi, inc, body in re.findall(
+                            r"for\(int kt=(\d+); kt<(\d+); kt\+=(\d+)\) \{(.*?)(?=#pragma unroll 1|deliver_atom<)",
+                            section, re.S):
+                        count += len(range(int(lo), int(hi), int(inc))) * body.count("copy_b<")
+                    copies.append(count)
+                self.assertEqual(copies, [k // 16, k // 16 - stage.retained])
+        self.assertEqual(_b_staging(GemmLayouts(128,512,256,rows,None), 240, 1, 2).retained, 0)
+        self.assertEqual(_b_staging(fan, 240, 2, 2).retained, 0)
+
+    def test_native_anchor_price_and_launch_receipt(self):
+        from native_gemm_execution import DenseGemm
+        fixture = Path(__file__).resolve().parents[3]/"test/Transforms/integer-column-loop-cost.mlir"
+        ir = fixture.read_text().split("module attributes", 1)[1]
+        ir = ("module attributes" + ir).replace('frisk.serial_column_width = 256 : i64, ', '')
+        ir = ir.replace('kind = "max"', 'kind = "sum"').replace('constant 80 : index','constant 240 : index')
+        gemm = DenseGemm.from_open_layout(ir, 240, resident_atoms=1)
+        plan = read_layouts(gemm.layout_ir)
+        self.assertEqual(plan.origins, ((0,0,64,0), (0,256,64,256)))
+        self.assertEqual(plan.slice_contract, (240,1,2))
+        self.assertIn("extra_global_sectors = 1920 : i64", gemm.layout_ir)
+        self.assertIn("saved_b_bytes = 163840 : i64", gemm.layout_ir)
+        with self.assertRaisesRegex(ValueError, "staging"):
+            read_layouts(gemm.layout_ir.replace("repeated_a_bytes = 61440", "repeated_a_bytes = 1"))
+        for options in (dict(resident_atoms=2), dict(staged_k_tiles=1)):
+            with self.assertRaisesRegex(ValueError, "slice contract"):
+                emit(plan, 240, **options)
+        with self.assertRaisesRegex(ValueError, "slice contract"):
+            emit(plan, 224)
+        self.assertEqual(emit(plan, 240), emit(plan, 240, resident_atoms=1, staged_k_tiles=2))
+        with self.assertRaisesRegex(ValueError, "no local optimum"):
+            DenseGemm.from_open_layout(ir, 240, resident_atoms=100)
 
     def test_saturated_and_single_wave_residency(self):
         origins = tuple((64*i, 0, 512+64*i, 0) for i in range(8))
