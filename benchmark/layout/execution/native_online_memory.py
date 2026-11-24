@@ -93,6 +93,17 @@ def _packed_groups(emitter, op):
     return [(root,b,sa,da) for sa,da in groups]
 
 
+def issue_packed_copy(e, group):
+    root,b,sa,da=group
+    offset=e.map(sa);src_addr=e.address(root,offset);dst_addr=e.shared(b,e.map(da))
+    guard=e.access_guard(root,offset)
+    size='16'
+    if guard:
+        size=e.tmp()
+        e.emit(f'selp.u32 {size}, 16, 0, {guard.strip()[1:]};')
+    e.emit(f'cp.async.cg.shared.global [{dst_addr}], [{src_addr}], 16, {size};')
+
+
 def emit_packed_copies(e, ops):
     batches = [_packed_groups(e,op) for op in ops]
     if not all(batches):
@@ -115,13 +126,7 @@ def emit_packed_copies(e, ops):
     for index,(root,b,sa,da) in enumerate(groups):
         if split and index == len(batches[0]):
             e.emit('cp.async.commit_group;')
-        offset=e.map(sa);src_addr=e.address(root,offset);dst_addr=e.shared(b,e.map(da))
-        guard=e.access_guard(root,offset)
-        size='16'
-        if guard:
-            size=e.tmp()
-            e.emit(f'selp.u32 {size}, 16, 0, {guard.strip()[1:]};')
-        e.emit(f'cp.async.cg.shared.global [{dst_addr}], [{src_addr}], 16, {size};')
+        issue_packed_copy(e,(root,b,sa,da))
     e.emit('cp.async.commit_group;')
     e.emit('cp.async.wait_group 1;' if split else 'cp.async.wait_group 0;')
     e.emit('bar.sync 0;')

@@ -33,7 +33,7 @@ LogicalResult verifyOnlineResources(ModuleOp module, DictionaryAttr plan,
         return module.emitError("single-group publication requires one buffer version");
   } else {
     int64_t c = contractInt(roles,"qk"), p = contractInt(roles,"k");
-    if (widths.size()!=2 || c<0 || c>1 || p!=1-c || widths[c]!=256 || widths[p]!=128 ||
+    if (widths.size()!=2 || c<0 || c>1 || p!=1-c || (widths[c]!=128 && widths[c]!=256) || widths[p]!=128 ||
         contractInt(roles,"pv")!=c || contractInt(roles,"q")!=c ||
         contractInt(roles,"reduce")!=c || contractInt(roles,"v")!=p || batch!=8)
       return module.emitError("incompatible FA3 execution domains or intrinsic wait batch");
@@ -50,7 +50,8 @@ LogicalResult verifyOnlineResources(ModuleOp module, DictionaryAttr plan,
       auto buffer = buffers.getAs<DictionaryAttr>(key);
       int64_t n = contractInt(buffer,"versions"), bytes = contractInt(buffer,"tile_bytes");
       int64_t base = contractInt(buffer,"offset");
-      if (bytes!=32768 || n<1 || n>8 || base<0 || base%1024 || base>arena-n*bytes ||
+      const int64_t tileBytes = (key=="q" || key=="o") ? widths[c]*128 : 32768;
+      if (bytes!=tileBytes || n<1 || n>8 || base<0 || base%1024 || base>arena-n*bytes ||
           ((key=="q" || key=="o") && n!=1))
         return module.emitError("invalid descriptor origin, tile size or ring extent");
       for (auto prior : live)
@@ -79,7 +80,7 @@ LogicalResult verifyOnlineResources(ModuleOp module, DictionaryAttr plan,
       mma.emitError("MMA depth cannot retire complete execution-contract wait batches");
       return WalkResult::interrupt();
     }
-    if (grouped && (mma.getMAttr().getInt()!=128 || mma.getNAttr().getInt()!=128 ||
+    if (grouped && (mma.getMAttr().getInt()!=widths[contractInt(roles,"qk")]/2 || mma.getNAttr().getInt()!=128 ||
                     mma.getKAttr().getInt()!=128)) {
       mma.emitError("MMA tile disagrees with FA3 buffer geometry");
       return WalkResult::interrupt();

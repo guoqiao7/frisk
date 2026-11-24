@@ -8,6 +8,9 @@
 #include <tl_templates/cuda/ldsm.h>
 #include <math_constants.h>
 
+#ifndef FRISK_KV_HEAD_RATIO
+#define FRISK_KV_HEAD_RATIO 1
+#endif
 // Descending causal work, with heads interleaved at each query coordinate.
 __device__ __forceinline__ int fa3_query_block() {
   if constexpr (REVERSE_Q) return gridDim.x-1-(blockIdx.x+gridDim.x*blockIdx.y)/gridDim.y;
@@ -18,19 +21,21 @@ __device__ __forceinline__ int fa3_head() {
   return blockIdx.y;
 }
 struct Ring {
-  int versions, ready, free_slot, byte_offset;
+  int versions, ready, free_slot, byte_offset, issuer;
   __device__ int slot(int i) const { return i % versions; }
   __device__ int phase(int i) const { return (i / versions) & 1; }
+  template<int Rows=MAP_ROWS, int HeadRatio=FRISK_KV_HEAD_RATIO>
   __device__ void load(const CUtensorMap& map, int tile, int row, int local,
                        unsigned char* arena, Barrier* bars) const {
     if (free_slot >= 0 && tile >= versions)
       bars[free_slot+slot(tile)].wait(phase(tile-versions));
-    if (local == 0) {
+    if (local == issuer) {
       auto& b=bars[ready+slot(tile)];
-      b.arrive_and_expect_tx(TILE_BYTES);
-      auto* dst=reinterpret_cast<half_t*>(arena+byte_offset+slot(tile)*TILE_BYTES);
-      tl::tma_load(map,b,dst,0,row,int(fa3_head()),0);
-      tl::tma_load(map,b,dst+8192,64,row,int(fa3_head()),0);
+      constexpr int bytes=Rows*MAP_COLS*4;
+      b.arrive_and_expect_tx(bytes);
+      auto* dst=reinterpret_cast<half_t*>(arena+byte_offset+slot(tile)*bytes);
+      tl::tma_load(map,b,dst,0,row,int(fa3_head()/HeadRatio),0);
+      tl::tma_load(map,b,dst+Rows*MAP_COLS,int(MAP_COLS),row,int(fa3_head()/HeadRatio),0);
     }
   }
 };
@@ -136,8 +141,8 @@ extern "C" __global__ void __launch_bounds__(CTA,1) main_kernel(
   extern __shared__ __align__(1024) unsigned char arena[];
   __shared__ __align__(16) uint64_t raw[SLOTS];
   auto* bars=reinterpret_cast<Barrier*>(raw);
-  constexpr Ring qr{1,Q_READY,-1,Q_OFFSET}, kr{K_VER,K_READY,K_FREE,K_OFFSET},
-                 vr{V_VER,V_READY,V_FREE,V_OFFSET};
+  constexpr Ring qr{Q_VER,Q_READY,-1,Q_OFFSET,Q_ISSUER}, kr{K_VER,K_READY,K_FREE,K_OFFSET,K_ISSUER},
+                 vr{V_VER,V_READY,V_FREE,V_OFFSET,V_ISSUER};
   if (threadIdx.x==0) {
     tl::prefetch_tma_descriptor(Q); tl::prefetch_tma_descriptor(K); tl::prefetch_tma_descriptor(V);
     #pragma unroll
@@ -148,40 +153,24 @@ extern "C" __global__ void __launch_bounds__(CTA,1) main_kernel(
   const int remainder=nk%128;
   const bool short_kv=SHORT_KV && remainder>0 && remainder<=8;
   const int bulk_tiles=tiles-int(short_kv);
-  const int active_tiles=CAUSAL ? min(int(fa3_query_block())+1,bulk_tiles) : bulk_tiles;
+  const int diagonal_tile=int(fa3_query_block())/(128/QUERY_ROWS);
+  const int active_tiles=CAUSAL ? min(diagonal_tile+1,bulk_tiles) : bulk_tiles;
   int tid=int(threadIdx.x)-C_BASE;
   if (tid>=0 && tid<C_THREADS) {
     tl::warpgroup_reg_alloc<C_REGS>();
-    qr.load(Q,0,fa3_query_block()*128,tid,arena,bars);
+    qr.load<QUERY_ROWS,1>(Q,0,fa3_query_block()*QUERY_ROWS,tid,arena,bars);
     float o[64]={}, s[64], m[2]={-CUDART_INF_F,-CUDART_INF_F}, l[2]={};
     half_t p[64];
     auto* q=reinterpret_cast<half_t*>(arena+Q_OFFSET);
     auto scores=[&](int t) {
-      bars[K_READY+kr.slot(t)].wait(kr.phase(t));
-      qk(s,q,reinterpret_cast<half_t*>(arena+K_OFFSET+kr.slot(t)*TILE_BYTES),tid);
-      if constexpr (CAUSAL) {
-        if (t==int(fa3_query_block())) {
-          #pragma unroll
-          for (int i=0;i<64;++i) {
-            int row=(tid/32)*16+((tid&31)/4)+((i/2)%2)*8;
-            int col=(i/4)*8+(tid%4)*2+i%2;
-            if (col>row) s[i]=-CUDART_INF_F;
-          }
-        }
-      }
-      // A TMA load zero-fills the tensor-map fringe. Padding logits must
-      // receive zero probability, including on non-causal query rows.
-      if constexpr (dynamic_geometry || (KV_ROWS % 128 != 0 && (!CAUSAL || ROWS>KV_ROWS))) {
-        if ((nk%128)!=0 && t==tiles-1) {
-          #pragma unroll
-          for (int i=0;i<64;++i) {
-            int col=(i/4)*8+(tid%4)*2+i%2;
-            if (col>=nk%128) s[i]=-CUDART_INF_F;
-          }
-        }
-      }
+#include "native_fa3_scores.inc"
       bars[K_FREE+kr.slot(t)].arrive();
     };
+#ifdef FRISK_FA3_DEFER_K
+    auto scores_defer_k=[&](int t) {
+#include "native_fa3_scores.inc"
+    };
+#endif
     auto accumulate=[&](int t) {
       bars[V_READY+vr.slot(t)].wait(vr.phase(t));
       pv(o,p,reinterpret_cast<half_t*>(arena+V_OFFSET+vr.slot(t)*TILE_BYTES));
@@ -191,18 +180,14 @@ extern "C" __global__ void __launch_bounds__(CTA,1) main_kernel(
     if constexpr (SAME_TILE_PV) {
       #pragma unroll 1
       for (int t=0;t<active_tiles;++t) {
-        scores(t);
-        update(s,p,o,m,l);
-        accumulate(t);
+        FRISK_FA3_SAME_TILE_EVENTS
       }
     } else {
       scores(0);
       update(s,p,o,m,l);
       #pragma unroll 1
       for (int t=0;t<active_tiles-1;++t) {
-        scores(t+1);
-        accumulate(t);
-        update(s,p,o,m,l);
+        FRISK_FA3_LOOKAHEAD_EVENTS
       }
       accumulate(active_tiles-1);
     }
@@ -210,8 +195,15 @@ extern "C" __global__ void __launch_bounds__(CTA,1) main_kernel(
       if (remainder==1) extend_keys<1>(o,m,l,tid,fa3_query_block(),nq,nk,shape.q,shape.k,shape.v,shape.qp,shape.kp,shape.vp);
       else extend_keys<8>(o,m,l,tid,fa3_query_block(),nq,nk,shape.q,shape.k,shape.v,shape.qp,shape.kp,shape.vp);
     }
-    // The optional numerical contract rounds one reciprocal per row.
-#ifdef FRISK_ROW_RECIPROCAL
+    // O is narrowed to binary16 after normalize. For binary32 inputs, a
+    // binary64 reciprocal and product preserve the subsequent RN32 -> RN16
+    // result. See the midpoint argument in fa3_query_tile.py.
+#if !defined(FRISK_ROW_RECIPROCAL) && defined(FRISK_NARROW_OUTPUT_DIV)
+    const double inverse[2]={__drcp_rn(double(l[0])),__drcp_rn(double(l[1]))};
+    auto normalize=[&](int i) {
+      return __double2float_rn(__dmul_rn(double(o[i]),inverse[(i&3)>>1]));
+    };
+#elif defined(FRISK_ROW_RECIPROCAL)
     float inverse[2]={__frcp_rn(l[0]),__frcp_rn(l[1])};
     auto normalize=[&](int i) { return __fmul_rn(o[i],inverse[(i&3)>>1]); };
 #else
@@ -219,17 +211,17 @@ extern "C" __global__ void __launch_bounds__(CTA,1) main_kernel(
 #endif
 #ifdef FRISK_REGISTER_WRITEBACK
     // Each accumulator holder writes its own adjacent pair of FP16 values.
-    auto* base=output+fa3_head()*shape.output_pitch*128+fa3_query_block()*16384;
+    auto* base=output+fa3_head()*shape.output_pitch*128+fa3_query_block()*(QUERY_ROWS*128);
     #pragma unroll
     for (int i=0;i<64;i+=2) {
       const int row=(tid/32)*16+((tid&31)/4)+((i/2)%2)*8;
       const int col=(i/4)*8+(tid%4)*2;
-      if ((!dynamic_geometry && ROWS%128==0) || fa3_query_block()*128+row<nq)
+      if ((!dynamic_geometry && ROWS%QUERY_ROWS==0) || fa3_query_block()*QUERY_ROWS+row<nq)
         *reinterpret_cast<uint32_t*>(base+row*128+col)=__pack_half2(
             half_t(normalize(i)),half_t(normalize(i+1)));
     }
 #else
-    if constexpr (O_OFFSET == Q_OFFSET) tl::__sync_thread_partial(2,C_THREADS);
+    if constexpr (O_ALIAS_BARRIER >= 0) tl::__sync_thread_partial(O_ALIAS_BARRIER,C_THREADS);
     auto* out=reinterpret_cast<half_t*>(arena+O_OFFSET);
     #pragma unroll
     for (int i=0;i<64;++i) o[i]=normalize(i);
@@ -241,10 +233,10 @@ extern "C" __global__ void __launch_bounds__(CTA,1) main_kernel(
           __pack_half2(half_t(src[4]),half_t(src[5])),__pack_half2(half_t(src[6]),half_t(src[7])));
     }
     tl::fence_proxy_async();  // Publish every writer to the TMA async proxy.
-    tl::__sync_thread_partial(3,C_THREADS);
-    if (tid==0) {
-      tl::tma_store(output+fa3_head()*shape.output_pitch*128+fa3_query_block()*16384,out,TILE_BYTES);
-      tl::tma_store_arrive(); tl::tma_store_wait<0,true>();
+    tl::__sync_thread_partial(O_PUBLISH_BARRIER,C_THREADS);
+    if (tid==O_ISSUER) {
+      tl::tma_store(output+fa3_head()*shape.output_pitch*128+fa3_query_block()*(QUERY_ROWS*128),out,Q_TILE_BYTES);
+      tl::tma_store_arrive(); tl::tma_store_wait<O_WAIT,bool(O_WAIT_READ)>();
     }
 #endif
   } else {

@@ -107,6 +107,29 @@ def from_overlap(plan):
     return out
 
 
+def fa3_query_plan(plan, query_tile):
+    """Specialize the imported event order; K/V arena origins and versions stay fixed."""
+    import copy
+    validate(plan)
+    if plan["kind"] not in FA3_KINDS or query_tile not in (64,128):
+        raise ValueError("unsupported FA3 query tile")
+    out=copy.deepcopy(plan)
+    consumer=out["roles"]["qk"]
+    threads=query_tile*2
+    out["groups"][consumer]["threads"]=threads
+    base=0
+    for group in out["groups"]:
+        group["base"]=base
+        base+=group["threads"]
+    out["cta"]=base
+    for name in ("q","o"):
+        out["buffers"][name]["tile_bytes"]=query_tile*128*2
+    for name in ("k_free","v_free"):
+        out["edges"][name]["arrivals"]=threads
+    validate(out)
+    return out
+
+
 def validate(plan):
     if plan['kind']=='single':
         if plan != single_group(plan['batch'],plan['cta']): raise ValueError('unsupported synchronous execution contract')
@@ -116,9 +139,9 @@ def validate(plan):
     gs=plan['groups'];roles=plan['roles']; c=roles['qk']; p=roles['k']
     if len(gs)!=2 or {c,p}!={0,1} or roles!={'q':c,'qk':c,'pv':c,'reduce':c,'v':p,'k':p}:
         raise ValueError('unsupported FA3 group binding')
-    if (gs[c]['threads'],gs[p]['threads'],gs[c]['increase'],gs[p]['increase'])!=(256,128,1,0):
+    if gs[c]['threads'] not in (128,256) or (gs[p]['threads'],gs[c]['increase'],gs[p]['increase'])!=(128,1,0):
         raise ValueError('unsupported MMA/producer domains')
-    if [g['base'] for g in gs]!=[0,gs[0]['threads']] or plan['cta']!=384:
+    if [g['base'] for g in gs]!=[0,gs[0]['threads']] or plan['cta']!=gs[c]['threads']+gs[p]['threads']:
         raise ValueError('invalid CTA partition')
     for g in gs:
         if _int(g['regs'],24,256)%8: raise ValueError('invalid setmaxnreg')
@@ -126,8 +149,8 @@ def validate(plan):
     bs=plan['buffers'];end=_int(plan['arena'],_TILE_BYTES,227328)
     spans={}
     for k,v in bs.items():
-        n=_int(v['versions'],1,8); start=_int(v['offset'],0,end);stop=start+n*_TILE_BYTES
-        if start%1024 or stop>end or v['tile_bytes']!=_TILE_BYTES: raise ValueError('invalid TMA ring allocation')
+        n=_int(v['versions'],1,8); start=_int(v['offset'],0,end);tile_bytes=gs[c]['threads']*128 if k in ('q','o') else _TILE_BYTES;stop=start+n*tile_bytes
+        if start%1024 or stop>end or v['tile_bytes']!=tile_bytes: raise ValueError('invalid TMA ring allocation')
         spans[k]=(start,stop)
     if set(bs)!={'q','k','v','o'} or bs['q']['versions']!=1 or bs['o']['versions']!=1:
         raise ValueError('unsupported Q/O versioning')
@@ -139,7 +162,7 @@ def validate(plan):
     if set(edges)!={'q_ready','k_ready','v_ready','k_free','v_free'}: raise ValueError('incomplete edges')
     for name,e in edges.items():
         n=bs[name[0]]['versions'];free=name.endswith('_free')
-        if (e['slots'],e['arrivals'],e['distance'])!=(n,256 if free else 1,n if free else 0):
+        if (e['slots'],e['arrivals'],e['distance'])!=(n,gs[c]["threads"] if free else 1,n if free else 0):
             raise ValueError('incorrect barrier versions, arrivals or reuse distance')
         used.extend(range(e['first'],e['first']+n))
     if sorted(used)!=list(range(plan['barrier_slots'])): raise ValueError('barrier slots overlap or have gaps')

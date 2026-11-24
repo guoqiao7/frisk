@@ -391,6 +391,11 @@ class Emitter:
     for stage in register.stages:
      other = self.tmp()
      self.emit(f'shfl.sync.bfly.b32 {other}, {value}, {stage.xor_mask}, 31, -1;')
+     # PTX max.f32 is symmetric, including signed zeros and NaN handling.
+     # Its ordered tree needs the same partners but no left/right lane select.
+     if operation == 'max.f32' or id(o) in getattr(self, 'positive_sum_ops', ()):
+      value = combine(value, other)
+      continue
      pred = left_predicate(stage)
      left, right = self.tmp(), self.tmp()
      self.emit(f'selp.b32 {left}, {value}, {other}, {pred};')
@@ -972,7 +977,7 @@ class Emitter:
 
 def emit(data, *, demand_query_observer=None, demand_query_budget=65536, shuffle_network_policy='auto',
          access_policy='vector', reduction_policy='auto', mma_group_size=None, shared_policy='declared',
-         store_policy='direct', copy_batch=False, trace_execution=False, aligned_online_inputs=False, defer_v_wait=False, flush_exp_subnormals=False, online_query_start=0, online_head_pitches=None):
+         store_policy='direct', copy_batch=False, trace_execution=False, aligned_online_inputs=False, defer_v_wait=False, flush_exp_subnormals=False, online_query_start=0, online_head_pitches=None, online_loop_schedule='auto', k_transport='cp.async', k_map_abi='value', overlap_pv_normalizer=True, cross_iteration_pv=False, prefetch_after_qk=False, kv_prefetch_edges=None, v_transport="cp.async"):
  from online_execution_contract import packet_contract
  plan = packet_contract(data) if any('frisk.execution_contract' in o.get('attrs',{}) for o in data.get('operations',[])) else None
  if plan is not None:
@@ -1003,6 +1008,31 @@ def emit(data, *, demand_query_observer=None, demand_query_budget=65536, shuffle
  if flush_exp_subnormals and not online:
   raise ValueError("explicit exponential FTZ requires an online attention launch")
  instance.flush_exp_subnormals = flush_exp_subnormals
+ if online_loop_schedule not in ('auto','original','grouped-qk-ring'):
+  raise ValueError("unsupported online KV schedule")
+ if k_transport not in ('cp.async','tma') or (k_transport=='tma' and not online):
+  raise ValueError("unsupported K transport for this execution contract")
+ if k_map_abi not in ('value','global'):
+  raise ValueError("K tensor map ABI must be value or global")
+ instance.overlap_pv_normalizer = overlap_pv_normalizer
+ instance.k_map_abi = k_map_abi
+ if cross_iteration_pv and not online:
+  raise ValueError("cross-iteration PV requires native online attention")
+ if prefetch_after_qk and (not online or cross_iteration_pv):
+  raise ValueError("post-QK prefetch requires single-group online attention with same-iteration PV")
+ if kv_prefetch_edges is not None:
+  if (not online or prefetch_after_qk or cross_iteration_pv or not isinstance(kv_prefetch_edges, tuple)
+      or len(kv_prefetch_edges)!=2 or any(edge not in ('before','after') for edge in kv_prefetch_edges)):
+   raise ValueError("expected independent (K,V) issue edges around QK with the original waits")
+ if v_transport not in ('cp.async','tma') or (v_transport=='tma' and
+      (not online or k_transport!='tma' or k_map_abi!='value' or cross_iteration_pv or kv_prefetch_edges is not None)):
+  raise ValueError('V TMA requires joint K/V issue, by-value maps and same-iteration PV')
+ instance.v_transport = v_transport
+ instance.kv_prefetch_edges = kv_prefetch_edges
+ instance.prefetch_after_qk = prefetch_after_qk
+ instance.cross_iteration_pv = cross_iteration_pv
+ instance.k_transport = k_transport
+ instance.online_loop_schedule = online_loop_schedule
  instance.defer_v_wait = defer_v_wait
  if (online_query_start or online_head_pitches is not None) and not online:
   raise ValueError("query slicing requires a native online attention packet")
@@ -1020,7 +1050,9 @@ def compile_execution(data, **emission_options):
 
  Returns (Triton CompiledKernel, emission metadata). The kernel takes the
  Global buffers in root_order. Static tile arguments may be contiguous views
- into the same read-only input. Launch one CTA with image[(1, 1, 1)](*args).
+ into the same read-only input. For online K TMA, append the prepared map
+ selected by info["k_tensor_map"]["abi"] and use the reported launch grid.
+ The value ABI takes a host CUtensorMap, the global ABI a device pointer.
  """
  from online_execution_contract import FA3_KINDS
  for op in data.get('operations',[]):
@@ -1040,6 +1072,11 @@ def compile_execution(data, **emission_options):
   path.write_text(source)
   image = triton.compile(str(path), target=target,
                          options={'num_warps': info.get('threads', 128) // 32, 'num_stages': 1})
+ # A mismatched launcher would copy a pointer instead of 128 parameter bytes.
+ for key in ('k_tensor_map', 'v_tensor_map'):
+  tensor_map = info.get(key)
+  if tensor_map and tensor_map['abi']=='value' and image.src.signature.get(tensor_map['descriptor_arg'])!='nvTmaDesc':
+   raise ValueError(f"compiled launcher does not accept {key} as a by-value CUtensorMap")
  dynamic = info.get('dynamic_shared_bytes', 0)
  if dynamic:
   # Inline PTX owns the explicitly declared external shared region. Triton's

@@ -71,7 +71,7 @@ class WideEmitter(Emitter):
         self.emit('bar.sync 0;')
         self.emit('fence.proxy.async.shared::cta;')
 
-    def group_descriptor(self, value, desc, starts, k):
+    def group_descriptor(self, value, desc, starts, k, base_offset=0):
         entries = desc['entries']
         table = {(mn, col): (offset, phase) for mn,col,offset,phase in zip(*[iter(entries)]*4)}
         if len(table)*4 != len(entries):
@@ -80,7 +80,7 @@ class WideEmitter(Emitter):
         values = []
         for start in starts:
             off, phase = table[start,k]
-            base = self.smem[self.storage(value)['root']] + off
+            base = self.smem[self.storage(value)['root']] + off + base_offset
             if base % 16 or base >= 1<<18 or not 0 <= phase < 8:
                 raise ValueError('invalid descriptor address')
             values.append((base,phase))
@@ -150,7 +150,7 @@ class WideEmitter(Emitter):
                             expected = [element(t,r,2*j+h)*(16*depth)+16*k+column(t,2*j+h) for t in range(self.threads)]
                             if source[i+h] != expected:
                                 raise ValueError('WGMMA RS packing disagrees with holder map')
-                        z = self.tmp()
+                        z = self.packed_mma_register(op, k, j, depth)
                         self.emit('mov.b32 '+z+', {'+', '.join(self.regs(a)[i:i+2])+'};')
                         packed.append(z)
                     operands = '{'+', '.join(packed)+'}, '+bd+', mma_acc, 1, 1, 1'
@@ -159,15 +159,10 @@ class WideEmitter(Emitter):
                     operands = f'{ad}, {bd}, mma_acc, 1, 1, 0, 0'
                 pending.append(operands)
                 if len(pending) == self.mma_group_size:
-                    # All RS fragments and descriptors are ready before the fence.
-                    # Only same-shape WGMMA touches this accumulator before wait 0.
-                    self.emit('setp.eq.u32 mma_acc, 0, 0;')
-                    self.emit('wgmma.fence.sync.aligned;')
-                    for arguments in pending:
-                        self.emit(f'wgmma.mma_async.sync.aligned.m64n{cols}k16.f32.f16.f16 {{'+
-                                  ', '.join(out[r*width:(r+1)*width])+'}, '+arguments+';')
-                    self.emit('wgmma.commit_group.sync.aligned;')
-                    self.emit('wgmma.wait_group.sync.aligned 0;')
+                    fragment = ', '.join(out[r*width:(r+1)*width])
+                    instructions = [f'wgmma.mma_async.sync.aligned.m64n{cols}k16.f32.f16.f16 '
+                                    f'{{{fragment}}}, {args};' for args in pending]
+                    self.emit_mma_group(op, instructions, last=(r == rows-1 and k == depth-1))
                     pending.clear()
 
     def local_mux(self, registers, indices):
@@ -300,6 +295,23 @@ class WideEmitter(Emitter):
                 transfer(slots, [int(start <= x < end) for x in slots], reg, False)
             self.emit('bar.sync 0;')
 
+    def packed_mma_register(self, op, k, j, depth):
+        return self.tmp()
+
+    def issue_mma_group(self, instructions):
+        for instruction in instructions:
+            self.emit(instruction)
+        self.emit('wgmma.commit_group.sync.aligned;')
+
+    def emit_mma_group(self, op, instructions, *, last):
+        self.emit('setp.eq.u32 mma_acc, 0, 0;')
+        self.emit('wgmma.fence.sync.aligned;')
+        self.issue_mma_group(instructions)
+        self.wait_for_mma(op)
+
+    def wait_for_mma(self, op):
+        self.emit('wgmma.wait_group.sync.aligned 0;')
+
     def global_io(self,op,store):
         value,buffer = op['operands'] if store else (op['results'][0],op['operands'][0])
         if ('xf32' not in self.v[value]['type'].split(',')[0] or
@@ -399,24 +411,40 @@ class WideEmitter(Emitter):
                 self.indices[iv] = index
                 self.emit(f'mov.u32 {index}, {low};')
                 high = self.loop_upper_bound(op,high)
-                self.emit(f'frisk_loop_{i}:')
-                pred = self.tmp('pred')
-                self.emit(f'setp.ge.s32 {pred}, {index}, {high};')
-                self.emit(f'@{pred} bra.uni {after};')
-                self.sequence(ops,i+1,tail)
-                updates = []
-                for arg,src in zip(carried,ops[tail]['operands'],strict=True):
-                    for z,x in zip(self.regs(arg),self.regs(src),strict=True):
-                        t = self.tmp()
-                        self.emit(f'mov.b32 {t}, {x};')
-                        updates.append((z,t))
-                for z,t in updates: self.emit(f'mov.b32 {z}, {t};')
-                self.emit(f'add.u32 {index}, {index}, {step};')
+                peel = getattr(self, 'cross_iteration_pv', False)
+                versions = (0,1,0) if peel else range(self.loop_body_versions(op))
+                for leg, self.loop_version in enumerate(versions):
+                    self.loop_prime = peel and leg == 0
+                    if leg == int(peel):
+                        self.emit(f'frisk_loop_{i}:')
+                    if not self.loop_prime:
+                        pred = self.tmp('pred')
+                        self.emit(f'setp.ge.s32 {pred}, {index}, {high};')
+                        self.emit(f'@{pred} bra.uni {after};')
+                    self.sequence(ops,i+1,tail)
+                    updates = []
+                    for arg,src in zip(carried,ops[tail]['operands'],strict=True):
+                        for z,x in zip(self.regs(arg),self.regs(src),strict=True):
+                            if peel and z == x:
+                                continue
+                            t = self.tmp()
+                            self.emit(f'mov.b32 {t}, {x};')
+                            updates.append((z,t))
+                    for z,t in updates: self.emit(f'mov.b32 {z}, {t};')
+                    self.emit(f'add.u32 {index}, {index}, {step};')
                 self.emit(f'bra.uni frisk_loop_{i};')
                 for result,arg in zip(op['results'],carried,strict=True):
                     self.reg[result] = self.regs(arg)
             self.emit(after+':')
+            if name == 'scf.for' and peel:
+                self.drain_pv()
             i = tail+1
+
+    def finalize_allocation(self, allocation):
+        return allocation
+
+    def loop_body_versions(self, op):
+        return 1
 
     def run(self):
         if (self.mma_group_size not in (1, 4) or self.copy_batch or self.store_policy!='direct' or
@@ -432,26 +460,39 @@ class WideEmitter(Emitter):
             raise ValueError('wide kernel ABI requires distinct declared global arguments')
         self.roots = {v:i for i,v in enumerate(roots)}
         self.smem = {item['root_id']:item['offset'] for item in allocation['allocations']}
+        allocation = self.finalize_allocation(allocation)
         shared = allocation['static_shared_bytes']
         self.indices, self.conditions = {}, {}
         self.decl += ['.reg .pred mma_acc;', '.reg .u32 tid, lane, smem, scratch;']
         self.emit('mov.u32 tid, %tid.x;')
         self.emit('and.b32 lane, tid, 31;')
-        self.emit(f'mov.u32 smem, ${len(roots)+1};')
+        tensor_maps = [m for m in (getattr(self, 'k_tma', None), getattr(self, 'v_tma', None)) if m]
+        descriptor_count = len(tensor_maps)
+        self.emit(f'mov.u32 smem, ${len(roots)+descriptor_count+1};')
         self.emit(f'add.u32 scratch, smem, {allocation["scratch_offset"]};')
         self.sequence(ops,0,len(ops))
         asm = '{\n'+'\n'.join(self.decl+self.code+['mov.u32 $0, 0;'])+'\n}'
         asm = asm.replace('\\','\\5C').replace('"','\\22').replace('\n','\\0A')
-        names = ['%arg'+str(i) for i in range(len(roots))]
+        names = ['%arg'+str(i) for i in range(len(roots)+descriptor_count)]
         ptr = '!tt.ptr<i8>'
+        types = [ptr]*len(names)
+        parameters = [name+': '+ptr for name in names]
+        for tensor_map in tensor_maps:
+            if tensor_map['abi'] != 'value':
+                continue
+            index = tensor_map['descriptor_arg']
+            # Triton lowers this generic pointer to grid-constant byval([128 x i8])
+            # and marshals the host descriptor using the nvTmaDesc launch ABI.
+            types[index] = '!tt.ptr<i8, 0>'
+            parameters[index] = names[index]+': '+types[index]+' {tt.nv_tma_desc = 1 : i32}'
         text = ('module attributes {"ttg.num-warps" = '+str(self.threads//32)+' : i32, "ttg.num-ctas" = 1 : i32, '
                 '"ttg.threads-per-warp" = 32 : i32, "ttg.target" = "cuda:90"} {\n'
                 ' llvm.mlir.global external @frisk_dynamic() {addr_space = 3 : i32, alignment = 1024 : i64} : !llvm.array<0 x i8>\n'
-                ' tt.func public @frisk_execution('+', '.join(n+': '+ptr for n in names)+') {\n'
+                ' tt.func public @frisk_execution('+', '.join(parameters)+') {\n'
                 '  %sm = llvm.mlir.addressof @frisk_dynamic : !llvm.ptr<3>\n'
                 '  %addr = llvm.ptrtoint %sm : !llvm.ptr<3> to i32\n'
                 '  %done = tt.elementwise_inline_asm "'+asm+'" {constraints = "=r'+',l'*len(names)+',r", '
                 'pure = false, packed_element = 1 : i32} '+', '.join(names)+', %addr : '+
-                ', '.join([ptr]*len(names))+', i32 -> i32\n tt.return\n }\n}\n')
+                ', '.join(types)+', i32 -> i32\n tt.return\n }\n}\n')
         return text,dict(threads=self.threads,root_order=roots,dynamic_shared_bytes=shared,
                          shared_allocation_plan=allocation,emitted_operations=len(ops),mma_group_size=self.mma_group_size)

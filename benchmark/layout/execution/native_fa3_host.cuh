@@ -15,11 +15,14 @@ extern "C" int frisk_launch_workspace(const void* q,const void* k,const void* v,
       floats<size_t(nq%128)*heads*parts*130)) return int(cudaErrorInvalidValue);
   CUtensorMap maps[3];
   const void* inputs[]={q,k,v};
-  cuuint32_t box[]={64,128,1,1}, unit[]={1,1,1,1};
+  static_assert(MAP_SWIZZLE==128 && MAP_COLS*MAP_ROWS*4==TILE_BYTES,"unsupported SM90 FP16 TMA box");
+  cuuint32_t box[]={MAP_COLS,MAP_ROWS,1,1}, unit[]={1,1,1,1};
   for (int i=0;i<3;++i) {
-    cuuint64_t dims[]={128,cuuint64_t(i==0?nq:nk),cuuint64_t(heads),1};
+    box[1]=i==0 ? QUERY_ROWS : MAP_ROWS;
+    const int map_heads = i==0 ? heads : heads/FRISK_KV_HEAD_RATIO;
+    cuuint64_t dims[]={128,cuuint64_t(i==0?nq:nk),cuuint64_t(map_heads),1};
     cuuint64_t pitch=cuuint64_t(pitches[i])*256;
-    cuuint64_t strides[]={256,pitch,pitch*heads};
+    cuuint64_t strides[]={256,pitch,pitch*map_heads};
     auto status=cuTensorMapEncodeTiled(&maps[i],CU_TENSOR_MAP_DATA_TYPE_FLOAT16,4,
           const_cast<void*>(inputs[i]),dims,strides,box,unit,CU_TENSOR_MAP_INTERLEAVE_NONE,
           CU_TENSOR_MAP_SWIZZLE_128B,CU_TENSOR_MAP_L2_PROMOTION_L2_128B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
@@ -27,7 +30,7 @@ extern "C" int frisk_launch_workspace(const void* q,const void* k,const void* v,
   }
   auto status=cudaFuncSetAttribute(main_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,ARENA);
   if (status!=cudaSuccess) return int(status);
-  const int qblocks=QUERY_FRINGE ? nq/128 : (nq+127)/128;
+  const int qblocks=QUERY_FRINGE ? nq/QUERY_ROWS : (nq+QUERY_ROWS-1)/QUERY_ROWS;
   main_kernel<<<dim3(qblocks,heads),CTA,ARENA,reinterpret_cast<cudaStream_t>(stream)>>>(
         maps[1],reinterpret_cast<half_t*>(o),maps[0],maps[2],{nq,nk,op,qp,kp,vp,static_cast<const half_t*>(q),static_cast<const half_t*>(k),static_cast<const half_t*>(v)},trace);
   status=cudaGetLastError();

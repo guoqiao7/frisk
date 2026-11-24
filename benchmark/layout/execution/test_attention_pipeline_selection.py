@@ -38,6 +38,49 @@ class AttentionPipelineSelectionTest(unittest.TestCase):
         self.assertEqual((image, info['wait']), ('q128-wait4', 4))
         self.assertEqual(len(receipt['rejected']), 2)
 
+    def test_extended_causal_tuner_compares_cp_k_and_kv_tma(self):
+        paths = {}
+        def compile_one(plan, *args, **options):
+            self.assertEqual((options["kv_heads"],options["kv_rows"],options["value_dim"]), (4,768,64))
+            paths[plan.name] = (options["k_transport"],plan.v_transport)
+            return plan.name, {}
+        with patch("attention_pipeline_selection.compile_attention_pipeline", side_effect=compile_one):
+            tune_attention_pipelines("opt",".",rows=768,heads=16,kv_heads=4,kv_rows=768,dim=64,
+                value_dim=64,causal=True,aligned_inputs=True,output_bits=32,
+                measure=lambda images: [{name: 1.0 for name in images}])
+        self.assertEqual(set(paths.values()),{("cp.async","cp.async"),("tma","cp.async"),("tma","tma")})
+
+    def test_regular_grouped_d64_tuner_pairs_q_rows_on_joint_transfer(self):
+        captured = {}
+        def capture(plan, *args, **options):
+            captured[plan.name] = (plan.query_tile, plan.kv_tile, plan.contract["cta"],
+                                   options["k_transport"], plan.v_transport, plan.prefetch_after_qk)
+            return plan.name, {}
+        with patch("attention_pipeline_selection.compile_attention_pipeline", side_effect=capture):
+            tune_attention_pipelines("opt", ".", rows=641, heads=12, kv_heads=4, dim=64,
+                causal=False, aligned_inputs=True, output_bits=32,
+                measure=lambda images: [{name: 1.0 for name in images}])
+        self.assertEqual({v for n,v in captured.items() if n.startswith("q128-kv")},
+                         {(128, width, 256, "tma", "tma", late)
+                          for width in (64,128) for late in (False,True)})
+
+    def test_default_regular_d64_tuner_includes_both_copy_paths_and_edges(self):
+        for bits in (16, 32):
+            arms = {}
+            def compile_one(plan, *args, **options):
+                self.assertEqual(plan.half_output, bits == 16)
+                arms[plan.name] = (options["k_transport"], plan.v_transport, plan.prefetch_after_qk)
+                return plan.name, {}
+            with patch("attention_pipeline_selection.compile_attention_pipeline", side_effect=compile_one):
+                tune_attention_pipelines("opt", ".", rows=641, heads=8, dim=64,
+                    causal=False, aligned_inputs=True, output_bits=bits, fa3_query_tile="auto",
+                    measure=lambda images: [{name: 1.0 for name in images}])
+            self.assertIn(("cp.async", "cp.async", False), arms.values())
+            for width in (64, 128):
+                for suffix, edge in (("", False), ("-post-qk", True)):
+                    name = f"q64-kv{width}-k-tma{suffix}-v-tma"
+                    self.assertEqual(arms[name], ("tma", "tma", edge))
+
     def test_compared_plans_remain_bound_to_their_contract(self):
         plans = attention_pipelines(32)[:2]
         a, b = (p.name for p in plans)
@@ -83,7 +126,9 @@ class AttentionPipelineSelectionTest(unittest.TestCase):
         self.assertEqual(_geometry(data), (640, 8, True))
         attrs["rows"] = 641
         self.assertEqual(_geometry(data), (641,8,True))
-        for key, value in [('rows',128), ('kv_heads',2), ('causal',2), ('heads',0)]:
+        attrs["kv_heads"]=2
+        self.assertEqual(_geometry(data), (641,8,True))
+        for key, value in [('rows',128), ('kv_heads',3), ('causal',2), ('heads',0)]:
             old = attrs[key]
             attrs[key] = value
             with self.subTest(key=key), self.assertRaises(ValueError):

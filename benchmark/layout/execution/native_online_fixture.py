@@ -46,16 +46,21 @@ def _storage(rows, cols, width, role, *, output_half=False):
             f'alignment={1024 if role else 16 if output_half else 128 if width==4 else 1},vector_granularity=1>')
 
 
-def online_fixture(qtile, dim, rows, heads=8, kv_heads=8, causal=False, *, kv_rows=None, value_dim=None, execution_contract=None, packed_copy=False, row_reciprocal=False, half_output=False, base2_logits=False):
+def online_fixture(qtile, dim, rows, heads=8, kv_heads=8, causal=False, *, kv_rows=None, value_dim=None, execution_contract=None, packed_copy=False, row_reciprocal=False, half_output=False, base2_logits=False, kv_tile=None, v_row_major=False):
     from online_execution_contract import FA3_KINDS, validate
     if execution_contract is not None: validate(execution_contract)
     fa3 = execution_contract is not None and execution_contract['kind'] in FA3_KINDS
     threads = execution_contract["cta"] if execution_contract and not fa3 else 256
-    kv_tile = 128 if fa3 else 64
+    if fa3:
+        threads = execution_contract["groups"][execution_contract["roles"]["qk"]]["threads"]
+    if kv_tile is None:
+        kv_tile = 128 if fa3 else 64
+    if (fa3 and kv_tile != 128) or kv_tile not in (64,128):
+        raise ValueError("unsupported attention KV tile")
     if fa3 and (row_reciprocal or base2_logits):
         raise ValueError('FA3 uses its certified graph and its own lowering options')
-    if fa3 and ((qtile,dim,value_dim or dim)!=(128,128,128) or rows<=128 or
-                (kv_rows is not None and (type(kv_rows) is not int or kv_rows <= 128)) or not 1<=heads==kv_heads<=65535 or max(rows,kv_rows if kv_rows is not None else rows)*heads*128>=2**31):
+    if fa3 and ((qtile,dim,value_dim or dim)!=(threads//2,128,128) or rows<=128 or
+                (kv_rows is not None and (type(kv_rows) is not int or kv_rows <= 128)) or not (1<=kv_heads<=heads<=65535 and heads%kv_heads==0) or max(rows,kv_rows if kv_rows is not None else rows)*heads*128>=2**31):
         raise ValueError('unsupported FA3 replay workload')
     kv_rows = rows if kv_rows is None else kv_rows
     if type(kv_rows) is not int or kv_rows<=0 or type(rows) is not int:
@@ -85,7 +90,9 @@ def online_fixture(qtile, dim, rows, heads=8, kv_heads=8, causal=False, *, kv_ro
         lines.append(f'%g{v} = frisk.layout_view %{v} : {t} -> {t}')
         if role:
             shared=t.replace(',1>',',3>');sv=role.lower()+'s'
-            lines.append(f'%s{sv} = frisk.layout_view %{sv} {{layout={_storage(r,columns[v],2,"K" if fa3 else role)}}} : {shared} -> {shared}')
+            # For D64, the 64-column SW128 box is a whole row of V.
+            storage_role = "K" if fa3 or (role == "V" and v_row_major) else role
+            lines.append(f'%s{sv} = frisk.layout_view %{sv} {{layout={_storage(r,columns[v],2,storage_role)}}} : {shared} -> {shared}')
     def copy(index):
         (v,r,role),t=spec[index],types[index]
         binding = f'frisk.execution_role="{role.lower()}",' if fa3 else 'frisk.execution_threads=256:i64,'
@@ -107,7 +114,7 @@ def online_fixture(qtile, dim, rows, heads=8, kv_heads=8, causal=False, *, kv_ro
         is_out=line.startswith(('%mfinal,','%ba1 =','%acc1 =','%out1 =','scf.yield','%denom3 =','%out =','frisk.tile_store'))
         line=line.replace('tensor<256x64xf32>',out if is_out else logits).replace('tensor<256x64xf16>',f'tensor<{qtile}x{kv_tile}xf16>')
         width=value_dim if is_out else dim
-        line=line.replace('memref<256x64x',f'memref<{qtile}x{width}x').replace('memref<64x64x',f'memref<{kv_tile}x{width}x')
+        line=line.replace('memref<64x64x',f'memref<{kv_tile}x{width}x').replace('memref<256x64x',f'memref<{qtile}x{width}x')
         if line.startswith('%zero ='):
             lines.append(f'%zeroO = arith.constant dense<0.0> : {out}')
         if line.startswith('%empty ='):
@@ -126,11 +133,12 @@ def online_fixture(qtile, dim, rows, heads=8, kv_heads=8, causal=False, *, kv_ro
                 line = line.replace('%lfinal', '%inv')
             if line.startswith('%out ='):
                 line = line.replace('arith.divf', 'arith.mulf')
-        if fa3:
+        if kv_tile == 128:
             if line.startswith('%s1 ='):
                 line=line.replace('n=64:i64','n=128:i64')
             if line.startswith('%out1 ='):
                 line=line.replace('k=64:i64','k=128:i64')
+        if fa3:
             if 'frisk.execution_threads=256:i64' in line:
                 role='qk' if line.startswith('%s1 =') else 'pv' if line.startswith('%out1 =') else 'reduce'
                 line=line.replace('frisk.execution_threads=256:i64',f'frisk.execution_role="{role}"')

@@ -21,7 +21,11 @@ class NativeOnlineEmitter(WideEmitter):
             raise ValueError('invalid packed online attention extent or head grouping')
         self.causal = bool(cfg['causal'])
         self.group = self.heads // kv_heads
-        self.ktiles = (self.kv_rows+63)//64
+        ss,rs = [op for op in ops if op['name']=='frisk.mma']
+        self.kv_tile = ss['attrs']['n']
+        if self.kv_tile not in (64,128):
+            raise ValueError('unsupported online KV tile')
+        self.ktiles = (self.kv_rows+self.kv_tile-1)//self.kv_tile
         kernel, = [op for op in ops if op['name']=='frisk.kernel']
         self.q, self.k, self.vroot, self.out = kernel['arguments']
         loop, = [op for op in ops if op['name']=='scf.for']
@@ -45,12 +49,10 @@ class NativeOnlineEmitter(WideEmitter):
         self.vcopy = copies[2]
         self.adjacent_kv = ops.index(copies[2]) == ops.index(copies[1])+1
         self.batched_kv = False
-        ss,rs = [op for op in ops if op['name']=='frisk.mma']
         self.qtile, self.dim = ss['attrs']['m'], ss['attrs']['k']
         self.value_dim = rs['attrs']['n']
         if (self.value_dim not in (32,64,128) or self.qtile not in (64,128,256,512) or self.dim not in (64,128,256) or
-                ss['attrs']['n'] != 64 or
-                [rs['attrs'][k] for k in ('m','n','k')] != [self.qtile,self.value_dim,64]):
+                [rs['attrs'][k] for k in ('m','n','k')] != [self.qtile,self.value_dim,self.kv_tile]):
             raise ValueError('incompatible online QK/PV tile geometry')
         start = getattr(self,'online_query_start',0)
         if not (type(start) is int and 0<=start<self.rows and start%self.qtile==0):
@@ -71,7 +73,7 @@ class NativeOnlineEmitter(WideEmitter):
             raise ValueError('expected one post-loop output store')
         self.output_bytes = 2 if 'xf16' in self.v[self.out]['type'].split(',')[0] else 4
         views=[op['operands'][0] for op in copies]+[store['operands'][1]]
-        for view,rows,cols,width in zip(views,(self.qtile,64,64,self.qtile),
+        for view,rows,cols,width in zip(views,(self.qtile,self.kv_tile,self.kv_tile,self.qtile),
                                        (self.dim,self.dim,self.value_dim,self.value_dim),(2,2,2,self.output_bytes),strict=True):
             offsets=self.offsets(view)
             if (len(offsets)!=rows*cols or
@@ -81,7 +83,7 @@ class NativeOnlineEmitter(WideEmitter):
             raise ValueError('unexpected global input in the online graph')
         from native_online_memory import identity_suffix
         self.pruned_loop = loop if self.causal and identity_suffix(ops,loop,ss,rs,self.logits) else None
-        self.pv_op = rs
+        self.qk_op, self.pv_op = ss, rs
         if getattr(self, 'defer_v_wait', False):
             target = self.storage(self.vcopy['operands'][1])['root']
             consumers = [op for op in ops[ops.index(self.vcopy)+1:hi] if any(
@@ -89,17 +91,247 @@ class NativeOnlineEmitter(WideEmitter):
                 for value in op['operands'])]
             if not self.adjacent_kv or consumers != [rs] or self.storage(rs['operands'][1])['root'] != target:
                 raise ValueError('the V tile must have only its certified PV consumer before reuse')
+        self.k_tma = None
+        self.v_tma = None
+        self.ring_stride = 0
+        self.copy_version = 0
+        self.carry_alias = {}
+        self.positive_sum_ops = set()
+        self.invariants = []
+        self.descriptors = {}
+        self.kv_loop = loop
+        schedule = getattr(self, 'online_loop_schedule', 'auto')
+        grouped_qk = (schedule == 'grouped-qk-ring' and self.dim == self.value_dim == 128
+                      and self.qtile == 64 and self.group > 1)
+        # Both WGMMA groups consume the same completed K/V versions. A 2x1
+        # grid gives each group a distinct 64-row slice of Q and the output.
+        paired_rows = (self.output_bytes == 4 and self.qtile == 128 and self.dim == self.value_dim == 64 and
+                       self.group > 1 and not self.causal and self.threads == 256 and
+                       getattr(self, 'kv_prefetch_edges', None) is None and
+                       getattr(self, 'k_transport', None) == 'tma' and self.k_map_abi == 'value' and
+                       ss['attrs']['frisk.mma_contract']['grid'] == [2,1] and
+                       rs['attrs']['frisk.mma_contract']['grid'] == [2,1])
+        group_k = 16 * self.mma_group_size
+        self.ring_candidate = (
+            (schedule == 'auto' or grouped_qk)
+            and getattr(self, 'defer_v_wait', False) and self.aligned_online_inputs
+            and (self.threads == 128 or paired_rows) and self.ktiles >= 4
+            and (self.output_bytes == 4 or (self.dim == self.value_dim == 64 and self.k_transport == "tma"))
+            and (ss['attrs']['k'] == group_k or (grouped_qk and ss['attrs']['k'] % group_k == 0))
+            and rs['attrs']['k'] % group_k == 0)
+        if self.ring_candidate:
+            # Changing the physical version is legal only when the two original
+            # shared tiles are private to their respective matrix instructions.
+            for copy, consumer in ((self.kcopy, ss), (self.vcopy, rs)):
+                root = self.storage(copy['operands'][1])['root']
+                users = [op for op in ops[ops.index(copy)+1:] if any(
+                    'memref<' in self.v[v]['type'] and self.storage(v)['root'] == root
+                    for v in op['operands'])]
+                self.ring_candidate &= users == [consumer]
+        if self.ring_candidate:
+            self.bind_loop_accumulator(ops, loop, rs)
+            exponentials = {v for op in ops[lo:hi] if op['name'] == 'math.exp2' for v in op['results']}
+            self.positive_sum_ops = {id(op) for op in ops[lo:hi] if op['name'] == 'frisk.reduce_tensor'
+                                    and op['attrs']['kind'].strip('"') == 'sum' and op['operands'][0] in exponentials}
+        self.cross_iteration_pv = getattr(self, 'cross_iteration_pv', False)
+        self.prefetch_after_qk = getattr(self, 'prefetch_after_qk', False)
+        self.kv_prefetch_edges = getattr(self, 'kv_prefetch_edges', None)
+        if (self.prefetch_after_qk or self.kv_prefetch_edges is not None) and not (
+                self.ring_candidate and (self.qtile == self.dim == self.value_dim == 64 or paired_rows)
+                and self.k_transport == 'tma' and self.k_map_abi == 'value'
+                and ops[lo+1:ops.index(ss)] == [self.kcopy, self.vcopy]
+                and ss['attrs']['frisk.mma_contract']['repeats'] == [1,1,4]):
+            raise ValueError('QK-relative prefetch requires the certified D64 by-value K-TMA ring')
+        if self.cross_iteration_pv:
+            if not (self.ring_candidate and not self.causal and self.kv_tile == 128
+                    and self.qtile == self.dim == self.value_dim == 64
+                    and self.k_transport == 'tma' and self.k_map_abi == 'value'
+                    and ops[lo+1:ops.index(ss)] == [self.kcopy,self.vcopy]
+                    and self.carry_alias and ss['operands'][2] in constants and ops[hi-1] is rs
+                    and ss['results'][0] not in ops[hi]['operands']
+                    and ss['attrs']['frisk.mma_contract']['repeats'] == [1,1,4]
+                    and rs['attrs']['frisk.mma_contract']['repeats'] == [1,1,8]):
+                raise ValueError('cross-iteration PV requires the ordinary D64 KV128 single-warpgroup ring')
+            self.packed_pv_carry = {}
+            self.pending_pv_by_slot = {}
+        self.normalizer_ops = ()
+        self.pending_normalizer = []
+        if (self.ring_candidate and (self.qtile==self.dim==self.value_dim==64 or paired_rows)
+                and getattr(self,'k_transport',None)=='tma' and self.k_map_abi=='value'
+                and self.overlap_pv_normalizer):
+            self.normalizer_ops = self.independent_normalizer(ops, lo, hi, rs)
         self.packed_copies = []
         text, info = super().run()
         if getattr(self, 'defer_v_wait', False) and not self.batched_kv:
             raise ValueError('the deferred V wait needs two certified packed copies')
-        info['defer_v_wait'] = getattr(self, 'defer_v_wait', False)
+        info['defer_v_wait'] = bool(getattr(self, 'defer_v_wait', False) and not self.ring_stride)
+        info['online_kv_schedule'] = 'two-slot-lookahead' if self.ring_stride else 'original'
+        info['loop_optimizations'] = dict(ring=bool(self.ring_stride), carry=bool(self.carry_alias),
+                                          interior_mask=bool(self.ring_stride and (self.causal or self.kv_rows % self.kv_tile)),
+                                          positive_sum=bool(self.positive_sum_ops))
         info.update(batched_kv=self.batched_kv, causal_kv_pruned=self.pruned_loop is not None, packed_copy_roots=self.packed_copies)
         info.update(launch_grid=[self.qtiles*self.heads,1,1], query_start=start, head_pitches=list(self.pitches), kv_tiles=self.ktiles,
                     native_online_launch=cfg, q_tile=self.qtile, head_dim=self.dim)
+        if self.k_tma:
+            info['kv_tile'] = self.kv_tile
+            info['overlap_pv_normalizer'] = bool(self.normalizer_ops and self.ring_stride)
+            info["k_tensor_map"] = self.k_tma
+            info["operand_transport"] = {"Q":"cp.async", "K":"tma", "V":"cp.async"}
+        if self.v_tma:
+            info['v_tensor_map'] = self.v_tma
+            info['operand_transport']['V'] = 'tma'
+            info['kv_completion'] = dict(issuer_thread=0, slots=2, barriers=self.k_tma['barriers'],
+                                         expected_bytes=self.k_tma['transaction_bytes'] + self.v_tma['transaction_bytes'],
+                                         phase=self.k_tma['phase'], wait='joint-before-qk')
+        if self.kv_prefetch_edges is not None:
+            k_edge, v_edge = self.kv_prefetch_edges
+            info['online_kv_schedule'] = 'independent-kv-prefetch'
+            info['next_tile_prefetch'] = dict(K=k_edge, V=v_edge, waits='before-qk', pv='same-iteration')
+        if self.prefetch_after_qk:
+            info['online_kv_schedule'] = 'post-qk-prefetch'
+        if self.cross_iteration_pv:
+            info['online_kv_schedule'] = 'previous-pv-next-qk'
+            info['pv_completion'] = dict(in_flight=['PV(i), last group','QK(i+1)'],
+                                         release='wait_group 1, cp.async.wait_group 0 and CTA barrier before slot reuse',
+                                         tail='last PV group, wait_group 0', carried_packed_registers=16)
         if self.value_dim != self.dim:
             info["value_dim"] = self.value_dim
         return text,info
+
+    def independent_normalizer(self, ops, lo, hi, pv):
+        # These two register-only operations update the loop-carried row sum.
+        # Neither the PV operands nor a second observer may consume their result.
+        body = ops[lo+1:hi]
+        sums = [op for op in body if id(op) in self.positive_sum_ops]
+        if len(sums) != 1:
+            return ()
+        reduction, = sums
+        total, = reduction['results']
+        users = [op for op in ops if total in op['operands']]
+        if len(users)!=1 or users[0]['name']!='arith.addf':
+            return ()
+        update, = users
+        result, = update['results']
+        if (not (ops.index(reduction)<ops.index(update)<ops.index(pv)<hi)
+                or [op for op in ops if result in op['operands']] != [ops[hi]]):
+            return ()
+        return reduction, update
+
+    def packed_mma_register(self, op, k, j, depth):
+        if self.cross_iteration_pv and op is self.pv_op and k >= depth-self.mma_group_size:
+            key = (k,j)
+            if key not in self.packed_pv_carry:
+                self.packed_pv_carry[key] = self.tmp()
+            return self.packed_pv_carry[key]
+        return super().packed_mma_register(op,k,j,depth)
+
+    def emit_mma_group(self, op, instructions, *, last):
+        if not self.cross_iteration_pv:
+            return super().emit_mma_group(op, instructions, last=last)
+        if op is self.pv_op and last:
+            # Only the RS fragment and the partial O are carried. No asynchronous
+            # group crosses the loop branch. The V slot is kept until the next QK.
+            self.pending_pv_by_slot[self.loop_version] = instructions
+            return
+        if op is not self.qk_op:
+            return super().emit_mma_group(op, instructions, last=last)
+
+        self.emit('setp.eq.u32 mma_acc, 0, 0;')
+        self.emit('wgmma.fence.sync.aligned;')
+        if not self.loop_prime:
+            self.issue_mma_group(self.pending_pv_by_slot[1-self.loop_version])
+        self.issue_mma_group(instructions)
+        self.emit('wgmma.wait_group.sync.aligned 1;')
+        self.publish_v_and_prefetch()
+        self.wait_for_mma(op)
+
+    def publish_v_and_prefetch(self):
+        from native_online_ring import prefetch_next
+        self.emit('cp.async.wait_group 0;')
+        self.emit('bar.sync 0;')
+        self.emit('fence.proxy.async.shared::cta;')
+        prefetch_next(self, self.indices[self.iv])
+
+    def drain_pv(self):
+        # Ordinary attention has the same static trip count at every CTA.
+        self.emit('setp.eq.u32 mma_acc, 0, 0;')
+        self.emit('wgmma.fence.sync.aligned;')
+        self.issue_mma_group(self.pending_pv_by_slot[(self.ktiles-1)%2])
+        self.emit('wgmma.wait_group.sync.aligned 0;')
+
+    def wait_for_mma(self, op):
+        if getattr(self, 'kv_prefetch_edges', None) is not None and op is self.qk_op:
+            from native_online_ring import issue_at_qk_edge
+            issue_at_qk_edge(self, self.indices[self.iv], 'after')
+        if getattr(self, 'prefetch_after_qk', False) and op is self.qk_op:
+            # The previous PV was drained. Only the current QK can be in flight.
+            self.publish_v_and_prefetch()
+        if op is self.pv_op and self.pending_normalizer:
+            # The PV accumulator remains untouched until wait_group. Keep the
+            # original FP32 reduction tree and row-add operand order.
+            for pending in self.pending_normalizer:
+                super().operation(pending)
+            self.pending_normalizer.clear()
+        super().wait_for_mma(op)
+
+    def bind_loop_accumulator(self, ops, loop, pv):
+        # The old O, rescaled O and PV result have consecutive lifetimes.
+        yield_op = ops[loop['body_terminator']]
+        result = pv['results'][0]
+        if yield_op['operands'].count(result) != 1:
+            return
+        carry = loop['body_arguments'][1+yield_op['operands'].index(result)]
+        scaled = pv['operands'][2]
+        users = [op for op in ops if carry in op['operands']]
+        if (len(users) == 1 and users[0]['name'] == 'arith.mulf' and users[0]['results'] == [scaled]
+                and [op for op in ops if scaled in op['operands']] == [pv]
+                and [op for op in ops if result in op['operands']] == [yield_op]
+                and self.tensor_slots(carry) == self.tensor_slots(scaled) == self.tensor_slots(result)):
+            self.carry_alias = {scaled: carry, result: carry}
+
+    def newregs(self, value):
+        if value in self.carry_alias:
+            self.reg[value] = self.regs(self.carry_alias[value])
+            return self.reg[value]
+        return super().newregs(value)
+
+    def finalize_allocation(self, allocation):
+        if self.ring_candidate:
+            from native_online_ring import prepare_ring
+            allocation = prepare_ring(self, allocation)
+            if not self.ring_stride:
+                if self.cross_iteration_pv or self.prefetch_after_qk or self.kv_prefetch_edges is not None:
+                    raise ValueError('the requested schedule requires two allocated K and V slots')
+                self.carry_alias.clear()
+                self.positive_sum_ops.clear()
+        if getattr(self, 'k_transport', 'cp.async') == 'tma':
+            from online_k_tma import configure
+            allocation = configure(self, allocation)
+            if self.v_transport == 'tma':
+                from online_k_tma import configure_v
+                self.v_tma = configure_v(self, allocation)
+        return allocation
+
+    def loop_body_versions(self, op):
+        return 2 if self.ring_stride and op is self.kv_loop else 1
+
+    def shared(self, value, offset):
+        addr = super().shared(value, offset)
+        if self.copy_version and self.storage(value)['root'] in self.ring_roots:
+            self.emit(f'add.u32 {addr}, {addr}, {self.ring_stride};')
+        return addr
+
+    def group_descriptor(self, value, desc, starts, k):
+        if not self.ring_stride:
+            return super().group_descriptor(value, desc, starts, k)
+        displacement = self.loop_version*self.ring_stride if self.storage(value)['root'] in self.ring_roots else 0
+        key = (value, id(desc), tuple(starts), k, displacement)
+        if key not in self.descriptors:
+            pos = len(self.code)
+            self.descriptors[key] = super().group_descriptor(value, desc, starts, k, displacement)
+            self.invariants.extend(self.code[pos:])
+            del self.code[pos:]
+        return self.descriptors[key]
 
     def sequence(self, ops, begin, end):
         if begin==0:
@@ -111,6 +343,7 @@ class NativeOnlineEmitter(WideEmitter):
             self.emit(f'mul.lo.u32 {self.qrow}, {qtile}, {self.qtile};')
             if self.online_query_start:
                 self.emit(f'add.u32 {self.qrow}, {self.qrow}, {self.online_query_start};')
+            self.kv_head = kvhead
             self.emit(f'div.u32 {kvhead}, {head}, {self.group};')
             qbase,self.kbase = self.tmp(),self.tmp()
             qp,kp,vp,op=self.pitches
@@ -126,6 +359,8 @@ class NativeOnlineEmitter(WideEmitter):
                 self.emit(f'mad.lo.u32 {qbase}, {head}, {op}, {self.qrow};')
             self.set_pointer(self.out,qbase,self.output_bytes*self.value_dim)
         super().sequence(ops,begin,end)
+        if begin == 0 and self.invariants:
+            self.code[self.preheader:self.preheader] = self.invariants
 
     def map(self, table):
         # A GF(2) column contributes one or more output bits. Group all input
@@ -193,11 +428,23 @@ class NativeOnlineEmitter(WideEmitter):
         return super().global_io(op,store)
 
     def loop_upper_bound(self, op, static_bound):
+        bound = self.active_kv_bound(op, static_bound)
+        if self.ring_stride and op is self.kv_loop:
+            from native_online_ring import issue_tile
+            self.kv_bound = bound
+            self.preheader = len(self.code)
+            if self.k_tma:
+                from online_k_tma import initialize
+                initialize(self)
+            issue_tile(self, self.indices[self.iv], 0)
+        return bound
+
+    def active_kv_bound(self, op, static_bound):
         if op is not self.pruned_loop:
             return static_bound
         last = self.tmp()
-        self.emit(f'add.u32 {last}, {self.qrow}, {self.qtile};')
-        self.emit(f'shr.u32 {last}, {last}, 6;')
+        self.emit(f'add.u32 {last}, {self.qrow}, {self.qtile+(self.kv_tile-1 if self.qtile%self.kv_tile else 0)};')
+        self.emit(f'shr.u32 {last}, {last}, {self.kv_tile.bit_length()-1};')
         self.emit(f'min.u32 {last}, {last}, {static_bound};')
         return last
 
@@ -213,9 +460,20 @@ class NativeOnlineEmitter(WideEmitter):
         return addr
 
     def wide_copy(self,op):
+        if self.ring_stride and op is self.vcopy:
+            return
+        if self.ring_stride and op is self.kcopy:
+            from native_online_ring import enter_iteration
+            self.batched_kv = True
+            if self.loop_version == 0 and (not self.cross_iteration_pv or self.loop_prime):
+                self.packed_copies.extend((self.k,self.vroot))
+            index = self.indices[self.iv]
+            self.emit(f'mul.lo.u32 {self.krow}, {index}, {self.kv_tile};')
+            enter_iteration(self, index)
+            return
         if op is self.kcopy:
             index=self.indices[self.iv];row=self.tmp()
-            self.emit(f'mul.lo.u32 {self.krow}, {index}, 64;')
+            self.emit(f'mul.lo.u32 {self.krow}, {index}, {self.kv_tile};')
             self.emit(f'add.u32 {row}, {self.kbase}, {self.krow};')
             self.set_pointer(self.k,row,2*self.dim)
             if self.vbase!=self.kbase:
@@ -235,7 +493,7 @@ class NativeOnlineEmitter(WideEmitter):
     def access_guard(self,root,offset):
         query = root in (self.q,self.out)
         limit = self.rows if query else self.kv_rows
-        if limit % (self.qtile if query else 64)==0:
+        if limit % (self.qtile if query else self.kv_tile)==0:
             return ''
         row=self.tmp();pred=self.tmp('pred')
         cols = self.value_dim if root in (self.out,self.vroot) else self.dim
@@ -245,23 +503,36 @@ class NativeOnlineEmitter(WideEmitter):
         return '@'+pred+' '
 
     def operation(self,op):
-        if op is self.pv_op and getattr(self, 'defer_v_wait', False):
+        if self.ring_stride and any(op is pending for pending in self.normalizer_ops):
+            self.pending_normalizer.append(op)
+            return
+        if op is self.pv_op and not self.ring_stride and getattr(self, 'defer_v_wait', False):
             self.emit('cp.async.wait_group 0;')
             self.emit('bar.sync 0;')
             self.emit('fence.proxy.async.shared::cta;')
         super().operation(op)
-        if op is not self.logits or not (self.causal or self.kv_rows%64):
+        if op is not self.logits or not (self.causal or self.kv_rows%self.kv_tile):
             return
+        if self.ring_stride:
+            last, interior = self.tmp(), self.tmp('pred')
+            self.emit(f'add.u32 {last}, {self.krow}, {self.kv_tile-1};')
+            self.emit(f'setp.lt.u32 {interior}, {last}, {self.kv_rows};')
+            if self.causal:
+                self.emit(f'setp.le.and.u32 {interior}, {last}, {self.qrow}, {interior};')
+            mask_label = 'frisk_mask_prime' if self.loop_prime else f'frisk_mask_done_{self.loop_version}'
+            self.emit(f'@{interior} bra.uni {mask_label};')
         v,=op['results']
         for reg,slots in zip(self.regs(v),self.tensor_slots(v),strict=True):
-            k=self.map([x%64 for x in slots]);pred=self.tmp('pred')
+            k=self.map([x%self.kv_tile for x in slots]);pred=self.tmp('pred')
             self.emit(f'add.u32 {k}, {k}, {self.krow};')
             if self.causal:
-                q=self.map([x//64 for x in slots])
+                q=self.map([x//self.kv_tile for x in slots])
                 self.emit(f'add.u32 {q}, {q}, {self.qrow};')
                 self.emit(f'setp.le.u32 {pred}, {k}, {q};')
-            if self.kv_rows%64:
+            if self.kv_rows%self.kv_tile:
                 combo='.and' if self.causal else ''
                 extra=', '+pred if self.causal else ''
                 self.emit(f'setp.lt{combo}.u32 {pred}, {k}, {self.kv_rows}{extra};')
             self.emit(f'selp.f32 {reg}, {reg}, 0fff800000, {pred};')
+        if self.ring_stride:
+            self.emit(mask_label+':')

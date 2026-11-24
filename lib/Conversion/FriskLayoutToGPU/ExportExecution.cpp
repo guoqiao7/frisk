@@ -1,3 +1,4 @@
+#include "Dialect/Frisk/Analysis/ExecutionGroups.h"
 #include "Dialect/Frisk/Analysis/ExecutionLayoutProof.h"
 #include "Dialect/Frisk/Analysis/ShuffleNetworkJSON.h"
 #include "Dialect/Frisk/Analysis/LinearExecutionLayout.h"
@@ -86,9 +87,14 @@ struct ExportExecutionPass: impl::ExportExecutionBase<ExportExecutionPass> {
   auto plan = module->getAttrOfType<DictionaryAttr>("frisk.execution_contract");
   auto kind = plan ? plan.getAs<StringAttr>("kind") : StringAttr();
   auto cta = plan ? plan.getAs<IntegerAttr>("cta") : IntegerAttr();
+  const bool oneConsumerFA3 = kind && cta && cta.getInt()==256 &&
+      (kind.getValue()=="fa3_same_tile" || kind.getValue()=="fa3_qk_next");
+  if (oneConsumerFA3 && failed(bindExecutionGroups(module))) {
+    signalPassFailure(); return;
+  }
   const bool singleWarpgroupOnline =
       module->getAttrOfType<DictionaryAttr>("frisk.online_launch") &&
-      kind && kind.getValue() == "single" && cta && cta.getInt() == 128;
+      ((kind && kind.getValue() == "single" && cta && cta.getInt() == 128) || oneConsumerFA3);
   bool structured = false;
   module.walk([&](ParallelOp op) {
     structured |= op.getThreads() == 256 ||
