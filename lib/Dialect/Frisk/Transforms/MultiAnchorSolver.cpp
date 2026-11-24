@@ -103,7 +103,7 @@ static DistributedEncodingAttr spliceWithinGroup(RankedTensorType type,
 }
 Completions addCompletions(LayoutConstraintGraph &graph, LayoutTarget &target,
                            ModuleOp mod, unsigned limit, StoreMap storeMap,
-                           bool offerConsecutiveWriters, bool subgroupCandidates) {
+                           bool offerConsecutiveWriters, bool subgroupCandidates, bool slicedStores) {
   Completions out;
   for (auto &var : graph.getVariables()) {
     auto type = dyn_cast<RankedTensorType>(var.shapedType);
@@ -133,7 +133,7 @@ Completions addCompletions(LayoutConstraintGraph &graph, LayoutTarget &target,
     auto seeds = var.candidates;
     // Offer the existing native consecutive-writer policy at each store use.
     if (offerConsecutiveWriters && var.use && isa<TileStoreOp>(var.use->getOwner()) &&
-        type.getRank() == 2 && type.getElementType().isF32())
+        (type.getRank() == 2 || (slicedStores && type.getRank() == 1)) && type.getElementType().isF32())
       for (auto &seed : seeds) {
         auto enc = dyn_cast<DistributedEncodingAttr>(seed.value);
         if (enc)
@@ -249,8 +249,9 @@ FailureOr<int64_t> columnLoopUnits(const LayoutConstraint &c,
 }
 FailureOr<int64_t> accessUnits(const LayoutConstraintGraph &graph,
                                const LayoutConstraint &c,
-                               const CandidateAssignment &assignment, bool nativeVector) {
-  auto cost = evaluateSM90AccessCost(graph, c, assignment, nativeVector);
+                               const CandidateAssignment &assignment, bool nativeVector,
+                               bool slicedStore = false) {
+  auto cost = evaluateSM90AccessCost(graph, c, assignment, nativeVector, slicedStore);
   if (failed(cost) || cost->saturated)
     return failure();
   auto &v = cost->cost;
@@ -566,6 +567,21 @@ struct Model {
   DenseMap<Attribute, int64_t> sliceUnits;
   bool scoreReduction = true;
   RoutePrice price;
+  StoreMap storeMap;
+  StringRef delivery;
+  bool routeAllowed(const LayoutConstraint &c, Attribute src, Attribute dst) {
+    if (sliceUnits.empty()) return true;
+    bool equal = layoutEncodingsEqual(src, dst);
+    if (!isa<TileStoreOp>(c.use->getOwner())) return equal;
+    auto type = cast<RankedTensorType>(graph.getVariable(c.vars[0]).shapedType);
+    if (type.getRank() != 1 && type.getRank() != 2) return false;
+    if (delivery == "auto" && equal) return true;
+    if (delivery != "auto" && delivery[type.getRank() == 2 ? 0 : 1] == 'd')
+      return equal;
+    auto owner = dyn_cast<DistributedEncodingAttr>(src);
+    auto writer = owner ? storeMap(type, owner) : DistributedEncodingAttr{};
+    return writer && layoutEncodingsEqual(writer, dst);
+  }
   z3::context ctx;
   z3::optimize solver{ctx};
   z3::expr mainLoop{ctx.int_val(0)};
@@ -576,8 +592,8 @@ struct Model {
   SmallVector<Attribute> masks;
   DenseMap<std::pair<Type, Type>, int64_t> prices;
   bool nativeVector = false;
-  Model(ModuleOp m, LayoutConstraintGraph &g, LayoutTarget &t, RoutePrice p)
-      : module(m), graph(g), target(t), price(p) {}
+  Model(ModuleOp m, LayoutConstraintGraph &g, LayoutTarget &t, RoutePrice p, StoreMap sm)
+      : module(m), graph(g), target(t), price(p), storeMap(sm) {}
   z3::expr bit() {
     return ctx.bool_const(("b" + std::to_string(next++)).c_str());
   }
@@ -850,7 +866,7 @@ struct Model {
     }
     auto add = [&](CandidateAssignment &assignment,
                    const z3::expr &flag) -> LogicalResult {
-      auto units = accessUnits(graph, c, assignment, nativeVector);
+      auto units = accessUnits(graph, c, assignment, nativeVector, !sliceUnits.empty());
       if (failed(units)) {
         auto &v = graph.getVariable(c.vars.front());
         auto *source = graph.getProvenances()[c.provenance].source;
@@ -931,8 +947,11 @@ struct Model {
       auto type = cast<RankedTensorType>(graph.getVariable(x).shapedType);
       for (auto a : vars[x].values)
         for (auto b : vars[y].values) {
-          if (layoutEncodingsEqual(a, b))
+          if (!routeAllowed(c, a, b)) {
+            solver.add(!(pick(x, a) && pick(y, b)));
             continue;
+          }
+          if (layoutEncodingsEqual(a, b)) continue;
           auto unitsPerUse = routeUnits(type, a, b);
           auto flag = pick(x, a) && pick(y, b);
           if (unitsPerUse < 0) {
@@ -996,6 +1015,9 @@ std::optional<Bill> billWitness(Model &m, const CandidateAssignment &assignment,
     return true;
   };
   for (const auto &c : m.graph.getConstraints()) {
+    if (c.kind == ConstraintKind::Convertible &&
+        !m.routeAllowed(c, assignment.values.lookup(c.vars[0]), assignment.values.lookup(c.vars[1])))
+      return std::nullopt;
     if (c.instruction) {
       auto tuple = findInstructionSupport(m.graph, c, assignment.values);
       if (!tuple) return std::nullopt;
@@ -1010,7 +1032,7 @@ std::optional<Bill> billWitness(Model &m, const CandidateAssignment &assignment,
       bill.reduction += *work;
     }
     if (c.kind == ConstraintKind::StorageAccess) {
-      auto amount = accessUnits(m.graph, c, assignment, m.nativeVector);
+      auto amount = accessUnits(m.graph, c, assignment, m.nativeVector, !m.sliceUnits.empty());
       if (failed(amount) || *amount > INT64_MAX - bill.access)
         return std::nullopt;
       bill.access += *amount;
@@ -1030,7 +1052,6 @@ std::optional<Bill> billWitness(Model &m, const CandidateAssignment &assignment,
       bill.access + bill.movement + bill.reduction > INT64_MAX - bill.spill ||
       bill.access + bill.movement + bill.reduction + bill.spill > INT64_MAX - bill.mainLoop)
     return std::nullopt;
-  if (!m.sliceUnits.empty() && bill.count) return std::nullopt;
   return bill;
 }
 
@@ -1064,8 +1085,8 @@ LogicalResult verifyByEnumeration(Model &m, unsigned limit,
     for (const auto &c : m.graph.getConstraints()) {
       if (!m.sliceUnits.empty() && c.kind == ConstraintKind::Convertible) {
         auto from = a.values.lookup(c.vars[0]), to = a.values.lookup(c.vars[1]);
-        if (from && to && !layoutEncodingsEqual(from, to))
-          return; // The native direct-delivery contract forbids this edge.
+        if (from && to && !m.routeAllowed(c, from, to))
+          return;
       }
       if (!satisfiesLayoutConstraint(m.graph, c, a.values,
                                      level == order.size()))
@@ -1114,7 +1135,7 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
     ModuleOp module, const CertifiedInstructionDomains &domains,
     RoutePrice price, StoreMap storeMap, unsigned freeBits, unsigned timeoutMs,
     unsigned oracleLimit, bool scoreReduction, bool nativeVector, bool subgroupCandidates,
-    const DenseMap<Attribute, int64_t> &sliceUnits) {
+    const DenseMap<Attribute, int64_t> &sliceUnits, StringRef nativeDelivery) {
 #ifndef FRISK_HAS_Z3
   return module.emitError(
       "multi-anchor integer solver requires Z3; configure FRISK_Z3_ROOT");
@@ -1129,7 +1150,7 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
   // Pointwise stores already propose layouts through their storage access.
   // Honor the ordinary F2 expansion budget independently of that choice.
   auto completions = addCompletions(*graph, *target, module, freeBits, storeMap,
-                                    /*offerConsecutiveWriters=*/!memorySeeds, subgroupCandidates);
+                                    /*offerConsecutiveWriters=*/!memorySeeds, subgroupCandidates, !sliceUnits.empty());
   if (failed(propagateCommonToFixedPoint(*graph)))
     return failure();
   std::optional<NormalizationTrial> normalization;
@@ -1140,7 +1161,8 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
     if (failed(trial)) return failure();
     normalization = *trial;
   }
-  Model m(module, *graph, *target, price);
+  Model m(module, *graph, *target, price, storeMap);
+  m.delivery = nativeDelivery;
   m.sliceUnits = sliceUnits;
   m.scoreReduction = scoreReduction;
   m.nativeVector = nativeVector;
@@ -1163,7 +1185,6 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
   }
   if (failed(m.boundaryFactors()))
     return failure();
-  if (!sliceUnits.empty()) m.solver.add(m.routes == 0); // Native C and R keep their solved owners.
   z3::params p(m.ctx);
   p.set("timeout", timeoutMs);
   m.solver.set(p);
@@ -1197,6 +1218,9 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
   for (const auto &c : graph->getConstraints()) {
     if (!satisfiesLayoutConstraint(*graph, c, solution.assignments, true))
       return module.emitError("invalid integer witness");
+    if (c.kind == ConstraintKind::Convertible &&
+        !m.routeAllowed(c, assignment.values.lookup(c.vars[0]), assignment.values.lookup(c.vars[1])))
+      return module.emitError("materialized delivery outside native domain");
     if (c.instruction) {
       auto tuple = findInstructionSupport(*graph, c, solution.assignments);
       if (!tuple)

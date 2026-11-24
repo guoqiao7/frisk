@@ -10,7 +10,8 @@ StringRef getSM90DemandCostModelID();
 struct ExperimentPolicy;
 FailureOr<CostEstimate> evaluateSM90AccessCost(const LayoutConstraintGraph &,
                                                const LayoutConstraint &,
-                                               const CandidateAssignment &, bool nativeVector = false);
+                                               const CandidateAssignment &, bool nativeVector = false,
+                                               bool slicedStore = false);
 FailureOr<CostEstimate> evaluateSM90LayoutCost(const LayoutConstraintGraph &graph,
     const CandidateAssignment &assignment,
     LayoutCostObserver *observer = nullptr, LayoutBoundaryFrequencyMode mode = LayoutBoundaryFrequencyMode::Legacy,

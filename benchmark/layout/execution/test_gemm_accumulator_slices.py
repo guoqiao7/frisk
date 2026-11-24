@@ -131,6 +131,19 @@ class AccumulatorSlicesTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no local optimum"):
             DenseGemm.from_open_layout(ir, 240, resident_atoms=100)
 
+    def test_mixed_writers_and_transfer_receipt(self):
+        from native_gemm_execution import DenseGemm
+        ir = (Path(__file__).resolve().parents[3]/"test/Transforms/integer-column-loop-cost.mlir").read_text()
+        ir = ("module attributes"+ir.split("module attributes",1)[1]).replace("frisk.serial_column_width = 256 : i64, ", "")
+        ir = ir.replace('kind = "max"', 'kind = "sum"').replace("policy Auto","policy FullRow")
+        for delivery, owners in (("ds", ("direct","striped")), ("sd", ("striped","direct"))):
+            solved = DenseGemm.from_open_layout(ir,80,resident_atoms=1,delivery=delivery)
+            plan = read_layouts(solved.layout_ir)
+            self.assertEqual((plan.c_delivery,plan.r_delivery),owners)
+            self.assertEqual(plan.slice_contract, (80,1,2))
+            with self.assertRaisesRegex(ValueError,"staging"):
+                read_layouts(re.sub(r"issued_a_bytes = \d+ : i64","issued_a_bytes = 0 : i64",solved.layout_ir))
+
     def test_saturated_and_single_wave_residency(self):
         origins = tuple((64*i, 0, 512+64*i, 0) for i in range(8))
         plan = GemmLayouts(1024, 128, 128, origins, None)

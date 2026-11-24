@@ -208,7 +208,14 @@ class PackedAttentionImage:
         return launch
 
 
-def compile_attention_pipeline(plan, opt, directory, *, rows, heads, dim, causal, aligned_inputs=False, row_reciprocal=False, softmax_math="default", kv_rows=None, kv_heads=None, value_dim=None, k_transport="cp.async", k_map_abi="value", overlap_pv_normalizer=True, cross_iteration_pv=False, _layout_cache=None):
+def _online_expectation(plan, k_transport):
+    return dict(q_tile=plan.query_tile, kv_tile=plan.kv_tile or 64, batch=plan.contract["batch"],
+                paths=dict(q="cp.async",k=k_transport,v=plan.v_transport),
+                writer=plan.writeback if plan.writeback=="producer" else "solver",
+                post_qk=plan.prefetch_after_qk, plan=plan.name)
+
+
+def compile_attention_pipeline(plan, opt, directory, *, rows, heads, dim, causal, aligned_inputs=False, row_reciprocal=False, softmax_math="default", kv_rows=None, kv_heads=None, value_dim=None, k_transport="cp.async", k_map_abi="value", overlap_pv_normalizer=True, cross_iteration_pv=False, _layout_cache=None, _audit_expected=None):
     """Compile one plan. A joint K/V TMA plan uses two by-value tensor maps."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -285,7 +292,7 @@ def compile_attention_pipeline(plan, opt, directory, *, rows, heads, dim, causal
     # This cache is private to one tuning invocation. Key the entire input and
     # pass configuration, and publish a packet only after a successful solve.
     key = (ir,str(opt),conversion_pass)
-    share_layout = _layout_cache is not None and (is_fa3 or k_transport == "tma")
+    share_layout = _layout_cache is not None
     cached = _layout_cache.get(key) if share_layout else None
     solved = directory/'solved.mlir'
     if cached is None:
@@ -328,6 +335,12 @@ def compile_attention_pipeline(plan, opt, directory, *, rows, heads, dim, causal
             consumes_conversion=any(op['name']=='frisk.convert_layout' and
                                     store['operands'][0] in op['results'] for op in data['operations']),
             solver_cost_stage='before physical store selection')
+    if _audit_expected is None and not is_fa3 and dim == value_dim == 64 and aligned_inputs:
+        _audit_expected = _online_expectation(plan,k_transport)
+    if _audit_expected is not None:
+        from attention_execution_audit import audit_attention
+        info["execution_audit"] = audit_attention(data,info,image.asm,_audit_expected)
+        info["layout_solve_reused"] = cached is not None
     (directory/'metadata.json').write_text(json.dumps(info,indent=2))
     return image, info
 
@@ -377,9 +390,20 @@ def _compile_static_online(opt,directory,rows,heads,kv_heads,dim,causal,receipt,
     row_major_v = (dim == 64 and output_bits == 32 and heads > kv_heads and not causal
                    and plan.v_transport == "tma" and plan.prefetch_after_qk)
     plan = replace(plan, half_output=output_bits == 16, v_row_major_tma=row_major_v)
+    expected = _online_expectation(plan,k_transport)
+    expected["plan"] = name
+    if k_transport == "tma" or name.startswith("ring"):
+        expected["kv_versions"] = 2
+    else:
+        # The single-group packed-copy ring needs at least four KV iterations.
+        expected["kv_versions"] = 2 if (dim == 64 and output_bits == 32 and plan.defer_v_wait and
+                                         plan.contract["cta"]==128 and (rows+63)//64 >= 4) else 1
+    if plan.v_transport == "tma":
+        expected["v_swizzle"] = 128 if row_major_v else 32
     image, metadata = compile_attention_pipeline(plan, opt, directory, rows=rows, heads=heads,
         dim=dim, kv_heads=kv_heads, causal=causal, aligned_inputs=True, row_reciprocal=True,
-        softmax_math="base2-ftz", k_transport=k_transport, k_map_abi="value")
+        softmax_math="base2-ftz", k_transport=k_transport, k_map_abi="value", _audit_expected=expected)
+    receipt["execution_audit"] = metadata["execution_audit"]
     return image, metadata, receipt
 
 

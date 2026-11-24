@@ -11,7 +11,7 @@ from gemm_accumulator_slices import compile_accumulator_gemm, read_layouts
 
 @dataclass(frozen=True)
 class DenseGemm:
-    """FP16 A @ B -> FP32 C, plus the column sum if present in the solved layouts.
+    """FP16 A @ B -> FP32 C, with an optional row or column sum.
 
     One 256-thread CTA per packed problem. The layout IR supplies the certified
     carriers and writers; k is the dense GEMM extent, not the WGMMA K16 atom.
@@ -20,18 +20,22 @@ class DenseGemm:
     k: int
 
     @classmethod
-    def from_open_layout(cls, layout_ir, k, *, resident_atoms, staged_k_tiles=2, frisk_opt=None):
-        """Solve a fixed-width native SS GEMM with direct C and optional column sum."""
-        if type(resident_atoms) is not int or resident_atoms < 1 or staged_k_tiles not in (1, 2):
+    def from_open_layout(cls, layout_ir, k, *, resident_atoms=None, staged_k_tiles=2, delivery="auto", frisk_opt=None):
+        """Jointly solve the protected anchor, residency and independent store owners."""
+        if (resident_atoms is not None and (type(resident_atoms) is not int or resident_atoms < 1)) or staged_k_tiles not in (1, 2):
             raise ValueError("expected positive resident width and one or two K16 slots")
         solver = frisk_opt or os.environ.get("FRISK_OPT", "frisk-opt")
+        if delivery not in ("auto", "dd", "ds", "sd", "ss"):
+            raise ValueError("delivery must be auto or a pair of d/s owners for C and R")
+        residency = "native-auto-residency=true" if resident_atoms is None else f"native-resident-atoms={resident_atoms}"
         option = ("--frisk-protected-store-layout=anchor-solver=integer "
-                  f"native-resident-atoms={resident_atoms} native-k-slots={staged_k_tiles}")
+                  f"{residency} native-delivery={delivery} native-k-slots={staged_k_tiles}")
         solved = subprocess.run([solver, option, "--canonicalize", "-verify-each"],
                                 input=layout_ir, capture_output=True, text=True)
         if solved.returncode:
             raise ValueError(solved.stderr.strip())
-        if read_layouts(solved.stdout).slice_contract != (k, resident_atoms, staged_k_tiles):
+        extent, width, slots = read_layouts(solved.stdout).slice_contract
+        if (extent, slots) != (k, staged_k_tiles) or resident_atoms not in (None, width):
             raise ValueError("native solve returned a different slice contract")
         return cls(solved.stdout, k)
 
@@ -40,7 +44,7 @@ class NativeGemmImage:
     def __init__(self, binary, info):
         self.asm = {"cubin": binary}
         self._shape = tuple(info["problem_shape"])
-        self._column_sum = info["column_sum"]
+        self._reduction_axis = info.get("reduction_axis", 0 if info["column_sum"] else None)
         self._symbol = info["symbol"].encode()
         self._shared = info["dynamic_shared_bytes"]
         self._kernel = None
@@ -79,11 +83,11 @@ class NativeGemmImage:
             m, n, k = self._shape
             tensors = [a, b, c]
             shapes = [(grid[0], m, k), (grid[0], k, n), (grid[0], m, n)]
-            if self._column_sum != (r is not None):
-                raise ValueError("R must match the compiled column-sum contract")
+            if (self._reduction_axis is not None) != (r is not None):
+                raise ValueError("R must match the compiled reduction contract")
             if r is not None:
                 tensors.append(r)
-                shapes.append((grid[0], n))
+                shapes.append((grid[0], n if self._reduction_axis == 0 else m))
             spans = []
             for i, (tensor, shape) in enumerate(zip(tensors, shapes)):
                 dtype = torch.float16 if i < 2 else torch.float32

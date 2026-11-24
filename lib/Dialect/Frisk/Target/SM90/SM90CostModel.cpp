@@ -8,6 +8,7 @@
 #include "Dialect/Frisk/Target/SM90/SM90MmaLayoutProof.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
 #include "Dialect/Frisk/IR/ContiguousStorageLayout.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/Support/MathExtras.h"
 #include <limits>
 #include <map>
@@ -268,17 +269,18 @@ std::optional<CostEstimate> nativeGlobalAccess(
   return result;
 }
 
-// A scalar warp issue fixes the register, warp and group. In aligned
+// A warp issue fixes a register packet, warp and group. In aligned
 // row-major f32 storage its sector IDs are an affine coset of the lane
 // image after removing the lowest three column bits (eight f32 per sector).
 // The cardinality is independent of the fixed carriers.
-static FailureOr<CostEstimate> wideScalarAccess(const LayoutVar &execution,
-    const LayoutVar &storage, DistributedEncodingAttr encoding, StorageLayoutAttr layout) {
+static FailureOr<CostEstimate> rowMajorWarpAccess(const LayoutVar &execution,
+    const LayoutVar &storage, DistributedEncodingAttr encoding, StorageLayoutAttr layout,
+    bool slicedStore) {
   const auto &alias = *storage.storageAlias;
   auto tile = matchRowMajorF32Storage(layout, alias.viewType);
   auto type = dyn_cast<RankedTensorType>(execution.shapedType);
   if (!tile || !type || type.getShape() != alias.viewType.getShape() ||
-      tile->elements <= 65536 || tile->columns < 8 || alias.rootAlignment < 32 ||
+      tile->columns < 8 || alias.rootAlignment < 32 ||
       alias.viewType != alias.rootType || !alias.viewToRoot.isIdentity() ||
       verifyStorageAliasCandidate(alias, layout).status != ProofStatus::Proven ||
       proveExecutionOwnership(encoding, type, "all").status != ProofStatus::Proven)
@@ -286,13 +288,28 @@ static FailureOr<CostEstimate> wideScalarAccess(const LayoutVar &execution,
   LinearExecutionLayout linear;
   if (analyzeLinearExecutionLayout(encoding,type,linear).status != ProofStatus::Proven ||
       linear.topology[1] != 32) return failure();
+  // deliver_atom uses float2 only for adjacent registers that own an
+  // aligned pair in the same row. The scalar striped writer fails this
+  // low-bit test. All accesses of the pair occupy the same 32-byte sector.
+  bool paired = false;
+  if (slicedStore) {
+    if (linear.topology[2] != 4 || linear.topology[3] != 2 ||
+        linear.topology[4] != 1)
+      return failure();
+    if (linear.hardwareWidths[0] != 0) {
+      unsigned reg = linear.hardwareOffsets[0], col = linear.logicalWidths[0];
+      paired = linear.rows[col].isPowerOf2() && linear.rows[col][reg];
+      for (unsigned bit = 0; paired && bit < linear.logicalBits; ++bit)
+        if (bit != col && linear.rows[bit][reg]) paired = false;
+    }
+  }
   SmallVector<APInt> sectorRows;
   for (unsigned bit = 0; bit < linear.logicalBits; ++bit)
     if (bit < linear.logicalWidths[0] || bit >= linear.logicalWidths[0] + 3)
       sectorRows.push_back(linear.rows[bit].extractBits(5,linear.hardwareOffsets[1]));
   auto projection = GF2Matrix::get(sectorRows.size(), 5, sectorRows);
   if (failed(projection)) return failure();
-  uint64_t issues = tile->elements / 32;
+  uint64_t issues = tile->elements / (32 * (paired ? 2 : 1));
   CostEstimate result;
   result.cost.instructionPathAndWork = issues;
   result.cost.memoryTransactions = issues << projection->rank();
@@ -302,12 +319,26 @@ static FailureOr<CostEstimate> wideScalarAccess(const LayoutVar &execution,
 FailureOr<CostEstimate> computeAccessCost(const LayoutConstraintGraph &graph,
     const LayoutConstraint &c, const LayoutVar &execution, const LayoutVar &storage,
     DistributedEncodingAttr encoding, StorageLayoutAttr layout,
-    DictionaryAttr copy, bool nativeVector) {
+    DictionaryAttr copy, bool nativeVector, bool slicedStore) {
+  if (slicedStore && !copy && c.access == AccessKind::Write &&
+      cast<ShapedType>(execution.shapedType).getRank() == 2) {
+    auto store = dyn_cast_or_null<TileStoreOp>(graph.getProvenances()[c.provenance].source);
+    auto loop = store ? store->getOperand(0).getDefiningOp<scf::ForOp>() : scf::ForOp();
+    // A module may also contain unrelated stores. Only this loop result
+    // goes through the native accumulator writer.
+    if (loop && loop.getNumResults() == 1 &&
+        loop.getBody()->getTerminator()->getOperand(0).getDefiningOp<MmaOp>()) {
+      if (auto cost = rowMajorWarpAccess(execution, storage, encoding, layout, true);
+          succeeded(cost))
+        return *cost;
+    }
+  }
   const auto &footprint = getStorageAliasFootprint(graph, storage.id, layout);
   if (footprint.proof.status != ProofStatus::Proven) {
     if (footprint.proof.status == ProofStatus::Unknown && !nativeVector && !copy &&
-        !execution.operationExecution)
-      return wideScalarAccess(execution,storage,encoding,layout);
+        !execution.operationExecution &&
+        hasWideStorageDomain(cast<ShapedType>(execution.shapedType).getShape()))
+      return rowMajorWarpAccess(execution, storage, encoding, layout, false);
     return failure();
   }
   if (nativeVector && !copy) {
@@ -408,7 +439,8 @@ FailureOr<CostEstimate> computeAccessCost(const LayoutConstraintGraph &graph,
 }
 
 FailureOr<CostEstimate> accessCost(const LayoutConstraintGraph &graph,
-    const LayoutConstraint &c, const CandidateAssignment &assignment, bool nativeVector = false) {
+    const LayoutConstraint &c, const CandidateAssignment &assignment, bool nativeVector = false,
+    bool slicedStore = false) {
   LayoutProfile::Scope profile(LayoutProfileKind::AccessCost);
   const auto &a = graph.getVariable(c.vars[0]), &b = graph.getVariable(c.vars[1]);
   const auto &execution = a.kind == LayoutKind::Distributed ? a : b;
@@ -420,7 +452,7 @@ FailureOr<CostEstimate> accessCost(const LayoutConstraintGraph &graph,
   auto copy = execution.operationExecution
       ? selectedCopy(graph, execution.anchor, assignment) : DictionaryAttr{};
   if (!graph.isCostQueryCacheEnabled() || !graph.getCostQueryCacheCapacity())
-    return computeAccessCost(graph, c, execution, storage, encoding, layout, copy, nativeVector);
+    return computeAccessCost(graph, c, execution, storage, encoding, layout, copy, nativeVector, slicedStore);
 
   // The selected Copy contract matters even for otherwise identical endpoint
   // layouts: vector width and TMA change physical issue/bank grouping. A null
@@ -431,6 +463,8 @@ FailureOr<CostEstimate> accessCost(const LayoutConstraintGraph &graph,
   Attribute pathKey = copy;
   if (nativeVector && !copy)
     pathKey = UnitAttr::get(layout.getContext());
+  if (slicedStore && !copy)
+    pathKey = IntegerAttr::get(IntegerType::get(layout.getContext(), 1), nativeVector);
   LayoutConstraintGraph::AccessCostCacheKey key{c.id, execution.shapedType,
       encoding, storage.shapedType, layout, pathKey,
       storage.storageAlias->rootAlignment, unsigned(c.access)};
@@ -439,7 +473,7 @@ FailureOr<CostEstimate> accessCost(const LayoutConstraintGraph &graph,
   auto found = cache.find(key);
   LayoutProfile::cacheLookup(LayoutProfileKind::AccessCostCache, found != cache.end());
   if (found != cache.end()) return found->second;
-  auto result = computeAccessCost(graph, c, execution, storage, encoding, layout, copy, nativeVector);
+  auto result = computeAccessCost(graph, c, execution, storage, encoding, layout, copy, nativeVector, slicedStore);
   // Unknown/failing queries remain failures and are not stored. At capacity,
   // bypass insertion only; the same scoring and proof budgets still apply.
   if (succeeded(result) && cache.size() < graph.getCostQueryCacheCapacity() &&
@@ -452,8 +486,8 @@ FailureOr<CostEstimate> accessCost(const LayoutConstraintGraph &graph,
 FailureOr<CostEstimate>
 mlir::frisk::evaluateSM90AccessCost(const LayoutConstraintGraph &graph,
                                     const LayoutConstraint &constraint,
-                                    const CandidateAssignment &assignment, bool nativeVector) {
-  return accessCost(graph, constraint, assignment, nativeVector);
+                                    const CandidateAssignment &assignment, bool nativeVector, bool slicedStore) {
+  return accessCost(graph, constraint, assignment, nativeVector, slicedStore);
 }
 
 FailureOr<CostEstimate> mlir::frisk::evaluateSM90LayoutCost(

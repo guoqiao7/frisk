@@ -47,13 +47,41 @@ __device__ __forceinline__ uint64_t descriptor(const unsigned char* base, uint64
   return (__cvta_generic_to_shared(base)>>4) | bits;
 }
 
-template<int N, int Atom, bool Reduce>
+template<int N, int Atom, bool Reduce, bool StripeC, int Axis, int PanelRows, int Row0, int Col0, int Row1, int Col1, int M>
 __device__ __forceinline__ void deliver_atom(const float* d, float* c, int row, int col,
                                              float* scratch, float* partials) {
   int tid = threadIdx.x, lane = tid%32, warp = tid/32;
   int r = row + (warp%4)*16 + lane/4;
   // Consecutive registers 2j and 2j+1 own adjacent columns of the same row.
-  if ((reinterpret_cast<uintptr_t>(c) & 7) == 0) {
+  if constexpr (StripeC) {
+    // Drain one source warp at a time. Every destination word is stored
+    // by thread (global flat index % 256), including atoms narrower than a CTA.
+    for (int group = 0; group < 2; ++group) {
+      const int rb = group ? Row1 : Row0, cb = group ? Col1 : Col0;
+      #pragma unroll 1
+      for (int w = 0; w < 4; ++w) {
+        #pragma unroll
+        for (int part = 0; part < 16; part += PanelRows) {
+          if (warp == group*4+w) {
+            #pragma unroll
+            for (int j = 0; j < Atom/2; ++j) {
+              int y = lane/4 + ((j/2)%2)*8;
+              if (y >= part && y < part + PanelRows)
+                scratch[(y-part)*Atom + (j/4)*8 + lane%4*2 + j%2] = d[j];
+            }
+          }
+          __syncthreads();
+          #pragma unroll
+          for (int y = 0; y < PanelRows; ++y) {
+            int start = (rb + w*16 + part + y)*N + cb;
+            int x = (tid - start) & 255;
+            if (x < Atom) c[start+x] = scratch[y*Atom+x];
+          }
+          __syncthreads();
+        }
+      }
+    }
+  } else if ((reinterpret_cast<uintptr_t>(c) & 7) == 0) {
     #pragma unroll
     for (int j = 0; j < Atom/2; j += 2) {
       float* dst = c + (r + (j/2%2)*8)*N + col + (j/4)*8 + (lane%4)*2;
@@ -64,7 +92,24 @@ __device__ __forceinline__ void deliver_atom(const float* d, float* c, int row, 
     for (int j=0; j<Atom/2; ++j)
       c[(r+(j/2%2)*8)*N + col + (j/4)*8 + (lane%4)*2 + j%2] = d[j];
   }
-  if constexpr (Reduce) {
+  if constexpr (Reduce && Axis == 1) {
+    #pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      float x[Atom/8];
+      #pragma unroll
+      for (int j = 0; j < Atom/8; ++j) x[j] = __fadd_rn(d[4*j+2*half], d[4*j+2*half+1]);
+      #pragma unroll
+      for (int step = 1; step < Atom/8; step *= 2) {
+        #pragma unroll
+        for (int j = 0; j < Atom/8; j += 2*step) x[j] = __fadd_rn(x[j], x[j+step]);
+      }
+      float v = x[0];
+      v = __fadd_rn(v, __shfl_xor_sync(0xffffffff, v, 1));
+      v = __fadd_rn(v, __shfl_xor_sync(0xffffffff, v, 2));
+      if (!(lane & 3)) partials[(col/Atom)*M+r+8*half] = v;
+    }
+    __syncthreads();
+  } else if constexpr (Reduce) {
     // Match the tree in the common replay: row bits 3,0,1,2,4,5,
     // followed by the row-repeat bits. Never reload the external C output.
     #pragma unroll

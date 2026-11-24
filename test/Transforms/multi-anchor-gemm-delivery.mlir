@@ -4,6 +4,10 @@
 // RUN: frisk-opt %t/fan21.mlir --frisk-protected-store-layout="anchor-solver=integer integer-native-stripes=false" -verify-each | FileCheck %s --check-prefix=REMOTE
 // RUN: frisk-opt %t/store21.mlir --frisk-protected-store-layout="anchor-solver=integer integer-native-stripes=false" -verify-each | FileCheck %s --check-prefix=DIRECT
 // RUN: frisk-opt %t/store21.mlir --frisk-multi-anchor-layout-pipeline -verify-each | FileCheck %s --check-prefix=STRIPE
+// RUN: frisk-opt %t/store21.mlir --frisk-protected-store-layout="anchor-solver=integer native-resident-atoms=1 native-k-slots=2" -verify-each | FileCheck %s --check-prefix=SLICE
+// The aligned sliced writer issues 1,024 warp-wide float2 stores covering 8,192 sectors.
+// SLICE: access_units = 9216 : i64
+// SLICE-SAME: distinct_conversions = 0 : i64
 // LOCAL: reduction_units = 0 : i64, selected = array<i64: 0>
 // LOCAL: frisk.mma
 // LOCAL-SAME: grid = array<i64: 1, 2>

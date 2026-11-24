@@ -286,11 +286,15 @@ def compile_fa3(data, *, tilelang_root=None, output_directory=None, fa3_writebac
                              dict(kernel="fa3_merge_fringe",grid=[tail,heads,1],threads=128)])
         else:
             launches.append(dict(kernel="fa3_query_fringe",grid=[tail,heads,1],threads=256))
-    return image,dict(cta_dispatch=cta_dispatch,fringe_policy=fringe_policy,workspace_bytes=4*scratch,kernel_launches=launches,row_reciprocal=row_reciprocal,writeback=fa3_writeback,threads=plan['cta'],consumer_threads=plan['groups'][plan['roles']['qk']]['threads'],
+    info=dict(cta_dispatch=cta_dispatch,fringe_policy=fringe_policy,workspace_bytes=4*scratch,kernel_launches=launches,row_reciprocal=row_reciprocal,writeback=fa3_writeback,threads=plan['cta'],consumer_threads=plan['groups'][plan['roles']['qk']]['threads'],
                       dynamic_shared_bytes=plan['arena'],grid=[(rows+query_tile-1)//query_tile,heads,1],query_tile=query_tile,
                       physical_transport=fa3_transport.facts, transport_sha256=fa3_transport.fingerprint,
                       layout_execution_contract=plan, execution_contract=dict(plan,kind=events.contract_kind),
                       event_schedule=dict(frame=events.frame,steady=list(events.steady)))
+    from attention_execution_audit import audit_attention
+    info["execution_audit"] = audit_attention(data, info, image.asm,
+        dict(q_tile=query_tile, kv_tile=128, writeback=fa3_writeback, transport_sha256=fa3_transport.fingerprint))
+    return image,info
 
 
 def solve_overlap_fa3(plan_file, opt, directory, *, multi_anchor=False, rows=8192, heads=16, causal=False, kv_rows=None, query_tile=128, kv_heads=None):
@@ -364,6 +368,9 @@ def compile_budgeted_fa3(data, *, budget=1, directory=None, tilelang_root=None, 
         images[key] = image, info
         if dest is not None:
             (dest/"metadata.json").write_text(json.dumps(info,indent=2))
+    receipt["layout_proofs"] = sorted({info["execution_audit"]["layout_sha256"] for _,info in images.values()})
+    if len(receipt["layout_proofs"]) != 1:
+        raise ValueError("schedule candidates disagree on their shared solved layout")
     if root is not None:
         (root/"schedule.json").write_text(json.dumps(receipt,indent=2))
     return images, receipt
@@ -378,6 +385,10 @@ def compile_static_fa3(plan_file, opt, directory, *, rows, heads, causal, kv_row
                                    query_tile=query_tile,cta_dispatch=cta_dispatch,guarded_query=kv_heads not in (None,heads))
     packet=solve_overlap_fa3(plan_file,opt,directory,rows=rows,heads=heads,causal=causal,
                              kv_rows=kv_rows,multi_anchor=multi_anchor,query_tile=geometry["query_tile"],kv_heads=kv_heads)
+    layout_plan = packet_contract(packet)
+    consumers = layout_plan["groups"][layout_plan["roles"]["qk"]]["threads"]
+    if (_query_tile(layout_plan), consumers) != (geometry["query_tile"], 2*geometry["query_tile"]):
+        raise ValueError("FA3 layout packet does not match the selected consumer geometry")
     images,receipt=compile_budgeted_fa3(packet,budget=budget,directory=directory,tilelang_root=tilelang_root,
                                        fa3_writeback=fa3_writeback,cta_dispatch=geometry["cta_dispatch"])
     receipt["geometry"]=geometry

@@ -16,5 +16,5 @@ FailureOr<DictionaryAttr> solveCertifiedMultiAnchor(
     ModuleOp module, const CertifiedInstructionDomains &domains,
     RoutePrice price, StoreMap storeMap, unsigned freeBits, unsigned timeoutMs,
     unsigned oracleLimit, bool scoreReduction, bool nativeVector, bool subgroupCandidates,
-    const DenseMap<Attribute, int64_t> &sliceUnits);
+    const DenseMap<Attribute, int64_t> &sliceUnits, StringRef nativeDelivery);
 } // namespace mlir::frisk

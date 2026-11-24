@@ -94,11 +94,12 @@ class BudgetedFA3Test(unittest.TestCase):
                 patch("native_fa3_execution._kv_rows",return_value=1024), \
                 patch("native_fa3_execution._prepare_transport") as prepare, \
                 patch("native_fa3_execution.rank_transport_events",return_value={"selected":["qk_next"]}), \
-                patch("backend.compile_execution",return_value=(object(),{})) as compile_one:
+                patch("backend.compile_execution",return_value=(object(),{"execution_audit":{"layout_sha256":"same"}})) as compile_one:
             prepare.return_value.facts={"moves":{"q":{"box":[64,128]}}}
             images,receipt=compile_budgeted_fa3({})
             self.assertEqual(compile_one.call_args.kwargs["cta_dispatch"],"forward")
             self.assertEqual(receipt["selected"],["qk_next"])
+            self.assertEqual(receipt["layout_proofs"],["same"])
             prepare.assert_called_once_with({}, "tma")
             compile_one.assert_called_once()
             self.assertIs(compile_one.call_args.kwargs["fa3_transport"],prepare.return_value)

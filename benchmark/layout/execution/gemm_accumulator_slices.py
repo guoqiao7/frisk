@@ -1,4 +1,4 @@
-"""SM90 CUDA replay of a solved, zero-initialized SS GEMM with optional column sum.
+"""SM90 CUDA lowering of a solved, zero-initialized SS GEMM with an optional sum.
 
 This entry takes *layouts* from frisk-opt and an explicit dense GEMM problem.
 It does not interpret arbitrary surrounding MLIR. Each CTA owns an independent
@@ -12,7 +12,7 @@ Use --output kernel.cu to inspect CUDA, or --output kernel.cubin to compile.
 """
 import argparse
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import re
 import subprocess
@@ -80,6 +80,39 @@ class GemmLayouts:
     reduced_writers: tuple | None  # thread and register column basis
     slice_contract: tuple | None = None  # (K extent, resident atoms, staged K16 slots)
 
+    reduction_axis: int = 0
+    c_delivery: str = "direct"
+    r_delivery: str = "direct"
+    width_units: tuple = ()
+
+    @property
+    def reduction_extent(self):
+        return self.n if self.reduction_axis == 0 else self.m
+
+    @property
+    def partial_count(self):
+        return self.m // 64 if self.reduction_axis == 0 else self.n // self.atom
+
+    @property
+    def partial_bytes(self):
+        return 4*self.partial_count*self.reduction_extent if self.reduced_writers is not None else 0
+
+
+def _delivery(ir, producer, store, owners, consumed):
+    """Accept only an identity use or a solved final, consecutive-writer conversion."""
+    value = _one(r"frisk\.tile_store (%[\w]+),", store)
+    target = _owners(store)
+    if value == producer and np.array_equal(owners, target):
+        return "direct"
+    edge = _one(rf"(?m)^\s*{re.escape(value)} = (frisk\.convert_layout .*?)$", ir)
+    if (_one(r"convert_layout (%\w+) :", edge) != producer or
+            not np.array_equal(_owners(edge.split(" -> ")[0]), owners) or
+            not np.array_equal(_owners(edge), target) or
+            target.size % 256 or not np.array_equal(target, np.arange(target.size).reshape(-1, 256).T)):
+        raise ValueError("unsupported native sliced store conversion")
+    consumed.add(value)
+    return "striped"
+
 
 def _check_row_major_writer(ir, store, shape):
     target = _one(r"frisk\.tile_store %[^,]+, (%[\w]+)", store)
@@ -102,7 +135,7 @@ def read_layouts(ir):
             'form = "ss"' not in mma or 'input_type = f16' not in mma or
             'accumulator_type = f32' not in mma or 'target = "sm_90a"' not in mma or
             not re.search(r"\bk = 16 : i64", mma) or len(stores) not in (1, 2)):
-        raise ValueError("expected f16 SS K16 GEMM with C and optional dim0 sum")
+        raise ValueError("expected f16 SS K16 GEMM with C and optional row or column sum")
     for role, leading, major, stride, swizzle in (("a", m*16, "k", 128, 0),
                                                   ("b", 256, "mn", n*16, 32)):
         d = _one(rf"{role}_descriptor = #frisk.mma_descriptor<\{{([^}}]+)\}}>", mma)
@@ -116,12 +149,18 @@ def read_layouts(ir):
             expected.extend((start, 0, addr, (addr>>7)&7 if swizzle else 0))
         if _numbers(_one(r"entries = array<i64: ([^>]+)>", d)) != tuple(expected):
             raise ValueError(f"unsupported {role.upper()} descriptor starts")
+    # C and R are identified by rank; the two independent uses can be scheduled in either order.
+    def matrix_writer(line):
+        return re.search(r": tensor<\d+x\d+xf32[,>]", line) is not None
+    if sum(map(matrix_writer,stores)) != 1:
+        raise ValueError("expected exactly one matrix writer")
+    stores.sort(key=matrix_writer, reverse=True)
     _check_row_major_writer(ir, stores[0], (m,n))
-    if len(stores)==2:
-        _check_row_major_writer(ir, stores[1], (n,))
     acc = _owners(mma)
-    if not np.array_equal(acc, _owners(stores[0])):
-        raise ValueError("sliced C delivery requires the certified in-place writer")
+    # Layout-only replay fixtures can also expose a single MMA outside a loop.
+    producer = _one(r"(?m)^\s*(%\w+) = scf\.for ", ir) if " = scf.for " in ir else mma.split("=")[0].strip()
+    consumed = set()
+    c_delivery = _delivery(ir, producer, stores[0], acc, consumed)
     if acc.size != m*n or not np.array_equal(np.sort(acc.ravel()), np.arange(m*n)):
         raise ValueError("accumulator is not a bijection on C")
     tid, reg = np.indices((256, atom//2))
@@ -149,36 +188,54 @@ def read_layouts(ir):
         if tuple(expected) != origin:
             raise ValueError("output partition disagrees with certified grid")
     writers = None
+    axis, r_delivery = 0, "direct"
     reductions = re.findall(r"(?m)^.* = frisk\.reduce_tensor .*?$", ir)
     if len(reductions) != len(stores)-1:
         raise ValueError("expected one R writer per reduction")
     if reductions:
         reduce, = reductions
-        if 'dim = 0 : i64' not in reduce or 'kind = "sum"' not in reduce:
-            raise ValueError("expected a column sum")
+        axis = int(_one(r"\bdim = ([01]) : i64", reduce))
+        length = m if axis == 1 else n
+        _check_row_major_writer(ir, stores[1], (length,))
+        if 'kind = "sum"' not in reduce or _one(r"reduce_tensor (%\w+) ", reduce) != producer:
+            raise ValueError("expected a direct sum of the accumulator")
         if not np.array_equal(_owners(reduce.split(" -> ")[0]), acc):
             raise ValueError("reduction source differs from the accumulator")
-        table = _owners(stores[1])
-        if not np.array_equal(_owners(reduce), table):
-            raise ValueError("R writer differs from the reduction layout")
+        table = _owners(reduce)
+        r_delivery = _delivery(ir, reduce.split("=")[0].strip(), stores[1], table, consumed)
         flat = table.ravel()
         basis = tuple(int(flat[1<<b]) for b in range(len(flat).bit_length()-1))
         nonzero = [x for x in basis if x]
-        if (len(nonzero) != n.bit_length()-1 or set(nonzero) !=
-                {1<<i for i in range(n.bit_length()-1)} or flat[0] != 0):
+        if (len(nonzero) != length.bit_length()-1 or set(nonzero) !=
+                {1<<i for i in range(length.bit_length()-1)} or flat[0] != 0):
             raise ValueError("expected a separable first-owner R map")
         rbits = table.shape[1].bit_length()-1
         writers = (basis[rbits:], basis[:rbits])
-    plan = GemmLayouts(m, n, atom, tuple(origins), writers)
+    if consumed != set(re.findall(r"(?m)^\s*(%\w+) = frisk\.convert_layout ", ir)):
+        raise ValueError("unsupported intermediate conversion in native sliced GEMM")
+    plan = GemmLayouts(m, n, atom, tuple(origins), writers, reduction_axis=axis,
+                       c_delivery=c_delivery, r_delivery=r_delivery)
     if "frisk.native_slice_traffic" in mma:
         record = _one(r"frisk\.native_slice_traffic = \{([^{}]*)\}", mma)
         fields = {key: int(value) for key, value in re.findall(r"(\w+) = (\d+) : i64", record)}
         if not {"k_extent", "resident_atoms", "staged_k_tiles"} <= fields.keys():
             raise ValueError("incomplete native slice receipt")
         k, width, slots = (fields[key] for key in ("k_extent", "resident_atoms", "staged_k_tiles"))
-        if fields != native_slice_traffic(plan, k, width, slots):
+        expected = native_slice_traffic(plan, k, width, slots)
+        if "issued_a_bytes" in fields:
+            delivery = delivery_traffic(plan,k,expected)
+            graph = _one(r"(?m)^.*frisk\.protected_graph = (.*)$", ir)
+            count = int(_one(r"\bdistinct_conversions = (\d+) : i64", graph))
+            if count != delivery["distinct_conversions"]:
+                raise ValueError("shared solver conversion count disagrees with native delivery")
+            expected.update({key:v for key,v in delivery.items() if key not in ("C","R")})
+        if fields != expected:
             raise ValueError("solver slice traffic disagrees with native operand staging")
-        plan = GemmLayouts(m, n, atom, tuple(origins), writers, (k, width, slots))
+        scores = re.search(r"width_units = array<i64: ([^>]+)>", record)
+        units = _numbers(scores[1]) if scores else ()
+        if len(units) > 1 and (len(units) != len(origins) or units[width-1] != min(units)):
+            raise ValueError("selected width disagrees with native residency scores")
+        plan = replace(plan, slice_contract=(k, width, slots), width_units=units)
     return plan
 
 
@@ -254,7 +311,7 @@ def rank_residencies(plan, k, *, staged_k_tiles=2, grid_ctas=None, sm_count=114)
     # compulsory workloads (operand staging and C/R delivery). Extra copy
     # and local traffic are always additive. The maximum is a scoring proxy;
     # it does not imply that the epilogue physically overlaps the K loop.
-    output_bytes = 4 * (plan.m * plan.n + (plan.n if plan.reduced_writers is not None else 0))
+    output_bytes = 4 * (plan.m * plan.n + (plan.reduction_extent if plan.reduced_writers is not None else 0))
     compulsory = max(base_bytes, output_bytes)
     for candidate in candidates:
         registers = min(255, candidate["peak_register_estimate"])
@@ -309,7 +366,7 @@ def _mma(atom, count):
 def shared_bytes(plan):
     tiles = 2*(plan.m+plan.n)*32
     scratch = max(tiles, 8*plan.atom*4)
-    partials = plan.m//64*plan.n*4 if plan.reduced_writers is not None else 0
+    partials = plan.partial_bytes
     return max(65536, scratch+partials)
 
 
@@ -347,7 +404,7 @@ def _b_staging(plan, k, width, depth):
     # drain. Keep both A slots and its warp scratch disjoint from retained B.
     base = max(depth * plan.m * 32, 8 * plan.atom * 4)
     slab = plan.n * 32
-    partial_bytes = (plan.m // 64) * plan.n * 4
+    partial_bytes = plan.partial_bytes
     slots = (budget - base - partial_bytes) // slab
     steps = k // 16
     if slots >= steps:
@@ -383,6 +440,18 @@ def native_slice_traffic(plan, k, width, slots):
                 extra_global_sectors=(repeated_a + repeated_b - saved_b) // 32)
 
 
+def delivery_traffic(plan,k,traffic):
+    """Logical bytes actually issued per CTA, distinct from DRAM sector traffic."""
+    words = ((plan.m*plan.n if plan.c_delivery == "striped" else 0) +
+             (plan.reduction_extent if plan.r_delivery == "striped" else 0))
+    return dict(C=plan.c_delivery, R=plan.r_delivery if plan.reduced_writers is not None else None,
+                    shared_store_bytes=4*words, shared_load_bytes=4*words,
+                    distinct_conversions=int(plan.c_delivery == "striped")+int(plan.r_delivery == "striped"),
+                    issued_a_bytes=2*k*plan.m+traffic["repeated_a_bytes"],
+                    issued_b_bytes=2*k*plan.n+traffic["repeated_b_bytes"]-traffic["saved_b_bytes"],
+                    global_store_bytes=4*(plan.m*plan.n+(plan.reduction_extent if plan.reduced_writers else 0)))
+
+
 def _stages(plan, requested):
     if requested is not None:
         return requested
@@ -398,9 +467,14 @@ def _write_columns(plan):
     terms = [f"(({var}>>{i}&1)*{v})" for var,bits in (("tid",threads),("s",regs))
              for i,v in enumerate(bits) if v]
     index = " | ".join(terms) or "0"
-    return [f"if (!(tid & {tid_mask})) {{", "#pragma unroll",
+    striped = plan.r_delivery == "striped"
+    target = "((float*)sm)" if striped else "R"
+    publish = ["__syncthreads();"] if striped else []
+    gather = (["__syncthreads();", f"for (int i=tid;i<{plan.reduction_extent};i+=256) R[i]=((float*)sm)[i];"]
+              if striped else [])
+    return publish + [f"if (!(tid & {tid_mask})) {{", "#pragma unroll",
             f"for (int s=0;s<{1<<len(regs)};++s) if (!(s & {reg_mask})) {{",
-            f"int j = {index};", f"R[j]=finish_column<{plan.m//64},{plan.n}>(partial,j);", "}}"]
+            f"int j = {index};", f"{target}[j]=finish_column<{plan.partial_count},{plan.reduction_extent}>(partial,j);", "}}"] + gather
 
 
 def emit(plan, k, *, sliced=None, resident_atoms=None, wait_group=1, staged_k_tiles=None, grid_ctas=None, sm_count=114):
@@ -423,7 +497,8 @@ def emit(plan, k, *, sliced=None, resident_atoms=None, wait_group=1, staged_k_ti
               "extern __shared__ __align__(1024) unsigned char sm[];",
               f"float* partial=(float*)(sm+{scratch}); int tid=threadIdx.x,wg=tid/128;"]
     if plan.reduced_writers is not None:
-        source.append(f"R+=(size_t)blockIdx.x*{n};")
+        source.append(f"R+=(size_t)blockIdx.x*{plan.reduction_extent};")
+    a_issued = b_issued = 0
     for group_index, group in enumerate(_atom_groups(plan, width)):
         rows, cols = _copy_regions(group, atom)
         source += ["{", f"float acc[{len(group)}][{atom//2}]={{}};"]
@@ -449,9 +524,11 @@ def emit(plan, k, *, sliced=None, resident_atoms=None, wait_group=1, staged_k_ti
                     offset = str(step * pitch + m * 32)
                 b_offsets.append(offset)
                 for lo,hi in rows:
+                    a_issued += ((stop-start)//depth)*2*(hi-lo)
                     source.append(f"copy_a<{m},{k},{lo},{hi}>(sm+{step*a_stride},A,kt+{step*16});")
                 if not retained or group_index == 0:
                     for lo,hi in cols:
+                        b_issued += ((stop-start)//depth)*2*(hi-lo)
                         source.append(f"copy_b<{n},{lo},{hi}>(sm+{offset},B,kt+{step*16});")
             # Every lane completes its own copies before the CTA publishes the slots.
             source += ['asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");',
@@ -473,9 +550,14 @@ def emit(plan, k, *, sliced=None, resident_atoms=None, wait_group=1, staged_k_ti
         source.append("__syncthreads();")  # operand slots may now serve as reduction scratch
         for i,(r,c,s,d) in enumerate(group):
             fan = "true" if plan.reduced_writers is not None else "false"
-            source.append(f"deliver_atom<{n},{atom},{fan}>(acc[{i}],C,{r}+wg*({s-r}),"
+            striped = "true" if plan.c_delivery == "striped" else "false"
+            panel = 16 if staged_k_tiles*m*32 >= 16*atom*4 else 8
+            source.append(f"deliver_atom<{n},{atom},{fan},{striped},{plan.reduction_axis},{panel},{r},{c},{s},{d},{m}>(acc[{i}],C,{r}+wg*({s-r}),"
                           f"{c}+wg*({d-c}),(float*)sm,partial);")
         source.append("}")
+    predicted = delivery_traffic(plan,k,native_slice_traffic(plan,k,width,staged_k_tiles))
+    if (a_issued,b_issued) != (predicted["issued_a_bytes"],predicted["issued_b_bytes"]):
+        raise ValueError("emitted operand copies disagree with the slice traffic receipt")
     return "\n".join(source+_write_columns(plan)+["}",""])
 
 
@@ -496,7 +578,17 @@ def compile_accumulator_gemm(layout_ir, k, *, sliced=None, resident_atoms=None, 
             raise RuntimeError(result.stderr)
         image = (path/"kernel.cubin").read_bytes()
     staging = _b_staging(plan, k, width, staged_k_tiles)
-    return image, {"retained_b_k16":staging.retained, "problem_shape":(plan.m,plan.n,k),"column_sum":plan.reduced_writers is not None,
+    traffic = native_slice_traffic(plan,k,width,staged_k_tiles)
+    delivery = delivery_traffic(plan,k,traffic)
+    if plan.width_units:
+        for item in ranked:
+            index = item["resident_atoms"]-1
+            item["native_slice_units"] = (plan.width_units[index] if len(plan.width_units)>1 else
+                                          plan.width_units[0] if index+1==width else None)
+        ranked.sort(key=lambda item:(item["native_slice_units"] is None, item["native_slice_units"],
+                                     item["slices"],item["resident_atoms"]))
+    return image, {"delivery":delivery, "reduction_axis":plan.reduction_axis if plan.reduced_writers else None,
+                   "retained_b_k16":staging.retained, "problem_shape":(plan.m,plan.n,k),"column_sum":plan.reduced_writers is not None and plan.reduction_axis == 0,
                    "symbol":"replay","threads":256,"dynamic_shared_bytes":staging.shared_bytes,
                    "slice_traffic":native_slice_traffic(plan,k,width,staged_k_tiles),
                    "resident_atoms":width,"slices":(len(plan.origins)+width-1)//width,

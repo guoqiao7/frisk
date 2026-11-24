@@ -979,11 +979,43 @@ std::optional<int64_t> gluonScratchService(RankedTensorType from,
   return std::max(2*issues, publish) + 2*warps;
 }
 
+// Native sliced epilogue: one elected FP32 producer per logical value
+// publishes to scratch[word], then the linear writer gathers dense FP32s.
+// Count warp instructions separately from shared bank service. Within one
+// scalar issue distinct words on a bank serialize into separate wavefronts.
+static FailureOr<int64_t> slicedReductionExchange(RankedTensorType from) {
+  ExecutionEnumeration owners;
+  auto enc = cast<DistributedEncodingAttr>(from.getEncoding());
+  if (enumerateExecutionLayout(enc, from, owners).status != ProofStatus::Proven ||
+      owners.topology[1] != 32)
+    return failure();
+  const unsigned regs = owners.topology[0], lanes = 32;
+  const unsigned threads = owners.logical.size() / regs;
+  int64_t publishIssues = 0, publishWaves = 0;
+  for (unsigned warp = 0; warp < threads; warp += lanes) {
+    for (unsigned reg = 0; reg < regs; ++reg) {
+      std::array<unsigned, 32> banks{};
+      for (unsigned lane = 0; lane < lanes; ++lane) {
+        unsigned slot = (warp + lane) * regs + reg;
+        auto word = owners.logical[slot];
+        if (owners.first[word] == slot)
+          ++banks[word % banks.size()];
+      }
+      unsigned waves = *llvm::max_element(banks);
+      publishIssues += waves != 0;
+      publishWaves += waves;
+    }
+  }
+  int64_t gatherIssues = llvm::divideCeil(from.getNumElements(), int64_t(lanes));
+  int64_t barrierIssues = 2 * (threads / lanes);
+  return publishIssues + publishWaves + 2 * gatherIssues + barrierIssues;
+}
+
 // A single integer problem spans all producers and uses in one function.
 LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
                                    unsigned timeout, unsigned oracleLimit, bool scoreReduction, bool allowStripes,
                                    bool replayScratch, bool bankFloor, StringRef globalAccess, bool subgroupCandidates,
-                                   unsigned residentAtoms, unsigned stagedKTiles) {
+                                   unsigned residentAtoms, unsigned stagedKTiles, StringRef delivery, bool autoWidth) {
   PassManager prepare(module.getContext());
   prepare.addPass(createNormalizeLayoutIRPass());
   if (failed(prepare.run(module)))
@@ -998,8 +1030,10 @@ LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
   DenseMap<Attribute, int64_t> sliceUnits;
   DenseMap<Attribute, DictionaryAttr> sliceReceipts;
   int64_t extent = 0;
-  bool columnSum = false;
-  if (residentAtoms) {
+  DenseMap<Attribute, int64_t> panelWords;
+  DenseMap<Attribute, SmallVector<int64_t>> widthScores;
+  int reductionAxis = -1;
+  if (autoWidth || residentAtoms) {
     if (anchors.size() != 1 || (stagedKTiles != 1 && stagedKTiles != 2))
       return module.emitError("native slices require one dense GEMM and one or two K16 slots");
     auto mma = anchors.front();
@@ -1024,14 +1058,17 @@ LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
     for (Operation *use : loop.getResult(0).getUsers()) {
       if (isa<TileStoreOp>(use)) { ++matrices; continue; }
       auto reduce = dyn_cast<ReduceTensorOp>(use);
-      if (!reduce || reduce.getDim() != 0 || reduce->getAttrOfType<StringAttr>("kind") != b.getStringAttr("sum") ||
+      if (!reduce || (reduce.getDim() != 0 && reduce.getDim() != 1) || reduce->getAttrOfType<StringAttr>("kind") != b.getStringAttr("sum") ||
           !reduce->getResult(0).hasOneUse() || !isa<TileStoreOp>(*reduce->getResult(0).getUsers().begin()))
-        return mma.emitOpError("native slice delivery supports C and an optional direct column sum");
+        return mma.emitOpError("native slice delivery supports C and an optional row or column sum");
+      reductionAxis = reduce.getDim();
       ++vectors;
     }
+    if (!vectors && delivery != "auto" && delivery[1] == 's')
+      return mma.emitOpError("requested a striped R writer but this graph has no reduction");
     if (matrices != 1 || vectors > 1)
       return mma.emitOpError("expected one direct C writer and at most one R writer");
-    columnSum = vectors == 1;
+
   }
   StringRef marker = "__frisk_integer_anchor_id";
   SmallVector<Attribute> originalIDs;
@@ -1052,18 +1089,41 @@ LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
       row.set("partition", partition(b, c));
       row.set("local_cost", b.getDenseI64ArrayAttr(c.local));
       std::optional<NativeSliceTraffic> traffic;
-      if (residentAtoms && c.local == minimum) {
-        traffic = priceNativeSlices(c.grid, extent, residentAtoms, stagedKTiles, columnSum);
+      if ((autoWidth || residentAtoms) && c.local == minimum) {
+        auto &g = c.grid;
+        int64_t partials = reductionAxis == 0 ? g.m / 64 * g.n * 4 :
+                           reductionAxis == 1 ? g.n / g.atomN * g.m * 4 : 0;
+        int64_t atoms = g.mRepeat * g.nRepeat;
+        int64_t best = INT64_MAX;
+        SmallVector<Attribute> widths;
+        int64_t panelRows = stagedKTiles * g.m * 32 >= 16 * g.atomN * 4 ? 16 : 8;
+        panelWords[c.anchor.back()] = panelRows * g.atomN;
+        for (int64_t w = autoWidth ? 1 : residentAtoms;
+             w <= (autoWidth ? atoms : residentAtoms); ++w) {
+          auto t = priceNativeSlices(g, extent, w, stagedKTiles, partials, reductionAxis >= 0);
+          if (!t) continue;
+          int64_t score = nativeResidencySectors(g, *t, reductionAxis, partials);
+          widthScores[c.anchor.front()].push_back(score);
+          widths.push_back(b.getDictionaryAttr({
+              b.getNamedAttr("resident_atoms", b.getI64IntegerAttr(w)),
+              b.getNamedAttr("slice_units", b.getI64IntegerAttr(score))}));
+          if (score < best || (score == best && traffic &&
+              llvm::divideCeil(atoms,w) < llvm::divideCeil(atoms,traffic->width))) {
+            best = score;
+            traffic = t;
+          }
+        }
+        row.set("width_costs", b.getArrayAttr(widths));
         row.set("slice_feasible", b.getBoolAttr(traffic.has_value()));
         if (traffic) {
           auto receipt = traffic->receipt(b);
           row.set("slice_traffic", receipt);
           sliceReceipts[c.anchor.front()] = receipt;
-          sliceUnits[c.anchor.front()] = traffic->sectors();
+          sliceUnits[c.anchor.front()] = best;
         }
       }
       rows.push_back(row.getDictionary(b.getContext()));
-      if (c.local != minimum || (residentAtoms && !traffic))
+      if (c.local != minimum || ((autoWidth || residentAtoms) && !traffic))
         continue;
       InstructionLayoutTuple t;
       t.binding = c.anchor.front();
@@ -1072,7 +1132,7 @@ LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
       t.encodings.push_back(encodeSM90MmaGeometry(module.getContext(), c.grid));
       certificates[op].push_back(std::move(t));
     }
-    if (residentAtoms && certificates[op].empty())
+    if ((autoWidth || residentAtoms) && certificates[op].empty())
       return op.emitOpError("no local optimum supports the requested native slice contract");
     proofs.push_back(b.getArrayAttr(rows));
     originalIDs.push_back(op->getAttr(marker));
@@ -1086,6 +1146,16 @@ LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
   };
   auto price = [&](RankedTensorType from,
                    RankedTensorType to) -> FailureOr<int64_t> {
+    if ((autoWidth || residentAtoms) && from != to && from.getRank() == 2) {
+      int64_t panel = panelWords.lookup(from.getEncoding());
+      if (!panel) return failure();
+      int64_t words = from.getNumElements();
+      return 2 * llvm::divideCeil(words, int64_t(32)) + 16 * llvm::divideCeil(words, panel);
+    }
+    if ((autoWidth || residentAtoms) && from != to && from.getRank() == 1 &&
+        from.getElementType().isF32() &&
+        striped(from, cast<DistributedEncodingAttr>(from.getEncoding())) == to.getEncoding())
+      return slicedReductionExchange(from);
     if (auto work = replayPrice(from, to)) {
       auto plan = module->getAttrOfType<DictionaryAttr>("frisk.execution_contract");
       if (plan && plan.getAs<ArrayAttr>("groups").size() > 1) return failure();
@@ -1108,7 +1178,7 @@ LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
   auto solved = solveCertifiedMultiAnchor(module, certificates, price, striped,
                                           freeBits, timeout, oracleLimit, scoreReduction,
                                           !replayScratch && (globalAccess == "native" ||
-                                            (globalAccess == "pointwise" && anchors.empty() && !hasReduction(module))), subgroupCandidates, sliceUnits);
+                                            (globalAccess == "pointwise" && anchors.empty() && !hasReduction(module))), subgroupCandidates, sliceUnits, delivery);
   if (failed(solved))
     return failure();
   SmallVector<int64_t> selected(domains.size(), -1);
@@ -1130,8 +1200,11 @@ LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
       return op.emitError(
           "integer materialization changed the certified binding");
     selected[idx] = it - d.begin();
-    if (residentAtoms)
-      op->setAttr("frisk.native_slice_traffic", sliceReceipts.lookup(tuple.front()));
+    if (autoWidth || residentAtoms) {
+      NamedAttrList receipt(sliceReceipts.lookup(tuple.front()));
+      receipt.set("width_units", b.getDenseI64ArrayAttr(widthScores.lookup(tuple.front())));
+      op->setAttr("frisk.native_slice_traffic", receipt.getDictionary(b.getContext()));
+    }
     if (originalIDs[idx])
       op->setAttr(marker, originalIDs[idx]);
     else
@@ -1145,6 +1218,13 @@ LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
     auto src = cast<RankedTensorType>(op->getOperand(0).getType());
     auto dst = cast<RankedTensorType>(op->getResult(0).getType());
     bool marked = op->hasAttr("frisk.native_shared_stripes");
+    if (autoWidth || residentAtoms) {
+      if (striped(src, cast<DistributedEncodingAttr>(src.getEncoding())) == dst.getEncoding() &&
+          llvm::all_of(op->getUsers(), [](Operation *u) { return isa<TileStoreOp>(u); }))
+        return WalkResult::advance();
+      op.emitError("unsupported sliced GEMM delivery edge");
+      return WalkResult::interrupt();
+    }
     if (!marked && replayPrice(src, dst)) return WalkResult::advance();
     if (!allowStripes && !marked) return WalkResult::advance();
     auto p = test::planExecutionRedistribution(src, dst, op.getLoc(),
@@ -1157,6 +1237,28 @@ LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
     return WalkResult::advance();
   });
   if (routeCheck.wasInterrupted()) return failure();
+  if (autoWidth || residentAtoms) {
+    auto mma = anchorsIn(module).front();
+    auto receipt = mma->getAttrOfType<DictionaryAttr>("frisk.native_slice_traffic");
+    NamedAttrList issued(receipt);
+    int64_t words = 0, exchanges = 0, outputs = 0;
+    module.walk([&](ConvertLayoutOp conv) {
+      words += cast<RankedTensorType>(conv.getResult().getType()).getNumElements();
+      ++exchanges;
+    });
+    module.walk([&](TileStoreOp store) {
+      outputs += cast<RankedTensorType>(store->getOperand(0).getType()).getNumElements();
+    });
+    auto bytes = [&](StringRef key) { return receipt.getAs<IntegerAttr>(key).getInt(); };
+    auto add = [&](StringRef key, int64_t v) { issued.set(key, b.getI64IntegerAttr(v)); };
+    add("issued_a_bytes", 2*extent*mma.getM() + bytes("repeated_a_bytes"));
+    add("issued_b_bytes", 2*extent*mma.getN() + bytes("repeated_b_bytes") - bytes("saved_b_bytes"));
+    add("global_store_bytes", 4*outputs);
+    add("shared_store_bytes", 4*words);
+    add("shared_load_bytes", 4*words);
+    add("distinct_conversions", exchanges);
+    mma->setAttr("frisk.native_slice_traffic", issued.getDictionary(b.getContext()));
+  }
   if (failed(preserveStorageContracts(module)))
     return failure();
   NamedAttrList proof(*solved);
@@ -1318,8 +1420,12 @@ public:
   Option<bool> subgroupCandidates{*this, "integer-subgroup-candidates",
       llvm::cl::desc("Propose warp- and warpgroup-compatible consumer bases"), llvm::cl::init(false)};
   Option<unsigned> nativeResidentAtoms{*this, "native-resident-atoms",
-      llvm::cl::desc("Fix native dense SS GEMM residency and price its direct C/R delivery (0 disables)"),
+      llvm::cl::desc("Fix native dense SS GEMM residency and price its independent C/R writers (0 disables)"),
       llvm::cl::init(0)};
+  Option<bool> nativeAutoWidth{*this, "native-auto-residency",
+      llvm::cl::desc("Rank legal accumulator widths within each certified anchor"), llvm::cl::init(false)};
+  Option<std::string> nativeDelivery{*this, "native-delivery",
+      llvm::cl::desc("C/R store owners: auto, dd, ds, sd, ss (direct or striped)"), llvm::cl::init("auto")};
   Option<unsigned> nativeKSlots{*this, "native-k-slots",
       llvm::cl::desc("Number of staged native K16 operands"), llvm::cl::init(2)};
   Option<unsigned> completionBits{
@@ -1372,7 +1478,10 @@ public:
   void runOnOperation() override {
     ModuleOp original=getOperation();
     auto error=[&](StringRef msg){original.emitError(msg);signalPassFailure();};
-    if (nativeResidentAtoms && (anchorSolver != "integer" || fixedAnchors || scratchBackend != "native"))
+    if (nativeAutoWidth && nativeResidentAtoms) return error("choose fixed or open native residency");
+    if (nativeDelivery != "auto" && nativeDelivery != "dd" && nativeDelivery != "ds" &&
+        nativeDelivery != "sd" && nativeDelivery != "ss") return error("invalid native C/R delivery");
+    if ((nativeAutoWidth || nativeResidentAtoms) && (anchorSolver != "integer" || fixedAnchors || scratchBackend != "native"))
       return error("native slice pricing requires open integer anchors and native scratch");
     if (oracleLimit == std::numeric_limits<unsigned>::max())
       return error("integer oracle limit too large");
@@ -1401,7 +1510,7 @@ public:
         return selectIntegerAnchors(graph, completionBits, integerTimeout,
                                     oracleLimit, scoreReduction, allowStripes,
                                     scratchBackend == "gluon34", bankFloor,
-                                    globalAccess, expand, nativeResidentAtoms, nativeKSlots);
+                                    globalAccess, expand, nativeResidentAtoms, nativeKSlots, nativeDelivery, nativeAutoWidth);
       };
       if (!subgroupCandidates)
         return solve(mod, false);

@@ -32,7 +32,7 @@ struct NativeSliceTraffic {
 // register order. A panel shared by both warpgroups is issued only once.
 inline std::optional<NativeSliceTraffic>
 priceNativeSlices(const SM90MmaGeometry &g, int64_t extent, int64_t width,
-                  int64_t stages, bool columnSum) {
+                  int64_t stages, int64_t partials, bool enableReuse) {
   int64_t atoms = g.mRepeat * g.nRepeat;
   if (g.threads != 256 || g.k != 16 || width < 1 || width > atoms ||
       extent <= 0 || extent % 16 || extent > INT32_MAX / std::max(g.m, g.n) ||
@@ -61,12 +61,12 @@ priceNativeSlices(const SM90MmaGeometry &g, int64_t extent, int64_t width,
   // Same memory contract as _b_staging. The executor independently
   // checks this receipt against its selected copy ranges before compiling.
   int64_t scratch = std::max(64 * (g.m + g.n), 32 * g.atomN);
-  int64_t partials = columnSum ? g.m / 64 * g.n * 4 : 0;
+
   result.sharedBytes = std::max<int64_t>(65536, scratch + partials);
   constexpr int64_t smBytes = 228 * 1024, reserved = 1024;
   if (result.sharedBytes > smBytes - reserved) return std::nullopt;
   int64_t live = width * (g.atomN / 2) + 4;
-  if (!columnSum || slices == 1 || !fullB || live > 255) return result;
+  if (!enableReuse || slices == 1 || !fullB || live > 255) return result;
   int64_t registers = llvm::alignTo(live, 8);
   int64_t ctas = std::min(65536 / (256 * registers), smBytes / (result.sharedBytes + reserved));
   int64_t base = std::max(stages * g.m * 32, 32 * g.atomN);
@@ -79,5 +79,32 @@ priceNativeSlices(const SM90MmaGeometry &g, int64_t extent, int64_t width,
   int64_t used = retained == steps ? steps : retained + stages;
   result.sharedBytes = std::max(result.sharedBytes, base + used * slab + partials);
   return result;
+}
+// Express the existing native pre-ptxas spill and residency estimates in
+// 32-byte units. Charge the real retained-B copy ranges for this width.
+inline int64_t nativeResidencySectors(const SM90MmaGeometry &g, const NativeSliceTraffic &t,
+                                      int reductionAxis, int64_t partialBytes) {
+  int64_t atoms = g.mRepeat * g.nRepeat;
+  int64_t steps = t.extent / 16;
+  int64_t loopTemps = 28 + 4 * std::min(steps, t.stages);
+  int64_t tailTemps = 16 + (reductionAxis >= 0 ? g.atomN / 4 : 0);
+  int64_t sectors = t.sectors();
+  for (int64_t i = 0; i < atoms; i += t.width) {
+    int64_t regs = std::min(t.width, atoms - i) * g.atomN / 2;
+    // One spilled word stored and reloaded by 256 lanes is 64 sectors.
+    sectors += 64 * (std::max<int64_t>(0, regs + loopTemps - 255) * steps +
+                     std::max<int64_t>(0, regs + tailTemps - 255));
+  }
+  constexpr int64_t arena = 228 * 1024, reserved = 1024;
+  int64_t live = t.width * g.atomN / 2 + std::max(loopTemps, tailTemps);
+  int64_t allocated = llvm::alignTo(std::min<int64_t>(255, live), 8);
+  int64_t resident = std::min(256 / allocated, arena / (t.sharedBytes + reserved));
+  int64_t base = std::max<int64_t>(65536, std::max(64*(g.m+g.n),32*g.atomN) + partialBytes);
+  int64_t target = std::min<int64_t>(2, arena / (base + reserved));
+  int64_t inputs = 2 * t.extent * (g.m + g.n);
+  int64_t reduced = reductionAxis == 1 ? g.m : reductionAxis == 0 ? g.n : 0;
+  int64_t outputs = 4 * (g.m * g.n + reduced);
+  return sectors + (std::max(outputs, inputs * (1 + std::max<int64_t>(0,target-resident))) -
+                    std::max(outputs, inputs)) / 32;
 }
 } // namespace mlir::frisk
