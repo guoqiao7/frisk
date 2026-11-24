@@ -37,6 +37,8 @@ FailureOr<DictionaryAttr> decodeCanonicalContract(const LayoutConstraintGraph &g
   auto dstType = cast<RankedTensorType>(op.getResult().getType());
   auto analysis = buildReductionLayoutProof(src, dst, srcType, dstType, op.getDim());
   proof = analysis.proof;
+  if (proof.status == ProofStatus::Unknown)
+    proof = proveLinearReductionScope(src,dst,srcType,dstType,op.getDim(),analysis.scope);
   if (proof.status != ProofStatus::Proven) return failure();
   Builder b(op->getContext());
   std::string dtype;

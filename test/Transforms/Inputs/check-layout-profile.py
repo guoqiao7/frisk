@@ -12,15 +12,15 @@ expected = {"address_enumeration", "execution_enumeration", "access_cost",
             "conversion_classification", "conversion_choice", "instruction_support",
             "instruction_contract", "relation_query", "relation_cache",
             "alias_pair_cache", "footprint_cache", "access_cost_cache",
-            "static_cost_validation_cache", "static_cost_validation"}
+            "static_cost_validation_cache", "static_cost_validation", "demand_footprint_cache"}
 assert set(profile["metrics"]) == expected
 for metric in profile["metrics"].values():
-    assert set(metric) == {"count", "inclusive_ns", "hits", "misses", "entries"}
+    assert set(metric) == {"count", "inclusive_ns", "hits", "misses", "entries", "peak_entries"}
     assert all(isinstance(value, int) and value >= 0 for value in metric.values())
-    assert metric["entries"] <= metric["misses"]
+    assert metric["peak_entries"] <= metric["entries"] <= metric["misses"]
 for name in sys.argv[3:]:
     assert profile["metrics"][name]["count"] > 0, name
 for name in ("relation_cache", "alias_pair_cache", "footprint_cache",
-             "access_cost_cache", "static_cost_validation_cache"):
+             "access_cost_cache", "static_cost_validation_cache", "demand_footprint_cache"):
     metric = profile["metrics"][name]
     assert metric["count"] == metric["hits"] + metric["misses"]

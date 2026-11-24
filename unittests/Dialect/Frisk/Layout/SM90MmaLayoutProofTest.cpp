@@ -62,6 +62,32 @@ TEST(SM90MmaProof, FullFragmentCoveragePackingTopologyAndBudget) {
   EXPECT_EQ(verifySM90MmaFragment(over,true,false,RankedTensorType::get({128,512},b.getBF16Type()),*small).status,ProofStatus::Unknown);
 }
 
+TEST(SM90MmaProof, LargeHighRegisterBitSwapsViolatePtxDespiteFullCoverage) {
+  MLIRContext ctx;
+  ctx.loadDialect<FriskDialect>();
+  Builder b(&ctx);
+  for (bool interleaved : {false,true}) {
+    SM90MmaGeometry g{256,512,16,256,2,1,256,2,2,1,interleaved};
+    auto encoded = buildSM90MmaFragment(&ctx,g,false,false);
+    ASSERT_TRUE(succeeded(encoded));
+    auto type = RankedTensorType::get({256,512},b.getF32Type());
+    auto valid = verifySM90MmaFragment(g,false,false,type,*encoded);
+    ASSERT_EQ(valid.status,ProofStatus::Proven) << valid.reason;
+    auto map = cast<BitLinearLayoutMapAttr>(encoded->getMap());
+    auto bits = SmallVector<APInt>(map.getMatrix().getValues<APInt>());
+    unsigned cols = map.getMatrix().getType().getDimSize(1);
+    for (unsigned row=0; row < bits.size()/cols; ++row)
+      std::swap(bits[row*cols+7],bits[row*cols+8]);
+    auto swapped = BitLinearLayoutMapAttr::get(&ctx,map.getInputNames(),map.getInputBitWidths(),
+        map.getOutputNames(),map.getOutputBitWidths(),DenseIntElementsAttr::get(map.getMatrix().getType(),bits));
+    auto wrong = DistributedEncodingAttr::get(&ctx,swapped,encoded->getTopology(),encoded->getReplication());
+    auto bad = verifySM90MmaFragment(g,false,false,type,wrong);
+    EXPECT_EQ(bad.status,ProofStatus::Disproven);
+    ASSERT_EQ(bad.counterexample.size(),6u);
+    EXPECT_EQ(bad.counterexample[3],128);
+  }
+}
+
 TEST(SM90MmaProof, EverySupportedAtomicNHasExactLastSlot) {
   MLIRContext ctx;ctx.loadDialect<FriskDialect>();Builder b(&ctx);
   for(int64_t n:{8,16,32,64,128,256}) {

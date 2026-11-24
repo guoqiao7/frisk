@@ -331,7 +331,7 @@ TEST_F(MmaAutoIntegrationTest, ConflictingEqualityConnectedHardSeedsAreNotDroppe
   EXPECT_TRUE(failed(prepareInstructionTuples(*graph,*target,module->getLoc())));
 }
 
-TEST_F(MmaAutoIntegrationTest, ExplicitSsLogicalBudgetRetainsUnknownDiagnostic) {
+TEST_F(MmaAutoIntegrationTest, LargeExplicitSsContractIsCertifiedAndTamperingIsRejected) {
   auto module = make(false,256,512,128); ASSERT_TRUE(module);
   auto op = mma(*module); Builder b(&context);
   SmallVector<Attribute> storage;
@@ -369,26 +369,22 @@ TEST_F(MmaAutoIntegrationTest, ExplicitSsLogicalBudgetRetainsUnknownDiagnostic) 
       b.getNamedAttr("b_descriptor",descriptors[1])}));
   ASSERT_TRUE(binding); op->setAttr("frisk.mma_contract",binding);
   SM90MmaGeometry geometry{256,512,16,128,1,1,256,4,2,1};
-  SmallVector<Attribute> encodings{storage[0],storage[1],{},{},encodeSM90MmaGeometry(&context,geometry)};
-  std::string diagnostics;
-  ScopedDiagnosticHandler capture(&context,[&](Diagnostic &d) { llvm::raw_string_ostream(diagnostics) << d; return success(); });
+  auto acc = buildSM90MmaFragment(&context,geometry,false,false);
+  ASSERT_TRUE(succeeded(acc));
+  SmallVector<Attribute> encodings{storage[0],storage[1],*acc,*acc,encodeSM90MmaGeometry(&context,geometry)};
   for (auto policy : {attr::GemmWarpPolicy::Auto,attr::GemmWarpPolicy::Square}) {
     op.setPolicy(policy);
-    auto graph = collectLayoutConstraints(*module,*target,LayoutCollectionMode::RelationsOnly); ASSERT_TRUE(succeeded(graph));
+    auto graph = collectLayoutConstraints(*module,*target,LayoutCollectionMode::RelationsOnly);
+    ASSERT_TRUE(succeeded(graph));
     auto &c = instruction(*graph);
-    // The result has 131072 logical points: no fragment enumeration is needed
-    // to classify this complete schema-valid, descriptor-compatible binding.
     auto proof = target->verifyInstructionContract(*graph,c,encodings,binding);
-    EXPECT_EQ(proof.status,ProofStatus::Unknown) << proof.reason;
-    EXPECT_NE(proof.reason.find("logical point budget exceeds 65536"),std::string::npos);
-    auto before = print(*module); diagnostics.clear();
-    EXPECT_TRUE(failed(target->prepareInstructionCandidates(*graph)));
-    EXPECT_NE(diagnostics.find("unknown proof: logical point budget exceeds 65536"),std::string::npos) << diagnostics;
-    EXPECT_EQ(diagnostics.find("invalid geometry"),std::string::npos) << diagnostics;
-    EXPECT_EQ(print(*module),before);
-    PassManager pipeline(&context); buildFriskLayoutPipeline(pipeline);
-    EXPECT_TRUE(failed(pipeline.run(*module))); EXPECT_EQ(print(*module),before);
-    EXPECT_EQ(op->getAttr("frisk.mma_contract"),binding);
+    EXPECT_EQ(proof.status,ProofStatus::Proven) << proof.reason;
+    auto missing = encodings;
+    missing[3] = {};
+    auto bad = target->verifyInstructionContract(*graph,c,missing,binding);
+    EXPECT_EQ(bad.status,ProofStatus::Disproven);
+    EXPECT_NE(bad.reason.find("result:"),std::string::npos) << bad.reason;
+    EXPECT_TRUE(succeeded(target->prepareInstructionCandidates(*graph)));
   }
 }
 

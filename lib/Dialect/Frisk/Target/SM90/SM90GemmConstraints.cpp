@@ -152,8 +152,11 @@ FailureOr<StorageLayoutAttr> storageProposal(const StorageAliasInfo &info,
 
 FailureOr<DistributedEncodingAttr> mlir::frisk::buildSM90MmaFragment(MLIRContext *ctx,
     const SM90MmaGeometry &g, bool a, bool transA) {
-  int64_t regs = a ? g.mRepeat*g.kRepeat*8 : g.mRepeat*g.nRepeat*g.atomN/2;
-  if (regs<=0 || g.threads<=0 || regs>65536/g.threads) return failure();
+  auto slots = getSM90MmaFragmentSlots(g, a);
+  // Distributed encodings represent up to 16 bits per carrier.
+  if (failed(slots) || *slots > 65536 || (a && *slots > 65536/g.threads))
+    return failure();
+  int64_t regs = *slots;
   SmallVector<int64_t> shape{g.m,a ? g.k : g.n};
   if (a && transA) std::swap(shape[0],shape[1]);
   SmallVector<int64_t> topology{regs,32,4,g.threads/128,1};
@@ -174,19 +177,9 @@ LogicalResult mlir::frisk::prepareSM90MmaCandidates(LayoutConstraintGraph &graph
     int64_t threads = graph.getVariable(constraint.vars[3]).requiredThreads;
     auto geometries = getSM90MmaGeometries(op,threads);
     if (failed(geometries)) {
-      auto exceeds = [](ShapedType type) {
-        return type.getRank() == 2 && type.getDimSize(0) > 0 &&
-               type.getDimSize(1) > 0 &&
-               (type.getDimSize(0) > 65536 ||
-                type.getDimSize(1) > 65536 / type.getDimSize(0));
-      };
-      if (exceeds(cast<ShapedType>(op.getA().getType())) ||
-          exceeds(cast<ShapedType>(op.getB().getType())) ||
-          exceeds(cast<ShapedType>(op.getResult().getType())))
-        return op.emitOpError("sm90-mma-fragment: unknown proof: logical point budget exceeds 65536");
+      auto reason = diagnoseSM90MmaGeometryFailure(op,threads);
+      if (reason.status == ProofStatus::Unknown) return op.emitOpError(reason.reason);
     }
-    // Preserve logical-budget evidence before the bounded semantic decoder can
-    // reject a valid explicit plan whose logical domain is too large to prove.
     FailureOr<SM90MmaGeometry> fixed = failure();
     if (constraint.instruction->binding) {
       fixed = getSM90MmaContractGeometry(op,threads,constraint.instruction->binding);
@@ -200,7 +193,7 @@ LogicalResult mlir::frisk::prepareSM90MmaCandidates(LayoutConstraintGraph &graph
         return op.emitOpError("sm90-mma-fragment: unknown proof: hardware point budget exceeds 65536");
     }
     if (failed(geometries))
-      return op.emitOpError("sm90-mma-thread-group: unsupported tile/policy/threads");
+      return op.emitOpError(diagnoseSM90MmaGeometryFailure(op,threads).reason);
     // SameLayout makes a hard-bound accumulator authoritative for both roles.
     // Gather only exact equality requirements, never Convertible preferences.
     SmallVector<SmallVector<Attribute>> hardRequirements(5);
@@ -233,7 +226,7 @@ LogicalResult mlir::frisk::prepareSM90MmaCandidates(LayoutConstraintGraph &graph
       }
       add(4,encodeSM90MmaGeometry(op.getContext(),g));
       auto accum = buildSM90MmaFragment(op.getContext(),g,false,false);
-      if (failed(accum)) return op.emitOpError("sm90-mma-fragment: unknown proof: init/result hardware enumeration budget exceeded");
+      if (failed(accum)) return op.emitOpError("sm90-mma-fragment: init/result register carrier exceeds the 16-bit encoding limit");
       add(2,*accum); add(3,*accum);
       if (rs) {
         auto a = buildSM90MmaFragment(op.getContext(),g,true,op.getTransA());

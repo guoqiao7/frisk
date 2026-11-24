@@ -42,6 +42,11 @@ FailureOr<DistributedEncodingAttr> projectReductionEncoding(
 void enumerateReductionLifts(DistributedEncodingAttr slice, DistributedEncodingAttr model,
     RankedTensorType sourceType, RankedTensorType resultType, int64_t axis,
     SmallVectorImpl<DistributedEncodingAttr> &out);
+/// Prove coverage and the exact communication scope of the natural projection
+/// of a bijective source. Does not materialize a dependency tree for lowering.
+LayoutProof proveLinearReductionScope(DistributedEncodingAttr source,
+    DistributedEncodingAttr result, RankedTensorType sourceType,
+    RankedTensorType resultType, int64_t axis, std::string &scope);
 /// Pure bounded dependency proof, not GPU lowering or shared resource validation.
 /// Elects one physical first_owner for each distinct source coordinate, forms
 /// canonical_fiber_tree_v1 and broadcasts completed roots to every result holder.

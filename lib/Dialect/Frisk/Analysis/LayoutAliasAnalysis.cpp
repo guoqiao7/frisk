@@ -484,7 +484,8 @@ LayoutProof mlir::frisk::verifyStorageAliasCandidate(const StorageAliasInfo &inf
     return proof(ProofStatus::Proven, "exact contiguous identity bit intervals");
   // This shortcut verifies a single whole-root candidate only. Pairwise
   // alias comparisons and consumers of a footprint still require evidence.
-  if (candidate && info.root && info.root.getType()==info.rootType &&
+  if (candidate && info.viewType && hasWideStorageDomain(info.viewType.getShape()) &&
+      info.root && info.root.getType()==info.rootType &&
       info.rootType==info.viewType && info.viewToRoot &&
       info.viewToRoot.getNumDims()==2 && info.viewToRoot.getNumResults()==2 &&
       !info.viewToRoot.getNumSymbols() && info.viewToRoot.isIdentity() &&
@@ -492,9 +493,10 @@ LayoutProof mlir::frisk::verifyStorageAliasCandidate(const StorageAliasInfo &inf
       candidate.getAlignment().getInt()>0 &&
       llvm::isPowerOf2_64(candidate.getAlignment().getInt()) && info.rootAlignment &&
       info.rootAlignment % uint64_t(candidate.getAlignment().getInt())==0 &&
-      getFriskMemorySpace(info.viewType)==candidate.getMemorySpace().getValue() &&
-      proveWideStridedStorageRange(candidate,info.viewType,info.lowerBit,info.upperBit))
-    return proof(ProofStatus::Proven, "non-overlapping strided intervals within the whole root");
+      getFriskMemorySpace(info.viewType)==candidate.getMemorySpace().getValue()) {
+    auto range = proveWideStridedStorageRange(candidate,info.viewType,info.lowerBit,info.upperBit);
+    if (range.status != ProofStatus::Unknown) return range;
+  }
   return buildStorageAliasFootprint(info, candidate).proof;
 }
 
@@ -516,6 +518,15 @@ LayoutProof mlir::frisk::proveStorageAliasCompatible(
       matchContiguousIdentityStorageAlias(a, ca) &&
       matchContiguousIdentityStorageAlias(b, cb))
     return proof(ProofStatus::Proven, "same-root exact contiguous identity bit functions agree");
+  // Equal coordinate transforms and maps induce identical intervals on
+  // the same root. Validate each endpoint independently (capacity/alignment).
+  if (ca && cb && a.viewType && a.root && a.root == b.root && a.rootType == b.rootType &&
+      a.viewType == b.viewType && a.viewToRoot == b.viewToRoot &&
+      ca.getMap() == cb.getMap() && failed(pointCount(a.viewType.getShape()))) {
+    auto first = verifyStorageAliasCandidate(a,ca);
+    if (first.status != ProofStatus::Proven) return first;
+    return verifyStorageAliasCandidate(b,cb);
+  }
   return proveStorageAliasFootprints(buildStorageAliasFootprint(a, ca),
                                      buildStorageAliasFootprint(b, cb));
 }

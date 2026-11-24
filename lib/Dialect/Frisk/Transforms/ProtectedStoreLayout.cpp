@@ -841,7 +841,7 @@ FailureOr<SmallVector<Candidate, 2>> certify(ModuleOp module, MmaOp mma) {
     return mma.emitOpError("protection requires one or two explicit warpgroups");
   auto grids = getSM90MmaGeometries(mma, threads.getInt(), true);
   if (failed(grids) || grids->empty())
-    return mma.emitOpError("no certifiable SM90 MMA geometry within the supported tile and proof bounds");
+    return mma.emitOpError(diagnoseSM90MmaGeometryFailure(mma,threads.getInt()).reason);
   auto isolated = projectAnchor(module, mma);
   if (failed(isolated))
     return mma.emitOpError("cannot project the MMA operand boundary");

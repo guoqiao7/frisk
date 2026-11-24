@@ -71,7 +71,7 @@ LogicalResult verifyLayoutStorageCapacity(const LayoutConstraintGraph &graph,
     return emitError(loc) << "storage solution for " << var.stableName
                           << " has an incompatible type or encoding";
   if (var.storageAlias) {
-    const auto &proof = getStorageAliasFootprint(graph, var.id, candidate).proof;
+    auto proof = proveStorageCandidate(graph, var.id, candidate);
     if (proof.status == ProofStatus::Proven) return success();
     return emitError(loc) << "storage alias proof failed for " << var.stableName
                           << ": " << proof.reason;
@@ -111,6 +111,16 @@ const StorageAliasFootprint &getStorageAliasFootprint(
   return inserted.first->second;
 }
 
+LayoutProof proveStorageCandidate(const LayoutConstraintGraph &graph,
+                                  LayoutVarID id, Attribute candidate) {
+  const auto &dense = getStorageAliasFootprint(graph, id, candidate).proof;
+  if (dense.status != ProofStatus::Unknown) return dense;
+  auto storage = dyn_cast_or_null<StorageLayoutAttr>(candidate);
+  const auto &alias = graph.getVariable(id).storageAlias;
+  if (!storage || !alias) return dense;
+  return verifyStorageAliasCandidate(*alias, storage);
+}
+
 LayoutProof proveAliasLayoutRelation(const LayoutConstraintGraph &graph,
                                     LayoutVarID lhs, Attribute a,
                                     LayoutVarID rhs, Attribute b) {
@@ -126,6 +136,13 @@ LayoutProof proveAliasLayoutRelation(const LayoutConstraintGraph &graph,
   (void)getStorageAliasFootprint(graph, rhs, b);
   auto proof = proveStorageAliasFootprints(
       getStorageAliasFootprint(graph, lhs, a), getStorageAliasFootprint(graph, rhs, b));
+  if (proof.status == ProofStatus::Unknown) {
+    auto &left = graph.getVariable(lhs).storageAlias;
+    auto &right = graph.getVariable(rhs).storageAlias;
+    if (left && right && a && b && isa<StorageLayoutAttr>(a) && isa<StorageLayoutAttr>(b))
+      proof = proveStorageAliasCompatible(*left,cast<StorageLayoutAttr>(a),
+                                          *right,cast<StorageLayoutAttr>(b));
+  }
   ++graph.getCandidatePreparationStatistics().pairProofEvaluations;
   if (cache.try_emplace(key, proof).second)
     LayoutProfile::cacheInsertion(LayoutProfileKind::AliasPairCache);

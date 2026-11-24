@@ -13,6 +13,8 @@ FailureOr<SM90MmaGeometry> getSM90MmaGeometry(MmaOp op, int64_t threads);
 /// legacy policies are singletons.
 FailureOr<SmallVector<SM90MmaGeometry>> getSM90MmaGeometries(MmaOp op, int64_t threads,
     bool exploreRowPartitions = false);
+/// Explain an unsuccessful geometry lookup, preserving proof-budget failures.
+LayoutProof diagnoseSM90MmaGeometryFailure(MmaOp op, int64_t threads);
 DictionaryAttr encodeSM90MmaGeometry(MLIRContext *context, const SM90MmaGeometry &geometry);
 /// Strict schema and membership checks against the operation's shape/policy/dtype/threads.
 /// Semantic validity does not imply the fragment proof fits its hardware budget.
@@ -23,6 +25,8 @@ FailureOr<SM90MmaGeometry> getSM90MmaContractGeometry(MmaOp op, int64_t threads,
 std::array<int64_t, 2> getSM90MmaFragmentCoordinate(
     const SM90MmaGeometry &g, bool operandA, bool transA,
     int64_t reg, int64_t lane, int64_t warp, int64_t group);
+/// Validated logical slots per consumer thread (A slots count halfwords).
+FailureOr<int64_t> getSM90MmaFragmentSlots(const SM90MmaGeometry &g, bool operandA);
 LayoutProof verifySM90MmaFragment(const SM90MmaGeometry &g,
     bool operandA, bool transA, RankedTensorType type, DistributedEncodingAttr encoding);
 /// PTX 9.4 section 9.7.17.5.1.2 canonical address equation; offsets in bytes.

@@ -91,9 +91,11 @@ TEST_F(SymbolicBroadcastLayoutTest, BeyondEnumerationBudget) {
   EXPECT_EQ(enumerateExecutionLayout(dst, output, points).status, ProofStatus::Unknown);
   auto proof = proveBroadcastLayout(src, dst, input, output, {1});
   EXPECT_EQ(proof.status, ProofStatus::Proven) << proof.reason;
-  // The entry coverage check is symbolic, but actual reduction projection still
-  // needs its bounded table. Do not silently broaden that algorithm's domain.
-  EXPECT_TRUE(failed(projectBroadcastInputEncoding(dst, input, output, {1})));
+  // The register quotient now has a symbolic ownership proof as well.
+  auto projected = projectBroadcastInputEncoding(dst, input, output, {1});
+  ASSERT_TRUE(succeeded(projected));
+  auto replay = proveBroadcastLayout(*projected, dst, input, output, {1});
+  EXPECT_EQ(replay.status, ProofStatus::Proven) << replay.reason;
   EXPECT_TRUE(succeeded(projectBroadcastInputEncoding(dst, output, output, {})));
 }
 

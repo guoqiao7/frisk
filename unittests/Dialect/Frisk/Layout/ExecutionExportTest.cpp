@@ -168,6 +168,24 @@ TEST_F(ExecutionExportTest, SymbolicRegisterPlanRejectsCrossThreadCommunication)
  EXPECT_TRUE(failed(test::planSymbolicRegisterRedistribution(src,dst,UnknownLoc::get(&context))));
 }
 
+TEST_F(ExecutionExportTest, WideLogicalOwnershipAndPackageLimitAreDiagnosedSeparately) {
+ SmallVector<uint64_t> columns;
+ for (unsigned bit=0; bit<17; ++bit) columns.push_back(uint64_t(1)<<bit);
+ auto type=executionType(context,{256,512},1024,columns);
+ std::string text;
+ llvm::raw_string_ostream(text)<<type;
+ auto module=parseSourceString<ModuleOp>("module attributes {frisk.target=\"sm_90a\"} { frisk.kernel @wide() { frisk.parallel (%i)=(1), threads=128 { %x=tensor.empty() : "+text+" frisk.end } frisk.end } }",&context);
+ ASSERT_TRUE(module);
+ { std::error_code ec; llvm::raw_fd_ostream output(path,ec); ASSERT_FALSE(bool(ec)); output<<"preserve"; }
+ std::string message;
+ ScopedDiagnosticHandler capture(&context,[&](Diagnostic &d){llvm::raw_string_ostream(message)<<d;return success();});
+ EXPECT_TRUE(failed(run(*module)));
+ EXPECT_NE(message.find("stage=export-representation code=logical-domain-width proof=Proven"),std::string::npos) << message;
+ EXPECT_NE(message.find("got 17; register slots per thread=1024"),std::string::npos) << message;
+ auto bytes=llvm::MemoryBuffer::getFile(path);
+ ASSERT_TRUE(bool(bytes)); EXPECT_EQ((*bytes)->getBuffer(),"preserve");
+}
+
 TEST_F(ExecutionExportTest, LargeProvenMapExportsCompactWithoutHolderTable) {
  SmallVector<uint64_t> columns(17,0);for(unsigned i=0;i<10;++i)columns[i]=uint64_t{1}<<i;
  auto type=executionType(context,{32,32},1024,columns,true);
@@ -193,7 +211,7 @@ TEST_F(ExecutionExportTest, LargeProvenMapExportsCompactWithoutHolderTable) {
 TEST_F(ExecutionExportTest, UnsupportedDeadOperationHasTypedAtomicRejection) {
  auto m=selected();ASSERT_TRUE(m);Value first;
  m->walk([&](Operation *op){for(Value value:op->getResults())if(!first && isa<RankedTensorType>(value.getType()))first=value;});ASSERT_TRUE(first);
- OpBuilder b(first.getDefiningOp());b.setInsertionPointAfter(first.getDefiningOp());b.create<arith::AddFOp>(first.getLoc(),first,first);
+ OpBuilder b(first.getDefiningOp());b.setInsertionPointAfter(first.getDefiningOp());b.create<arith::NegFOp>(first.getLoc(),first);
  {std::error_code ec;llvm::raw_fd_ostream stream(path,ec);ASSERT_FALSE(bool(ec));stream<<"preserve";}
  std::string diagnostics;
  ScopedDiagnosticHandler capture(&context,[&](Diagnostic &diagnostic){llvm::raw_string_ostream stream(diagnostics);diagnostic.print(stream);return success();});

@@ -7,6 +7,7 @@
 #include "Dialect/Frisk/Analysis/InstructionLayoutConstraints.h"
 #include "Dialect/Frisk/Target/SM90/SM90MmaLayoutProof.h"
 #include "Dialect/Frisk/IR/FriskOps.h"
+#include "Dialect/Frisk/IR/ContiguousStorageLayout.h"
 #include "llvm/Support/MathExtras.h"
 #include <limits>
 #include <map>
@@ -267,12 +268,48 @@ std::optional<CostEstimate> nativeGlobalAccess(
   return result;
 }
 
+// A scalar warp issue fixes the register, warp and group. In aligned
+// row-major f32 storage its sector IDs are an affine coset of the lane
+// image after removing the lowest three column bits (eight f32 per sector).
+// The cardinality is independent of the fixed carriers.
+static FailureOr<CostEstimate> wideScalarAccess(const LayoutVar &execution,
+    const LayoutVar &storage, DistributedEncodingAttr encoding, StorageLayoutAttr layout) {
+  const auto &alias = *storage.storageAlias;
+  auto tile = matchRowMajorF32Storage(layout, alias.viewType);
+  auto type = dyn_cast<RankedTensorType>(execution.shapedType);
+  if (!tile || !type || type.getShape() != alias.viewType.getShape() ||
+      tile->elements <= 65536 || tile->columns < 8 || alias.rootAlignment < 32 ||
+      alias.viewType != alias.rootType || !alias.viewToRoot.isIdentity() ||
+      verifyStorageAliasCandidate(alias, layout).status != ProofStatus::Proven ||
+      proveExecutionOwnership(encoding, type, "all").status != ProofStatus::Proven)
+    return failure();
+  LinearExecutionLayout linear;
+  if (analyzeLinearExecutionLayout(encoding,type,linear).status != ProofStatus::Proven ||
+      linear.topology[1] != 32) return failure();
+  SmallVector<APInt> sectorRows;
+  for (unsigned bit = 0; bit < linear.logicalBits; ++bit)
+    if (bit < linear.logicalWidths[0] || bit >= linear.logicalWidths[0] + 3)
+      sectorRows.push_back(linear.rows[bit].extractBits(5,linear.hardwareOffsets[1]));
+  auto projection = GF2Matrix::get(sectorRows.size(), 5, sectorRows);
+  if (failed(projection)) return failure();
+  uint64_t issues = tile->elements / 32;
+  CostEstimate result;
+  result.cost.instructionPathAndWork = issues;
+  result.cost.memoryTransactions = issues << projection->rank();
+  return result;
+}
+
 FailureOr<CostEstimate> computeAccessCost(const LayoutConstraintGraph &graph,
     const LayoutConstraint &c, const LayoutVar &execution, const LayoutVar &storage,
     DistributedEncodingAttr encoding, StorageLayoutAttr layout,
     DictionaryAttr copy, bool nativeVector) {
   const auto &footprint = getStorageAliasFootprint(graph, storage.id, layout);
-  if (footprint.proof.status != ProofStatus::Proven) return failure();
+  if (footprint.proof.status != ProofStatus::Proven) {
+    if (footprint.proof.status == ProofStatus::Unknown && !nativeVector && !copy &&
+        !execution.operationExecution)
+      return wideScalarAccess(execution,storage,encoding,layout);
+    return failure();
+  }
   if (nativeVector && !copy) {
     Operation *op = graph.getProvenances()[c.provenance].source;
     auto region = op ? op->getParentOfType<ParallelOp>() : ParallelOp();

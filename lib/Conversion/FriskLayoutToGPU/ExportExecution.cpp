@@ -164,7 +164,13 @@ struct ExportExecutionPass: impl::ExportExecutionBase<ExportExecutionPass> {
      rejectProof(op,"execution ownership is not Proven",code,ownership);
      return std::nullopt;
     }
-    if(proof.status!=ProofStatus::Unknown || linear.hardwareBits<=16 || linear.logicalBits>16) {
+    if (proof.status==ProofStatus::Unknown && linear.logicalBits>16) {
+     reject(op,(Twine("logical ownership proven; native execution package supports at most 16 logical bits, got ")+
+                Twine(linear.logicalBits)+"; register slots per thread="+Twine(linear.topology[0])).str(),
+            "logical-domain-width","export-representation","Proven");
+     return std::nullopt;
+    }
+    if(proof.status!=ProofStatus::Unknown || linear.hardwareBits<=16) {
      rejectProof(op,"execution table is not Proven",code,proof);
      return std::nullopt;
     }

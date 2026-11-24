@@ -1,7 +1,7 @@
 #include "Dialect/Frisk/Target/SM90/SM90MmaLayoutProof.h"
 #include "Dialect/Frisk/Target/SM90/SM90InstructionTable.h"
 #include "Dialect/Frisk/Target/SM90/SM90TargetInfo.h"
-#include "Dialect/Frisk/Analysis/LayoutAlgebra.h"
+#include "Dialect/Frisk/Analysis/LinearExecutionLayout.h"
 #include "Dialect/Frisk/Analysis/ExecutionLayoutProof.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
@@ -26,7 +26,7 @@ FailureOr<SM90MmaGeometry> mlir::frisk::getSM90MmaGeometry(MmaOp op, int64_t thr
   if (op.getPolicy() == attr::GemmWarpPolicy::Auto) return failure();
   int64_t m = op.getMAttr().getInt(), n = op.getNAttr().getInt(), k = op.getKAttr().getInt();
   if (!isSM90WGMMAThreadCount(threads) ||
-      !bounded(m,n) || !bounded(m,k) || !bounded(n,k) || m % 64 || k % 16 || n < 8)
+      !bounded(m,k) || !bounded(n,k) || m % 64 || k % 16 || n < 8)
     return failure();
   int64_t bestM = 0, bestN = 0, score = std::numeric_limits<int64_t>::max();
   for (int64_t gm = 1; gm <= threads / 128; gm *= 2) {
@@ -60,8 +60,7 @@ static FailureOr<SmallVector<SM90MmaGeometry>> getSM90MmaBaseGeometries(
     return SmallVector<SM90MmaGeometry>{*legacy};
   }
   int64_t m = op.getM(), n = op.getN(), k = op.getK();
-  if (!isSM90WGMMAThreadCount(threads) || !bounded(m,n) ||
-      !bounded(m,k) || !bounded(n,k) || m % 64 || k % 16 || n < 8)
+  if (!isSM90WGMMAThreadCount(threads) || !bounded(m,k) || !bounded(n,k) || m % 64 || k % 16 || n < 8)
     return failure();
   SmallVector<SM90MmaGeometry> result;
   bool rs = isa<RankedTensorType>(op.getA().getType());
@@ -124,6 +123,24 @@ FailureOr<SmallVector<SM90MmaGeometry>> mlir::frisk::getSM90MmaGeometries(
     });
   if (result->empty()) return failure();
   return result;
+}
+
+LayoutProof mlir::frisk::diagnoseSM90MmaGeometryFailure(MmaOp op, int64_t threads) {
+  int64_t m = op.getM(), n = op.getN(), k = op.getK();
+  if (isSM90WGMMAThreadCount(threads) && m > 0 && n > 0 && k > 0 &&
+      llvm::isPowerOf2_64(m) && llvm::isPowerOf2_64(n) && llvm::isPowerOf2_64(k) &&
+      m % 64 == 0 && n >= 8 && k % 16 == 0) {
+    for (bool a : {true, false}) {
+      int64_t extent = a ? m : n;
+      if (extent > 65536/k)
+        return unknown((Twine("sm90-mma-") +
+            (a && isa<RankedTensorType>(op.getA().getType()) ? "fragment" : "descriptor") +
+            ": unknown proof: " + (a ? "A " : "B ") + Twine(extent) + "x" + Twine(k) +
+            " logical point budget exceeds 65536").str());
+    }
+  }
+  return reject((Twine("sm90-mma-thread-group: unsupported binding geometry, tile, threads or policy grouping: ") +
+       Twine(m)+"x"+Twine(n)+"x"+Twine(k)+", consumer threads="+Twine(threads)).str());
 }
 
 DictionaryAttr mlir::frisk::encodeSM90MmaGeometry(MLIRContext *ctx,
@@ -191,47 +208,58 @@ std::array<int64_t,2> mlir::frisk::getSM90MmaFragmentCoordinate(
   return {row,col};
 }
 
+FailureOr<int64_t> mlir::frisk::getSM90MmaFragmentSlots(const SM90MmaGeometry &g,
+                                                      bool operandA) {
+  auto extent = [](int64_t v) { return v > 0 && v <= 65536 && llvm::isPowerOf2_64(v); };
+  if (!isSM90WGMMAThreadCount(g.threads) || !extent(g.m) || !extent(g.n) ||
+      !extent(g.k) || g.gM < 1 || g.gM > g.threads/128 ||
+      !llvm::isPowerOf2_64(g.gM) || g.gN != g.threads/128/g.gM ||
+      g.atomN < 8 || g.atomN > 256 || !llvm::isPowerOf2_64(g.atomN) ||
+      g.m % (64*g.gM) || g.n % (g.atomN*g.gN) || g.k % 16 ||
+      g.mRepeat != g.m/(64*g.gM) || g.nRepeat != g.n/(g.atomN*g.gN) ||
+      g.kRepeat != g.k/16 ||
+      (g.interleavedRows && (g.gM != 2 || g.gN != 1 || g.mRepeat <= 1)))
+    return failure();
+  return operandA ? g.mRepeat*g.kRepeat*8 : g.mRepeat*g.nRepeat*(g.atomN/2);
+}
+
 LayoutProof mlir::frisk::verifySM90MmaFragment(const SM90MmaGeometry &g,
     bool a, bool transA, RankedTensorType type, DistributedEncodingAttr encoding) {
   if (!type || !encoding) return reject("sm90-mma-fragment: missing Distributed encoding");
-  int64_t regs = a ? g.mRepeat*g.kRepeat*8 : g.mRepeat*g.nRepeat*g.atomN/2;
-  if (regs > 65536/g.threads) return unknown("sm90-mma-fragment: hardware point budget exceeds 65536");
+  // These checks also establish the power-of-two factors needed by the basis
+  // proof. Validate before multiplying or dividing caller-supplied geometry.
+  auto count = getSM90MmaFragmentSlots(g, a);
+  if (failed(count)) return reject("sm90-mma-fragment: inconsistent geometry or repeats");
+  int64_t regs = *count;
+  if (a && regs > 65536/g.threads)
+    return unknown("sm90-mma-fragment: A hardware point budget exceeds 65536");
+  SmallVector<int64_t, 2> shape{g.m, a ? g.k : g.n};
+  if (a && transA) std::swap(shape[0], shape[1]);
+  if (type.getShape() != ArrayRef<int64_t>(shape))
+    return reject("sm90-mma-fragment: logical shape disagrees with geometry");
   if (encoding.getTopology().asArrayRef() != ArrayRef<int64_t>({regs,32,4,g.threads/128,1}) ||
       encoding.getReplication().getInt() != (a ? g.gN : 1))
     return reject("sm90-mma-fragment: noncanonical warpgroup topology/replication");
   auto ownership = proveExecutionOwnership(encoding,type,"first_owner");
   if (ownership.status != ProofStatus::Proven) return ownership;
-  auto map = dyn_cast<BitLinearLayoutMapAttr>(encoding.getMap());
-  if (!map) return unknown("sm90-mma-fragment: unsupported map representation");
-  auto matrix = map.getMatrixValue();
-  if (failed(matrix)) return reject("sm90-mma-fragment: malformed matrix");
-  const StringRef carrierNames[] = {"register","lane","warp","warp_group","cta"};
-  for (int64_t group = 0; group < g.threads/128; ++group)
-    for (int64_t warp = 0; warp < 4; ++warp)
-      for (int64_t lane = 0; lane < 32; ++lane)
-        for (int64_t reg = 0; reg < regs; ++reg) {
-          int64_t coordinates[] = {reg,lane,warp,group,0};
-          APInt input(matrix->getNumColumns(),0);
-          unsigned offset = 0;
-          for (unsigned d = 0; d < map.getInputNames().size(); ++d) {
-            auto name = cast<StringAttr>(map.getInputNames()[d]).getValue();
-            auto found = llvm::find(ArrayRef<StringRef>(carrierNames),name);
-            if (found == std::end(carrierNames)) return reject("sm90-mma-fragment: unknown carrier");
-            input |= APInt(input.getBitWidth(),coordinates[found-std::begin(carrierNames)]) << offset;
-            offset += map.getInputBitWidths()[d];
-          }
-          APInt out = matrix->apply(input);
-          auto expected = getSM90MmaFragmentCoordinate(g,a,transA,reg,lane,warp,group);
-          offset = 0;
-          for (unsigned d = 0; d < 2; ++d) {
-            unsigned width = map.getOutputBitWidths()[d];
-            if (out.extractBitsAsZExtValue(width,offset) != uint64_t(expected[d]))
-              return reject("sm90-mma-fragment: register/packed-half coordinate mismatch",
-                            {group,warp,lane,reg,expected[0],expected[1]});
-            offset += width;
-          }
-        }
-  return {ProofStatus::Proven,{},"sm90-mma-fragment: exact hardware coordinates"};
+  LinearExecutionLayout layout;
+  auto proof = analyzeLinearExecutionLayout(encoding, type, layout);
+  if (proof.status != ProofStatus::Proven) return proof;
+  // Within a validated PTX atom the lane, warp and register fields occupy
+  // disjoint output bits. Repeats and group IDs append disjoint high bits
+  // (interleaving exchanges the group and row-repeat fields). The origin is
+  // zero, so the hardware equation is linear over F2. Equality on every
+  // carrier basis vector proves equality everywhere, even for replicated A.
+  for (unsigned bit = 0; bit < layout.hardwareBits; ++bit) {
+    APInt unit = APInt::getOneBitSet(layout.hardwareBits, bit);
+    auto hw = layout.hardwareCoordinate(unit); // CTA, group, warp, lane, reg.
+    auto expected = getSM90MmaFragmentCoordinate(g,a,transA,hw[4],hw[3],hw[2],hw[1]);
+    auto actual = layout.logicalCoordinate(layout.apply(unit));
+    if (actual[0] != expected[0] || actual[1] != expected[1])
+      return reject("sm90-mma-fragment: register/packed-half coordinate mismatch",
+                    {hw[1],hw[2],hw[3],hw[4],expected[0],expected[1]});
+  }
+  return {ProofStatus::Proven,{},"sm90-mma-fragment: exact hardware coordinates by GF(2) basis equality"};
 }
 
 uint64_t mlir::frisk::getSM90DescriptorAddress(StringRef major, unsigned swizzle,
@@ -324,16 +352,7 @@ LayoutProof mlir::frisk::verifySM90MmaContract(const LayoutConstraintGraph &grap
     return reject("sm90-mma-fragment: requires f16/bf16 inputs and f32 accumulator");
   int64_t threads = graph.getVariable(constraint.vars[3]).requiredThreads;
   auto g = getSM90MmaContractGeometry(op,threads,binding);
-  if (failed(g)) {
-    auto exceeds = [](ShapedType t) {
-      return t.getRank()==2 && t.getDimSize(0)>0 && t.getDimSize(1)>0 &&
-             (t.getDimSize(0)>65536 || t.getDimSize(1)>65536/t.getDimSize(0));
-    };
-    if (exceeds(result) || exceeds(cast<ShapedType>(op.getA().getType())) ||
-        exceeds(cast<ShapedType>(op.getB().getType())))
-      return unknown("sm90-mma-fragment: logical point budget exceeds 65536");
-    return reject("sm90-mma-thread-group: unsupported binding geometry, tile, threads or policy grouping");
-  }
+  if (failed(g)) return diagnoseSM90MmaGeometryFailure(op,threads);
   if (auto attr = op->getAttrOfType<IntegerAttr>("frisk.execution_threads"))
     if (attr.getInt()!=threads) return reject("sm90-mma-thread-group: explicit threads conflict with execution scope");
   if (failed(decodeSM90MmaGeometry(op,threads,encodings[4])) ||

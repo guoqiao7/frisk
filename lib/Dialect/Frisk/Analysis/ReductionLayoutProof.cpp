@@ -30,8 +30,11 @@ unsigned edgeScope(const ReductionHolder &a, const ReductionHolder &b) {
 FailureOr<DistributedEncodingAttr> mlir::frisk::projectReductionEncoding(
     DistributedEncodingAttr src, RankedTensorType srcType, RankedTensorType dstType, int64_t axis) {
   if (!validTypes(srcType,dstType,axis)) return failure();
-  ExecutionEnumeration points;
-  if (enumerateExecutionLayout(src,srcType,points).status != ProofStatus::Proven) return failure();
+  LinearExecutionLayout input;
+  if (analyzeLinearExecutionLayout(src,srcType,input).status != ProofStatus::Proven ||
+      input.hardwareBits >= 63 || input.logicalBits >= 63 ||
+      proveExecutionOwnership(src,srcType,"first_owner").status != ProofStatus::Proven)
+    return failure();
   auto map = cast<BitLinearLayoutMapAttr>(src.getMap());
   unsigned begin = 0;
   for (int64_t i=0; i<axis; ++i) begin += map.getOutputBitWidths()[i];
@@ -83,8 +86,8 @@ FailureOr<DistributedEncodingAttr> mlir::frisk::projectReductionEncoding(
   int64_t hardware=1; for (auto e:topology) hardware*=e;
   auto result=DistributedEncodingAttr::get(src.getContext(),projected,b.getDenseI64ArrayAttr(topology),
       b.getI64IntegerAttr(hardware/dstType.getNumElements()));
-  ExecutionEnumeration output;
-  if (enumerateExecutionLayout(result,dstType,output).status != ProofStatus::Proven) return failure();
+  if (proveExecutionOwnership(result,dstType,"first_owner").status != ProofStatus::Proven)
+    return failure();
   return result;
 }
 
@@ -192,6 +195,43 @@ void mlir::frisk::enumerateReductionLifts(
     auto natural = projectReductionEncoding(candidate, sourceType, resultType, axis);
     if (succeeded(natural) && *natural == slice) out.push_back(candidate);
   }
+}
+
+LayoutProof mlir::frisk::proveLinearReductionScope(DistributedEncodingAttr src,
+    DistributedEncodingAttr dst, RankedTensorType srcType, RankedTensorType dstType,
+    int64_t axis, std::string &scope) {
+  if (!validTypes(srcType,dstType,axis)) return reject("invalid reduction shapes");
+  // With replicated input, first-owner election requires a separate proof.
+  if (!src || src.getReplication().getInt() != 1)
+    return {ProofStatus::Unknown, {}, "symbolic reduction requires a unique source owner"};
+  auto natural = projectReductionEncoding(src,srcType,dstType,axis);
+  if (failed(natural))
+    return {ProofStatus::Unknown, {}, "could not prove the source register quotient"};
+  LinearExecutionLayout actual, expected;
+  auto result = analyzeLinearExecutionLayout(dst,dstType,actual);
+  if (result.status != ProofStatus::Proven) return result;
+  result = proveExecutionOwnership(dst,dstType,"first_owner");
+  if (result.status != ProofStatus::Proven) return result;
+  result = analyzeLinearExecutionLayout(*natural,dstType,expected);
+  if (result.status != ProofStatus::Proven) return result;
+  if (actual.topology != expected.topology || actual.rows != expected.rows)
+    return reject("result encoding differs from natural reduction projection");
+  if (actual.topology[4] != 1) return reject("reduction requires a single CTA");
+  // Deleting the reduced rows projects each thread's input registers to a
+  // coset. Removing dependent register columns preserves that coset, so the
+  // result holders and contributing threads agree for every output. Each
+  // fiber is a translate of the same kernel. Its connected reduction tree
+  // and broadcasts span exactly the widest differing thread carrier.
+  auto matrix = actual.getMatrix();
+  if (failed(matrix)) return {ProofStatus::Unknown, {}, "empty symbolic reduction axes"};
+  unsigned level = 0;
+  for (const APInt &v : matrix->kernelBasis()) {
+    auto hw = actual.hardwareCoordinate(v);
+    if (hw[1] || hw[2]) level = 2;
+    else if (hw[3]) level = std::max(level,1u);
+  }
+  scope = level == 2 ? "cta_shared_tree" : level == 1 ? "warp" : "register";
+  return {ProofStatus::Proven, {}, "canonical fiber coverage and scope by register quotient"};
 }
 
 ReductionLayoutProof mlir::frisk::buildReductionLayoutProof(DistributedEncodingAttr src,

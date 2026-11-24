@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <numeric>
 #include <set>
 #include <vector>
 
@@ -1526,64 +1527,78 @@ std::optional<PositiveCoefficients> positiveCoefficients(AffineExpr expr,
 }
 // On a bounded positive rectangle, the larger stride separates adjacent
 // rows (or columns) if it exceeds the entire span of the other axis.
-bool proveWideStridedStorage(Attribute map, ArrayRef<int64_t> shape,
+LayoutProof proveWideStridedStorage(Attribute map, ArrayRef<int64_t> shape,
                             uint64_t elementBits, uint64_t lowerBit, uint64_t upperBit) {
   auto a = dyn_cast<AffineLayoutMapAttr>(map);
-  if (!a || shape.size() != 2 || shape[0] <= 0 || shape[1] <= 0 ||
-      shape[0] <= 65536 / shape[1] || !a.getInputExtents() ||
+  if (!a || !hasWideStorageDomain(shape) || !a.getInputExtents() ||
       a.getInputExtents().asArrayRef() != shape || !a.getOutputExtents() ||
-      a.getOutputExtents().size() != 2) return false;
+      a.getOutputExtents().size() != 2) return {ProofStatus::Unknown, {}, "unsupported wide strided storage map"};
   auto f = a.getAffineMap().getValue();
   if (f.getNumDims() != 2 || f.getNumSymbols() || f.getNumResults() != 2)
-    return false;
+    return {ProofStatus::Unknown, {}, "unsupported wide strided storage map"};
   auto bit = dyn_cast<AffineConstantExpr>(f.getResult(1));
   if (!bit || bit.getValue() < 0 || bit.getValue() >= 8 ||
-      bit.getValue() >= a.getOutputExtents()[1]) return false;
+      bit.getValue() >= a.getOutputExtents()[1]) return {ProofStatus::Unknown, {}, "unsupported wide strided storage map"};
   unsigned budget = 4096;
   auto bytes = positiveCoefficients(f.getResult(0), budget);
-  if (!bytes || a.getOutputExtents()[0] <= 0) return false;
+  if (!bytes || a.getOutputExtents()[0] <= 0) return {ProofStatus::Unknown, {}, "unsupported wide strided storage map"};
   uint64_t span[2], end = (*bytes)[2];
   for (unsigned i = 0; i < 2; ++i) {
-    if (shape[i] > 1 && !(*bytes)[i]) return false;
     uint64_t steps = shape[i] - 1;
-    if (steps && (*bytes)[i] > (uint64_t(INT64_MAX) - end) / steps) return false;
+    if (steps && (*bytes)[i] > (uint64_t(INT64_MAX) - end) / steps)
+      return {ProofStatus::Unknown, {}, "wide storage byte address exceeds signed 64-bit arithmetic"};
     span[i] = steps * (*bytes)[i];
     end += span[i];
   }
   uint64_t width = llvm::divideCeil(elementBits, uint64_t{8});
+  if (__int128((*bytes)[2])*8 + bit.getValue() < lowerBit)
+    return {ProofStatus::Disproven, {0,0}, "element begins before the root interval"};
   if (end >= uint64_t(a.getOutputExtents()[0]) ||
-      __int128((*bytes)[2])*8 + bit.getValue() < lowerBit ||
-      __int128(end)*8 + bit.getValue() + elementBits > upperBit ||
-      (shape[0]>1 && (*bytes)[0]<width) || (shape[1]>1 && (*bytes)[1]<width))
-    return false;
-  return shape[0]==1 || shape[1]==1 ||
-         ((*bytes)[0]>=span[1] && (*bytes)[0]-span[1]>=width) ||
-         ((*bytes)[1]>=span[0] && (*bytes)[1]-span[0]>=width);
+      __int128(end)*8 + bit.getValue() + elementBits > upperBit)
+    return {ProofStatus::Disproven, {shape[0]-1,shape[1]-1},
+            "last element exceeds the declared address extent or root interval"};
+  for (unsigned i = 0; i < 2; ++i) {
+    if (shape[i] > 1 && (*bytes)[i] < width)
+      return {ProofStatus::Disproven, {i==0,i==1}, "element overlaps the element at [0, 0]"};
+  }
+  if (shape[0]>1 && shape[1]>1) {
+    uint64_t x = (*bytes)[0], y = (*bytes)[1], divisor = std::gcd(x,y);
+    // The shortest nonzero equal-address displacement is (y/g, -x/g).
+    if (y/divisor < uint64_t(shape[0]) && x/divisor < uint64_t(shape[1]))
+      return {ProofStatus::Disproven, {int64_t(y/divisor),0},
+              (Twine("same byte/bit address as [0, ")+Twine(x/divisor)+"]").str()};
+    // Distinct starts are at least gcd(x,y) bytes apart. With a smaller
+    // gcd, row or column separation is still a sufficient interval proof.
+    if (divisor < width && !(x >= span[1] && x-span[1] >= width) &&
+        !(y >= span[0] && y-span[0] >= width))
+      return {ProofStatus::Unknown, {}, "distinct starts proven; element interval separation unresolved"};
+  }
+  return {ProofStatus::Proven, {}, "disjoint strided element intervals within bounds"};
 }
 } // namespace
 
-bool proveWideStridedStorageRange(StorageLayoutAttr layout, MemRefType type,
+LayoutProof proveWideStridedStorageRange(StorageLayoutAttr layout, MemRefType type,
                                   uint64_t lowerBit, uint64_t upperBit) {
-  if (!layout || !type || !type.getElementType().isIntOrFloat()) return false;
+  if (!layout || !type || !type.getElementType().isIntOrFloat()) return {ProofStatus::Unknown, {}, "unsupported wide strided storage map"};
   auto a = dyn_cast<AffineLayoutMapAttr>(layout.getMap());
-  if (!a || a.getOutputNames().size()!=2) return false;
+  if (!a || a.getOutputNames().size()!=2) return {ProofStatus::Unknown, {}, "unsupported wide strided storage map"};
   Builder b(type.getContext());
   if (a.getOutputNames()[0]!=b.getStringAttr("byte_offset") ||
-      a.getOutputNames()[1]!=b.getStringAttr("bit_offset")) return false;
+      a.getOutputNames()[1]!=b.getStringAttr("bit_offset")) return {ProofStatus::Unknown, {}, "unsupported wide strided storage map"};
   return proveWideStridedStorage(a,type.getShape(),type.getElementTypeBitWidth(),lowerBit,upperBit);
 }
 
 std::optional<ContiguousIdentityStorage>
-matchContiguousIdentityStorage(StorageLayoutAttr layout, MemRefType type) {
+matchRowMajorF32Storage(StorageLayoutAttr layout, MemRefType type) {
   if (!layout || !type || type.getRank() != 2 || !type.hasStaticShape() ||
       !type.getElementType().isF32() || !layout.getMemorySpace() ||
       layout.getMemorySpace().getValue() != attr::MemorySpace::Global ||
       getFriskMemorySpace(type) != attr::MemorySpace::Global ||
-      !layout.getAlignment() || layout.getAlignment().getInt() != 1 ||
+      !layout.getAlignment() || layout.getAlignment().getInt() <= 0 ||
       !layout.getVectorGranularity() || layout.getVectorGranularity().getInt() != 1)
     return std::nullopt;
   int64_t m = type.getDimSize(0), n = type.getDimSize(1);
-  if (m <= 0 || n <= 0 || uint64_t(m) > 65536 / uint64_t(n)) return std::nullopt;
+  if (m <= 0 || n <= 0 || uint64_t(m) > uint64_t(INT64_MAX / 32) / uint64_t(n)) return std::nullopt;
   uint64_t elements = uint64_t(m) * uint64_t(n);
   SmallVector<int64_t> strides;
   int64_t offset;
@@ -1625,9 +1640,18 @@ matchContiguousIdentityStorage(StorageLayoutAttr layout, MemRefType type) {
   return ContiguousIdentityStorage{m, n, elements, elements * 4};
 }
 
+std::optional<ContiguousIdentityStorage>
+matchContiguousIdentityStorage(StorageLayoutAttr layout, MemRefType type) {
+  // Compact wire format v1 has its own metadata and point-count bounds.
+  if (!layout || !layout.getAlignment() || layout.getAlignment().getInt() != 1)
+    return std::nullopt;
+  auto match = matchRowMajorF32Storage(layout, type);
+  return match && match->elements <= 65536 ? match : std::nullopt;
+}
+
 FailureOr<uint64_t> getStorageFootprintBytes(StorageLayoutAttr layout,
                                              MemRefType type) {
-  if (auto contiguous = matchContiguousIdentityStorage(layout, type))
+  if (auto contiguous = matchRowMajorF32Storage(layout, type))
     return contiguous->bytes;
   if (!type.hasStaticShape() || !type.getElementType().isIntOrFloat())
     return failure();
@@ -1680,9 +1704,22 @@ LogicalResult StorageLayoutAttr::verifyForType(ShapedType type,
   if (failed(verifyMapDomainMatchesType(getMap(), type, loc)))
     return failure();
 
-  if (matchContiguousIdentityStorage(*this, memref) ||
-      proveWideStridedStorageRange(*this, memref, 0, UINT64_MAX))
-    return success();
+  if (matchContiguousIdentityStorage(*this, memref)) return success();
+  if (hasWideStorageDomain(memref.getShape())) {
+    auto wide = proveWideStridedStorageRange(*this, memref, 0, UINT64_MAX);
+    if (wide.status == ProofStatus::Proven) return success();
+    if (wide.status == ProofStatus::Disproven) {
+      auto error = emitError(loc) << "wide storage layout disproven: " << wide.reason << "; coordinate [";
+      llvm::interleaveComma(wide.counterexample, error);
+      return error << "]";
+    }
+    // Other representations, e.g. bit-linear maps, still have their own
+    // injectivity checks below. An unsupported affine range has no remaining
+    // exhaustive fallback on this domain.
+    if (isa<AffineLayoutMapAttr>(getMap()))
+      return emitError(loc) << "wide storage proof unknown: " << wide.reason
+                            << "; dense interval enumeration limit is 65536";
+  }
 
   LayoutProof injective = checkInjectivity(getMap(), type.getShape());
   if (injective.status != ProofStatus::Proven)

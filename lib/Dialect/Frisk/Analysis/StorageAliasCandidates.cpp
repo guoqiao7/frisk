@@ -63,7 +63,7 @@ LogicalResult initializeStorageAliasCandidates(
               << *bytes << " bytes but underlying memref type provides "
               << capacity << " bytes (root accessible span)";
       }
-      auto proof = getStorageAliasFootprint(graph, var.id, candidate.value).proof;
+      auto proof = proveStorageCandidate(graph, var.id, candidate.value);
       if (proof.status != ProofStatus::Proven) {
         auto diagnostic = emitError(var.anchor->getLoc())
             << "invalid explicit storage binding for " << var.stableName << ": "
@@ -91,7 +91,7 @@ LogicalResult initializeStorageAliasCandidates(
                         Operation *source, StringRef rule) {
       if (visited[id]) return;
       auto &var = graph.getVariable(id);
-      if (getStorageAliasFootprint(graph, id, candidate.value).proof.status !=
+      if (proveStorageCandidate(graph, id, candidate.value).status !=
           ProofStatus::Proven) return;
       // Proposal rejection is silent; hard seeds are diagnosed above.
       ScopedDiagnosticHandler quiet(root->getContext(), [](Diagnostic &) { return success(); });

@@ -363,8 +363,15 @@ TEST_F(GemmLayoutIntegrationTest, ActualOnlyRejectsDescriptorPackingGridAndFragm
   EXPECT_EQ(actualOnly.builds, 0u);
 }
 
-TEST_F(GemmLayoutIntegrationTest, ProofBudgetFailureIsUnknown) {
+TEST_F(GemmLayoutIntegrationTest, LargeAccumulatorWithBoundedRegisterInput) {
   auto module = make(true, "f16", 1024, 128, 16);
+  ASSERT_TRUE(module);
+  ASSERT_TRUE(succeeded(infer(*module)));
+  EXPECT_TRUE(succeeded(verifyMaterializedLayouts(*module, target)));
+}
+
+TEST_F(GemmLayoutIntegrationTest, RegisterInputProofBudgetIsStillUnknown) {
+  auto module = make(true, "f16", 1024, 128, 128);
   ASSERT_TRUE(module);
   std::string message;
   ScopedDiagnosticHandler capture(&context, [&](Diagnostic &diagnostic) {

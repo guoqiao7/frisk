@@ -27,6 +27,10 @@ FailureOr<Attribute> projectLayoutCandidate(
     const LayoutConstraintGraph &graph, const LayoutConstraint &relation,
     LayoutVarID source, Attribute candidate, LayoutVarID target);
 std::string layoutCandidateKey(Attribute value);
+/// Certificate for one candidate. Consumers that need concrete addresses
+/// must request the footprint instead.
+LayoutProof proveStorageCandidate(const LayoutConstraintGraph &graph,
+                                  LayoutVarID id, Attribute candidate);
 const StorageAliasFootprint &getStorageAliasFootprint(
     const LayoutConstraintGraph &graph, LayoutVarID id, Attribute candidate);
 LayoutProof proveAliasLayoutRelation(const LayoutConstraintGraph &graph,

@@ -88,6 +88,10 @@ TEST_F(ReductionLayoutProofTest, FirstMiddleLastAxisProjectionIndependentCoordin
     ASSERT_TRUE(succeeded(dst));
     auto p=buildReductionLayoutProof(src,*dst,type({4,4,4}),type({4,4}),axis);
     ASSERT_EQ(p.proof.status,ProofStatus::Proven);
+    std::string scope;
+    auto symbolic = proveLinearReductionScope(src,*dst,type({4,4,4}),type({4,4}),axis,scope);
+    ASSERT_EQ(symbolic.status,ProofStatus::Proven) << symbolic.reason;
+    EXPECT_EQ(scope,p.scope);
     for (auto &fiber:p.fibers) {
       unsigned leaves=0;
       for (auto &n:fiber.nodes) if (n.logicalInput>=0) {
@@ -114,6 +118,10 @@ TEST_F(ReductionLayoutProofTest, RegisterWarpAndWarpGroupEdges) {
     ASSERT_TRUE(succeeded(projected));
     auto proof=buildReductionLayoutProof(wide,*projected,type({4,16}),type({4}),1);
     EXPECT_EQ(proof.proof.status,ProofStatus::Proven);
+    std::string scope;
+    ASSERT_EQ(proveLinearReductionScope(wide,*projected,type({4,16}),type({4}),1,scope).status,
+              ProofStatus::Proven);
+    EXPECT_EQ(scope,proof.scope);
     EXPECT_EQ(proof.scope,"cta_shared_tree");
   }
 }

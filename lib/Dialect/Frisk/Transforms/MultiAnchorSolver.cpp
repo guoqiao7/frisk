@@ -850,8 +850,19 @@ struct Model {
     auto add = [&](CandidateAssignment &assignment,
                    const z3::expr &flag) -> LogicalResult {
       auto units = accessUnits(graph, c, assignment, nativeVector);
-      if (failed(units))
-        return module.emitError("unsupported multi-anchor access cost");
+      if (failed(units)) {
+        auto &v = graph.getVariable(c.vars.front());
+        auto *source = graph.getProvenances()[c.provenance].source;
+        auto diagnostic = (source ? source : module.getOperation())->emitError(
+            "unsupported multi-anchor access cost for ") << v.shapedType;
+        if (auto t = dyn_cast<ShapedType>(v.shapedType);
+            t && t.hasStaticShape() && t.getRank()==2 &&
+            t.getDimSize(1)>0 && t.getDimSize(0)>65536/t.getDimSize(1))
+          diagnostic << "; dense address proof exceeds 65536 elements; symbolic pricing requires "
+                        "an ordinary scalar access to an aligned whole-root row-major f32 tile "
+                        "with unique ownership (32 lanes)";
+        return failure();
+      }
       if (*units)
         access = access + charge(flag, *units);
       return success();
