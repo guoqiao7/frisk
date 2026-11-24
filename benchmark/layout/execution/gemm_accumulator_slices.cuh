@@ -1,25 +1,45 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+// The native launch contract fixes the CTA at two 128-thread warpgroups.
+constexpr unsigned kCopyThreads = 256;
+
+template<bool CacheAll>
+__device__ __forceinline__ void copy16_async(unsigned char* dst, const uint16_t* src) {
+  unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+  if constexpr (CacheAll) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src) : "memory");
+  } else {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(shared), "l"(src) : "memory");
+  }
+}
+
 // One vector is eight adjacent f16 values. Coordinates and descriptor bits
 // refer to the complete, original K16 operand maps even for a partial copy.
 template<int M, int K, int Begin, int End>
 __device__ __forceinline__ void copy_a(unsigned char* sm, const uint16_t* a, int k) {
-  for (int v = threadIdx.x; v < (End-Begin)*2; v += blockDim.x) {
-    int i = Begin + v/2, j = (v%2)*8;
-    int off = i*16 + (j/8)*M*16;
-    *reinterpret_cast<uint4*>(sm+off) = *reinterpret_cast<const uint4*>(a+i*K+k+j);
+  constexpr unsigned count = (End-Begin)*2;
+  #pragma unroll
+  for (unsigned start = 0; start < count; start += kCopyThreads) {
+    unsigned v = start + threadIdx.x;
+    if (count % kCopyThreads != 0 && v >= count) continue;
+    unsigned i = Begin + v/2, j = (v%2)*8;
+    unsigned off = i*16 + (j/8)*M*16;
+    copy16_async<true>(sm + off, a + i*K + k + j);
   }
 }
 
 template<int N, int Begin, int End>
 __device__ __forceinline__ void copy_b(unsigned char* sm, const uint16_t* b, int k) {
   constexpr int vectors = (End-Begin)/8;
-  for (int v = threadIdx.x; v < 16*vectors; v += blockDim.x) {
-    int i = v/vectors, j = Begin + v%vectors*8;
-    int off = j%16*2 + j/16*256 + i%8*32 + i/8*N*16;
-    *reinterpret_cast<uint4*>(sm+(off^(((off>>7)&1)<<4))) =
-        *reinterpret_cast<const uint4*>(b+(k+i)*N+j);
+  constexpr unsigned count = 16*vectors;
+  #pragma unroll
+  for (unsigned start = 0; start < count; start += kCopyThreads) {
+    unsigned v = start + threadIdx.x;
+    if (count % kCopyThreads != 0 && v >= count) continue;
+    unsigned i = v/vectors, j = Begin + v%vectors*8;
+    unsigned off = j%16*2 + j/16*256 + i%8*32 + i/8*N*16;
+    copy16_async<false>(sm + (off ^ (((off >> 7) & 1) << 4)), b + (k+i)*N + j);
   }
 }
 
@@ -32,9 +52,18 @@ __device__ __forceinline__ void deliver_atom(const float* d, float* c, int row, 
                                              float* scratch, float* partials) {
   int tid = threadIdx.x, lane = tid%32, warp = tid/32;
   int r = row + (warp%4)*16 + lane/4;
-  #pragma unroll
-  for (int j=0; j<Atom/2; ++j)
-    c[(r+(j/2%2)*8)*N + col + (j/4)*8 + (lane%4)*2 + j%2] = d[j];
+  // Consecutive registers 2j and 2j+1 own adjacent columns of the same row.
+  if ((reinterpret_cast<uintptr_t>(c) & 7) == 0) {
+    #pragma unroll
+    for (int j = 0; j < Atom/2; j += 2) {
+      float* dst = c + (r + (j/2%2)*8)*N + col + (j/4)*8 + (lane%4)*2;
+      *reinterpret_cast<float2*>(dst) = make_float2(d[j], d[j+1]);
+    }
+  } else {
+    #pragma unroll
+    for (int j=0; j<Atom/2; ++j)
+      c[(r+(j/2%2)*8)*N + col + (j/4)*8 + (lane%4)*2 + j%2] = d[j];
+  }
   if constexpr (Reduce) {
     // Match the tree in the common replay: row bits 3,0,1,2,4,5,
     // followed by the row-repeat bits. Never reload the external C output.

@@ -342,7 +342,9 @@ def emit(plan, k, *, sliced=None, resident_atoms=None, wait_group=1, staged_k_ti
                     source.append(f"copy_a<{m},{k},{lo},{hi}>(sm+{step*pitch},A,kt+{step*16});")
                 for lo,hi in cols:
                     source.append(f"copy_b<{n},{lo},{hi}>(sm+{step*pitch+m*32},B,kt+{step*16});")
-            source += ["__syncthreads();", 'asm volatile("fence.proxy.async.shared::cta;" ::: "memory");']
+            # Every lane completes its own copies before the CTA publishes the slots.
+            source += ['asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");',
+                       "__syncthreads();", 'asm volatile("fence.proxy.async.shared::cta;" ::: "memory");']
             for i,(r,c,s,d) in enumerate(group):
                 source.append(f"{{int row={r}+wg*({s-r}), col={c}+wg*({d-c});")
                 args = []

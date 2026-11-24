@@ -37,6 +37,19 @@ class AccumulatorSlicesTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             emit(plan,207)
 
+    def test_async_copy_completion_precedes_cta_publication(self):
+        plan = read_layouts(self.ir)
+        for slots, wait in ((1, 1), (2, 1), (2, 2)):
+            source = emit(plan, 208, resident_atoms=1, staged_k_tiles=slots, wait_group=wait)
+            loops = source.split("for(int kt=")[1:]
+            self.assertTrue(loops)
+            for loop in loops:
+                copy_end = loop.rindex("copy_b<")
+                commit = loop.index("cp.async.commit_group; cp.async.wait_group 0;", copy_end)
+                publish = loop.index("__syncthreads();", commit)
+                fence = loop.index("fence.proxy.async.shared::cta;", publish)
+                self.assertRegex(loop[fence:], r"issue[12]\(acc\[")
+
     def test_all_widths_use_the_same_copy_footprint_as_the_emitter(self):
         plan = read_layouts(self.ir)
         rank = rank_residencies(plan, 208)
