@@ -116,14 +116,14 @@ class HybridDemand(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"compact source Register-only route"):
             backend.emit(packet)
 
-    def test_existing_explicit_cross_thread_domain_still_rejects_over_256(self):
+    def test_explicit_cross_thread_domain_rejects_over_512(self):
         # Probe the real ordinary-proof validator before any slot expansion.
-        # A proposed 512-register Shared boundary cannot enter the hybrid path.
+        # A proposed 1024-register Shared boundary cannot enter the hybrid path.
         values={v["id"]:dict(v) for v in self.normal["values"]}
         operation=self.cross[0];source=operation["operands"][0]
         values[source]=dict(values[source],distributed=dict(values[source]["distributed"]))
         values[source]["distributed"]["topology"]=list(values[source]["distributed"]["topology"])
-        values[source]["distributed"]["topology"][0]=512
+        values[source]["distributed"]["topology"][0]=1024
         with self.assertRaisesRegex(ValueError,"bounded domain"):
             validate(operation,values)
 
@@ -133,7 +133,7 @@ class HybridDemand(unittest.TestCase):
         emitter=backend.Emitter(self.packet);original=backend.validate_redistribution
         def widened(operation,values):
             plan=original(operation,values)
-            return dict(plan,source_registers=512) if plan["mode"]=="Shared" else plan
+            return dict(plan,source_registers=1024) if plan["mode"]=="Shared" else plan
         with patch.object(backend,"validate_redistribution",widened):
             with self.assertRaisesRegex(ValueError,"large cross-thread demand boundary"):
                 emitter.demand_program()

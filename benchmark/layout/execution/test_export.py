@@ -1,7 +1,8 @@
 """Checked exporter integration gate; failures must preserve existing output."""
-import json,subprocess,tempfile,unittest,sys
+import json,os,subprocess,tempfile,unittest,sys
 from pathlib import Path
-OPT=Path(sys.argv.pop(1)); ROOT=Path(__file__).resolve().parents[3]
+ROOT=Path(__file__).resolve().parents[3]
+OPT=Path(os.environ.get('FRISK_OPT', ROOT/'build-m6-release/bin/frisk-opt'))
 class ExportTests(unittest.TestCase):
  def export(self,source,out):
   return subprocess.run([str(OPT),str(source),'-frisk-export-execution=output='+str(out)],capture_output=True,text=True)
@@ -10,7 +11,8 @@ class ExportTests(unittest.TestCase):
    p=Path(t);selected=p/'selected.mlir';out=p/'execution.json'
    q=subprocess.run([str(OPT),str(ROOT/'test/Transforms/attention-layout-fixed-abi.mlir'),'--frisk-layout-pipeline','-o',str(selected)],capture_output=True,text=True);self.assertEqual(q.returncode,0,q.stderr)
    q=self.export(selected,out);self.assertEqual(q.returncode,0,q.stderr)
-   data=json.loads(out.read_text());self.assertEqual(data['schema_version'],1)
+   data=json.loads(out.read_text());self.assertEqual(data['schema_version'],2)
+   self.assertTrue(any('addresses_compact' in v.get('storage',{}) for v in data['values']))
    reductions=[o for o in data['operations'] if o['name']=='frisk.reduce_tensor'];self.assertEqual(len(reductions),2)
    for o in reductions:
     self.assertEqual(len(o['fibers']),64)
@@ -36,4 +38,7 @@ class ExportTests(unittest.TestCase):
    p=Path(t);selected=p/'selected.mlir';out=p/'missing'/'execution.json'
    q=subprocess.run([str(OPT),str(ROOT/'test/Transforms/attention-layout-fixed-abi.mlir'),'--frisk-layout-pipeline','-o',str(selected)],capture_output=True,text=True);self.assertEqual(q.returncode,0,q.stderr)
    q=self.export(selected,out);self.assertNotEqual(q.returncode,0);self.assertIn('stage=export-publication code=output-create',q.stderr);self.assertFalse(out.exists())
-if __name__=='__main__':unittest.main()
+if __name__=='__main__':
+ if len(sys.argv)>1 and not sys.argv[1].startswith('-'):
+  OPT=Path(sys.argv.pop(1))
+ unittest.main()
