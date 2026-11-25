@@ -8,7 +8,7 @@ import re
 import numpy as np
 from calibration_fixture import fixture as calibration_program, inputs
 from support_closure_fixture import (PROFILE_RELATIVE, PROFILE_SHA256, GPU_UUID,
-    numerical_cases, reference, offsets)
+    numerical_cases, reference, offsets, safety_input_identity)
 from support_closure_fixture import check_numerics as previous_check_numerics
 
 SEED = 20261102
@@ -91,15 +91,6 @@ def check_numerics(spec, got, expected):
         proxy=dict(spec, tail="mixed")
         return previous_check_numerics(proxy,got,expected)
     return previous_check_numerics(spec,got,expected)
-
-
-def safety_input_identity(spec, info, abi):
-    cases=[dict(name=name, inputs=[hashlib.sha256(x.tobytes()).hexdigest()
-                                  for x in (q,k,v)])
-           for name,q,k,v in numerical_cases(spec)[:1]]
-    return dict(spec=spec, cases=cases, offsets=offsets(spec,info["copy_path"]),
-        physical_abi=abi, repeats=1, guard_byte=165, threads=128, grid=[1,1,1],
-        default_stream=True)
 
 
 def protocol():

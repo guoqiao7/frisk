@@ -10,3 +10,5 @@ AGENTS.md
 GEMM_LAYOUT_PLAN.md
 .claude/
 .worktrees/
+/build-m6-release/
+/benchmark/layout/execution/cache/

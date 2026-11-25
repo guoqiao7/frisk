@@ -62,7 +62,7 @@ The core of the ongoing work. `LayoutAttr` encodes `(inputShape, forwardIndex, f
 
 - `test/python/` — Python integration tests using the pybind11 bindings (`bind_test.py` builds a full kernel IR, `map_expr_test.py` exercises affine map manipulation).
 - `test_pass/` — Native C++ test executables (`attr_test.cpp` validates attribute construction/parsing and GEMM layout inference across targets; `reduce_layout_test.cpp` validates reduce layout inference with multiple split patterns).
-- `exp/layout/` — Experimental tools (`gemm_layout_tool.cpp` for standalone layout analysis, `analyze_bank_conflicts.py`).
+- `exp/layout/` — Experimental tools (`frisk_layout_tool` for canonical layout and MMA contract inspection).
 
 ## Coding Conventions
 

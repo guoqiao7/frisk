@@ -53,7 +53,29 @@ export PYTHONPATH=~/install/path/frisk/python:$PYTHONPATH
 
 Here's a simple example demonstrating how to create a GEMM IR expression:
 ```bash
-cd ~/install/path/frisk/test
-python bind_test.py
+cd /path/to/frisk
+python test/python/bind_test.py
 ```
 This will generate and execute a GEMM kernel using the Frisk compiler.
+
+
+## Layout inference and native execution
+
+Use `frisk-opt` to normalize and solve layout IR. The SM90 multi-anchor path is
+`--frisk-multi-anchor-layout-pipeline`. `--frisk-optimize-layout-conversions`
+materializes consumer deliveries and `--frisk-export-execution` exports the packet.
+The MLIR passes live in `lib/Dialect/Frisk/Transforms`. Target-specific legality
+and cost models live in `lib/Dialect/Frisk/Target/SM90`.
+
+The H100 research backend is in `benchmark/layout/execution`. Use
+`backend.compile_execution` for a solved packet or a native dense GEMM contract.
+For attention, `attention_pipeline_selection` exposes static D64 MHA and grouped
+selection and measured tuning. They share the physical plans in
+`attention_pipeline_candidates`. Use `native_fa3_execution.compile_static_fa3`
+for imported FA3 schedules. Its CLI also replays explicitly named event orders.
+A solved layout fixes the execution domain and transport before an order is emitted.
+
+For static SM90 layout inspection, build `frisk_layout_tool` as described in
+[the layout tool guide](exp/layout/README.md). Compiler regressions live in
+`test/Transforms` and `unittests`. The Python backend and scoring tests live
+alongside their implementations.

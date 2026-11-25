@@ -345,17 +345,34 @@ def rank_fa3_writebacks(transports, rows, keys, causal, budget, *, heads, cta_di
     return dict(budget=budget,selected=[key for key,_,_ in chosen],writers=receipts), chosen
 
 
-def compile_budgeted_fa3(data, *, budget=1, directory=None, tilelang_root=None, fa3_writeback="tma", cta_dispatch="auto"):
-    """Apply one shared compilation budget across all requested writers and event orders."""
-    from backend import compile_execution
-    rows, heads, causal = _geometry(data)
-    tile = _query_tile(packet_contract(data))
-    writers = eligible_writebacks(rows, tile, fa3_writeback)
+def _writer_transports(data, rows, tile, requested):
+    writers = eligible_writebacks(rows, tile, requested)
     if not writers:
         raise ValueError("partial FA3 output tiles require the guarded register writer")
-    transports = {w:_prepare_transport(data,w) for w in writers}
+    transports = {writer: _prepare_transport(data, writer) for writer in writers}
     if any(t.facts["moves"]["q"]["box"][1] != tile for t in transports.values()):
         raise ValueError("FA3 Q transport extent disagrees with the solved query tile")
+    return transports
+
+
+def _emit_event_order(data, directory, tilelang_root, writer, transport, order, dispatch,
+                      source_packet=None):
+    from backend import compile_execution
+    image, info = compile_execution(data, output_directory=directory, tilelang_root=tilelang_root,
+                                    event_schedule=order, fa3_writeback=writer,
+                                    fa3_transport=transport, cta_dispatch=dispatch)
+    if source_packet is not None:
+        info["source_packet"] = str(source_packet)
+    if directory is not None:
+        (directory / "metadata.json").write_text(json.dumps(info, indent=2))
+    return image, info
+
+
+def compile_budgeted_fa3(data, *, budget=1, directory=None, tilelang_root=None, fa3_writeback="tma", cta_dispatch="auto"):
+    """Apply one shared compilation budget across all requested writers and event orders."""
+    rows, heads, causal = _geometry(data)
+    tile = _query_tile(packet_contract(data))
+    transports = _writer_transports(data, rows, tile, fa3_writeback)
     keys = _kv_rows(data)
     dispatch = rank_cta_dispatch(rows,keys,heads,causal,tile,mode=cta_dispatch)
     receipt, chosen = rank_fa3_writebacks(transports,rows,keys,causal,budget,heads=heads,cta_dispatch=dispatch["selected"])
@@ -364,12 +381,8 @@ def compile_budgeted_fa3(data, *, budget=1, directory=None, tilelang_root=None, 
     images = {}
     for key, writer, name in chosen:
         dest = root / key if root is not None and budget > 1 else root
-        image, info = compile_execution(data, output_directory=dest, tilelang_root=tilelang_root,
-                                        event_schedule=name, fa3_writeback=writer, fa3_transport=transports[writer],
-                                        cta_dispatch=dispatch["selected"])
-        images[key] = image, info
-        if dest is not None:
-            (dest/"metadata.json").write_text(json.dumps(info,indent=2))
+        images[key] = _emit_event_order(data, dest, tilelang_root, writer, transports[writer],
+                                        name, dispatch["selected"])
     receipt["layout_proofs"] = sorted({info["execution_audit"]["layout_sha256"] for _,info in images.values()})
     if len(receipt["layout_proofs"]) != 1:
         raise ValueError("schedule candidates disagree on their shared solved layout")
@@ -510,31 +523,26 @@ if __name__=='__main__':
     if args.replay_imported:
         compile_overlap_fa3(args.plan,args.opt,args.output,tilelang_root=args.tilelang_root,fa3_writeback=args.writeback,cta_dispatch=args.cta_dispatch,**options)
     elif args.event_schedules:
-        from backend import compile_execution
         if len(set(args.event_schedules)) != len(args.event_schedules):
             parser.error('duplicate event schedules')
         directory=Path(args.output).resolve()
         data=solve_overlap_fa3(args.plan,args.opt,directory,**options)
         rows, heads, causal = _geometry(data)
-        writers = eligible_writebacks(rows, query_tile, args.writeback)
-        if not writers:
-            parser.error("partial FA3 output tiles require the guarded register writer")
+        transports = _writer_transports(data, rows, query_tile, args.writeback)
+        direction = rank_cta_dispatch(rows, _kv_rows(data), heads, causal, query_tile,
+                                      mode=args.cta_dispatch or "forward")["selected"]
         receipts={}
-        for writer in writers:
-            transport=_prepare_transport(data,writer)
+        for writer, transport in transports.items():
             facts=transport.facts
             receipt=dict(transport_sha256=transport.fingerprint)
             # Explicit replay can also emit legal plans outside the profiled geometry.
             if rows % query_tile == 0 and all(facts["moves"][r]["buffer"]["versions"]==2 for r in ("k","v")):
-                direction=rank_cta_dispatch(rows,_kv_rows(data),heads,causal,query_tile,mode=args.cta_dispatch or "forward")["selected"]
                 receipt=rank_transport_events(transport,rows,_kv_rows(data),causal,1,heads=heads,cta_dispatch=direction)
             receipt["replayed_orders"]=list(args.event_schedules)
             receipts[writer]=receipt
             for name in args.event_schedules:
-                dest=directory/(writer+"-"+name if len(writers)>1 else name)
-                _,info=compile_execution(data,tilelang_root=args.tilelang_root,output_directory=dest,
-                                         event_schedule=name,fa3_writeback=writer,fa3_transport=transport,cta_dispatch=args.cta_dispatch)
-                info['source_packet']=str(directory/'execution.json')
-                (dest/'metadata.json').write_text(json.dumps(info,indent=2))
-        report=receipts[writers[0]] if len(writers)==1 else dict(writers=receipts)
+                dest = directory / (writer + "-" + name if len(transports) > 1 else name)
+                _emit_event_order(data, dest, args.tilelang_root, writer, transport, name, direction,
+                                  directory / "execution.json")
+        report = next(iter(receipts.values())) if len(receipts) == 1 else dict(writers=receipts)
         (directory/"schedule.json").write_text(json.dumps(report,indent=2))
