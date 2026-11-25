@@ -79,3 +79,7 @@ For static SM90 layout inspection, build `frisk_layout_tool` as described in
 [the layout tool guide](exp/layout/README.md). Compiler regressions live in
 `test/Transforms` and `unittests`. The Python backend and scoring tests live
 alongside their implementations.
+
+The [H100 paper regression](benchmark/layout/paper/README.md) contains the
+fixed-pipeline comparisons, native kernel measurements, certified anchor
+experiments, raw paired timings, and hardware replay instructions.

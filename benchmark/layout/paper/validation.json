@@ -1,0 +1,209 @@
+{
+  "provenance": {
+    "source": "4af412a77b46dd53b0aad6c0257122b9dac7aff3",
+    "tests": "9093ba6ac6ccc46a02b1b4ceeaa29c76daf6cd3d",
+    "baseline": "58d16b3425c3aa4133183a8b9ecf5b2870fc4f88",
+    "frisk_opt": "4d9ca9fbf9bb346cd21cd3e2069c87233d833fb29812bc10a39b660e23d3f3f2",
+    "gpu": "0, GPU-7bafb1de-da7b-3bf6-e8cd-2369e0c92767, NVIDIA H100 PCIe, 580.178.04, 81559 MiB",
+    "toolkit": [
+      "Cuda compilation tools, release 12.8, V12.8.61",
+      "Build cuda_12.8.r12.8/compiler.35404655_0"
+    ],
+    "packages": {
+      "torch": "2.8.0",
+      "triton": "3.4.0",
+      "tilelang": "0.1.7.post3+cuda.gitf8083581",
+      "numpy": "2.2.6"
+    },
+    "current_source_checkouts": {
+      "/home/baopeihua/pipeline/triton": "cd2e01c6686d6503802e6cdfac56d5a5dfdb27a1",
+      "/home/baopeihua/tilelang": "f8083581f13370455f9b4618fb1ae99fb1fb5480"
+    },
+    "external_images": "Historical peer builds are identified by the maps, receipts and hashes in the replay recipes. Local checkout revisions describe the machine at regression time."
+  },
+  "lit": 109,
+  "cpp_layout": 710,
+  "cpp_selection": 65,
+  "geometry_tool": "SM90 layout tool: SS, RS, observable canonical output and target rejection passed",
+  "c2": {
+    "groups": 24,
+    "identity_exceptions": [],
+    "images": 54
+  },
+  "python_current": {
+    "ran": 1147,
+    "failures": [
+      "ERROR: test_actual_approved_projection (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "ERROR: test_complete_recursive_dependency_chain (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "ERROR: test_no_output_overwrite_or_outside_new_stage (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "ERROR: test_pure_instance_offset_memo_projection (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "ERROR: test_real_original_profiles_load_without_rewriting (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "ERROR: test_receipt_rejects_arbitrary_resigning (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "ERROR: test_source_changes_after_receipt_even_comment_rejected (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "ERROR: test_training_dependency_mutation_rejected (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "ERROR: test_view_base_hash_mutation_rejected (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "FAIL: test_default_and_observed_emit_equal_preimage_bytes_and_config (test_demand_observer.DemandObserverTest)",
+      "FAIL: test_existing_conversion_implementation_is_unchanged (test_hybrid_demand.HybridDemand)",
+      "FAIL: test_network_anchor_seal_mutation_rejected (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "FAIL: test_network_helper_dependency_mutation_rejected (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "FAIL: test_redistribution_shared_scratch_mutation_rejected (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "FAIL: test_reviewed_network_emitter_mutation_rejected (test_compatible_native_profiles.CompatibleNativeProfilesTest)"
+    ]
+  },
+  "python_before_cleanup": {
+    "ran": 51,
+    "failures": [
+      "ERROR: test_actual_approved_projection (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "ERROR: test_complete_recursive_dependency_chain (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "ERROR: test_hybrid_guard_refuses_future_large_cross_thread_plan (test_hybrid_demand.HybridDemand)",
+      "ERROR: test_no_output_overwrite_or_outside_new_stage (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "ERROR: test_pure_instance_offset_memo_projection (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "ERROR: test_real_original_profiles_load_without_rewriting (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "ERROR: test_receipt_rejects_arbitrary_resigning (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "ERROR: test_source_changes_after_receipt_even_comment_rejected (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "ERROR: test_training_dependency_mutation_rejected (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "ERROR: test_view_base_hash_mutation_rejected (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "FAIL: test_default_and_observed_emit_equal_preimage_bytes_and_config (test_demand_observer.DemandObserverTest)",
+      "FAIL: test_existing_conversion_implementation_is_unchanged (test_hybrid_demand.HybridDemand)",
+      "FAIL: test_existing_explicit_cross_thread_domain_still_rejects_over_256 (test_hybrid_demand.HybridDemand)",
+      "FAIL: test_network_anchor_seal_mutation_rejected (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "FAIL: test_network_helper_dependency_mutation_rejected (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "FAIL: test_redistribution_shared_scratch_mutation_rejected (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "FAIL: test_reviewed_network_emitter_mutation_rejected (test_compatible_native_profiles.CompatibleNativeProfilesTest)",
+      "FAIL: test_selected_maps_and_reduction_proof (test_export.ExportTests)"
+    ]
+  },
+  "python_resolved": [
+    "ERROR: test_hybrid_guard_refuses_future_large_cross_thread_plan (test_hybrid_demand.HybridDemand)",
+    "FAIL: test_existing_explicit_cross_thread_domain_still_rejects_over_256 (test_hybrid_demand.HybridDemand)",
+    "FAIL: test_selected_maps_and_reduction_proof (test_export.ExportTests)"
+  ],
+  "fa_partial_tail": "PASS same_tile full-tile phase and boundary cost extrapolation ['same_tile', 'late_k'] 0.0002601742744445801",
+  "physical": {
+    "gqa": {
+      "static": "q64-kv128-k-tma-post-qk-v-tma-sw128",
+      "static_compiles": 1,
+      "cubin_sha256": "c4f8e868f3a03039b1c72e03b92f0edff1188857cc6c4dd693a2564e17aeb9cd",
+      "physical_contract_sha256": "0e241050e2f5ed2c95d3c7bb8f48b212687defaaf5e066bc4c84b80b88c568d8",
+      "bitwise_equal": true,
+      "static_error": 5.326420068740845e-05
+    },
+    "d64-causal": {
+      "static": "q64-kv64-k-tma-v-tma-sw128",
+      "static_compiles": 1,
+      "cubin_sha256": "870cf7d1ff20171bad383f8faa3f9fe24b8e702dd0b683b84f0ada05e05b1c8e",
+      "physical_contract_sha256": "5f1443365725ebe6a6281366c4d3bcc5300b3fb616f9c0fafedf67b0c56a0c82",
+      "bitwise_equal": true,
+      "static_error": 0.0003560781478881836
+    }
+  },
+  "retired": {
+    "removed": [
+      "frisk-gemm-reorder-example-yGUPwW",
+      "frisk-gemm-one-side-SJKkmI",
+      "frisk-wgmma-fa-single-195mTO",
+      "frisk-physical-plans-VcHLUH/n920",
+      "frisk-physical-plans-VcHLUH/n920-final",
+      "frisk-physical-plans-VcHLUH/runner-path-log"
+    ],
+    "regular_files": 753,
+    "bytes": 543657930,
+    "archive": "/data0/baopeihua/frisk-withdrawn-58d16b3/experiments.tar.gz",
+    "sha256": "f8df77489407c6890ab187e380de5f46267ed6efb8982be661101b91a9c7cc5a",
+    "verified": "restored and rehashed with modes and symlink targets",
+    "source": "58d16b3"
+  },
+  "ablation_profiled_kernels": 30,
+  "open_residency_delivery": [
+    {
+      "graph": "row",
+      "grid": 32,
+      "anchor": "int",
+      "contract": [
+        256,
+        1,
+        2
+      ],
+      "delivery": [
+        "direct",
+        "direct"
+      ],
+      "matches_fixed": true
+    },
+    {
+      "graph": "row",
+      "grid": 132,
+      "anchor": "col",
+      "contract": [
+        256,
+        1,
+        2
+      ],
+      "delivery": [
+        "direct",
+        "direct"
+      ],
+      "matches_fixed": true
+    },
+    {
+      "graph": "fan",
+      "grid": 32,
+      "anchor": "int",
+      "contract": [
+        256,
+        1,
+        2
+      ],
+      "delivery": [
+        "direct",
+        "direct"
+      ],
+      "matches_fixed": true
+    },
+    {
+      "graph": "fan",
+      "grid": 132,
+      "anchor": "col",
+      "contract": [
+        256,
+        1,
+        2
+      ],
+      "delivery": [
+        "direct",
+        "direct"
+      ],
+      "matches_fixed": true
+    },
+    {
+      "graph": "matrix",
+      "grid": 32,
+      "anchor": "int",
+      "contract": [
+        256,
+        1,
+        2
+      ],
+      "delivery": [
+        "direct",
+        "direct"
+      ],
+      "matches_fixed": true
+    },
+    {
+      "graph": "matrix",
+      "grid": 132,
+      "anchor": "int",
+      "contract": [
+        256,
+        1,
+        2
+      ],
+      "delivery": [
+        "direct",
+        "direct"
+      ],
+      "matches_fixed": true
+    }
+  ]
+}

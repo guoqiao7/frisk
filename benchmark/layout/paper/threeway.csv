@@ -1,0 +1,103 @@
+study,op,shape,grid,policy,frisk_us,frisk_screen_pick_us,triton_us,tilelang_us,paired_pct,ci_low_pct,ci_high_pct,blocks,record
+layout,GEMM+column max,128x256x128,64,,25.9787,25.9787,26.272,24.1547,7.609,7.501,7.67,33,sweep/data/fusion-gem-fan_m128n256k128.json
+layout,GEMM+column max,128x256x304,64,,38.288,38.288,38.528,35.84,6.866,6.726,6.95,33,sweep/data/fusion-gem-fan_m128n256k304.json
+layout,GEMM+column max,128x512x160,64,,36.1813,36.1813,37.5147,60.688,-3.797,-4.514,-3.519,33,sweep/data/fusion-gem-fan_m128n512k160.json
+layout,GEMM+column max,128x512x240,64,,52.4907,52.4907,52.1813,76.6827,-0.583,-0.846,0.398,33,sweep/data/fusion-gem-fan_m128n512k240.json
+layout,GEMM+column max,128x512x272,64,,59.2907,59.2907,59.52,83.8667,-0.286,-0.493,-0.116,33,sweep/data/fusion-gem-fan_m128n512k272.json
+layout,GEMM+column max,128x512x384,64,,77.4133,77.4133,77.7867,102.5973,-0.488,-0.569,-0.398,33,sweep/data/fusion-gem-fan_m128n512k384.json
+layout,GEMM+column max,128x512x64,64,,26.496,26.496,28.9813,44.608,-8.627,-9.059,-8.06,33,sweep/data/fusion-gem-fan_m128n512k64.json
+layout,GEMM+column max,128x512x80,64,,27.8827,27.8827,30.032,47.344,-6.966,-7.434,-6.647,33,sweep/data/fusion-gem-fan_m128n512k80.json
+layout,GEMM+column max,256x256x320,64,,74.3467,74.3467,72.1493,88.032,2.74,2.573,4.263,33,sweep/data/fusion-gem-fan_m256n256k320.json
+layout,GEMM+column max,256x256x96,64,,41.0667,39.7813,41.0613,49.1093,0.117,-0.194,0.673,33,sweep/data/fusion-gem-fan_m256n256k96.json
+layout,ReGLU+column max,128x128x112,64,,14.7947,14.7947,14.7147,16.3093,0.508,0.289,0.652,33,sweep/data/fusion-reglu-fan_m128n128k112.json
+layout,ReGLU+column max,128x256x112,64,,35.5627,35.5627,35.2907,39.9147,0.74,0.634,0.817,33,sweep/data/fusion-reglu-fan_m128n256k112.json
+layout,ReGLU+column max,128x512x112,64,,179.3973,179.3973,183.8293,190.4587,-2.593,-2.732,-2.501,33,sweep/data/fusion-reglu-fan_m128n512k112.json
+layout,ReGLU+row max,128x128x112,64,,12.224,12.224,12.3307,15.6747,-0.779,-1.079,-0.778,33,sweep/data/fusion-reglu-row_m128n128k112.json
+layout,ReGLU+row max,128x256x112,64,,29.3013,29.3013,29.312,36.8533,-0.055,-0.182,0.2,33,sweep/data/fusion-reglu-row_m128n256k112.json
+layout,ReGLU+row max,128x512x112,64,,170.4213,170.4213,170.1707,173.7867,0.129,-0.06,0.264,33,sweep/data/fusion-reglu-row_m128n512k112.json
+native GEMM,GEMM+column sum,128x512x240,132,,84.1333,84.1333,95.872,84.9333,-0.873,-1.14,-0.745,33,sweep/data/gem-fan_m128n512k240-g132.json
+native GEMM,GEMM+column sum,128x512x240,32,,30.1227,30.1227,30.5067,32.048,-1.241,-1.346,-1.172,33,sweep/data/gem-fan_m128n512k240-g32.json
+native GEMM,GEMM,128x512x240,132,,76.816,76.816,79.2213,78.4587,-2.134,-2.197,-1.875,33,sweep/data/gem-matrix_m128n512k240-g132.json
+native GEMM,GEMM,128x512x240,32,,25.4773,25.4773,25.6693,25.4613,0.105,-0.063,0.168,33,sweep/data/gem-matrix_m128n512k240-g32.json
+native FA,GQA full D64,N920 H15/1,,,14.8427,14.8427,16.496,22.8427,-9.776,-10.668,-9.053,33,sweep/data/fa-gqa64-920-15-1-0.json
+native FA,MHA causal D128,N1025 H7/7,,,18.5227,18.5227,25.9787,20.24,-8.59,-8.809,-8.417,33,sweep/data/fa-mha128-1025-7-7-1.json
+native FA,MHA causal D128,N896 H18/18,,,22.4427,22.2933,22.864,22.832,-1.659,-1.939,-1.328,33,sweep/data/fa-mha128-896-18-18-1.json
+native FA,MHA full D64,N256 H2/2,,,5.392,5.392,5.3067,5.2587,2.548,2.323,2.843,33,sweep/data/fa-mha64-256-2-2-0.json
+native FA,MHA causal D64,N256 H2/2,,,5.5627,5.5627,5.9733,5.44,2.353,2.255,2.458,33,sweep/data/fa-mha64-256-2-2-1.json
+layout,Transpose,16x32,8192,compatible,9.0827,12.1493,12.1493,17.9413,-24.934,-25.833,-24.67,33,sweep/data/point-16x32-RC-copy.json
+layout,Copy,16x32,8192,scalar,8.8373,8.8427,8.8427,8.8427,0.0,-0.661,0.242,33,sweep/data/point-16x32-RR-copy.json
+layout,"Add, two stores",16x32,8192,scalar,29.952,29.3707,29.3707,31.7333,1.912,1.632,2.612,33,sweep/data/point-16x32-RRC-add.json
+layout,Transpose,16x64,4096,compatible,9.6587,11.0347,11.0347,40.8747,-12.819,-13.234,-12.27,33,sweep/data/point-16x64-RC-copy.json
+layout,Copy,16x64,4096,scalar,8.9867,8.7467,8.7467,8.7467,2.732,1.737,3.193,33,sweep/data/point-16x64-RR-copy.json
+layout,"Add, two stores",16x64,4096,native,26.5707,26.5707,26.5707,47.8187,0.0,0.0,0.0,33,sweep/data/point-16x64-RRC-add.json
+layout,Transpose,32x32,4096,compatible,10.3093,12.7413,12.7413,21.2,-19.405,-19.658,-18.808,33,sweep/data/point-32x32-RC-copy.json
+layout,Copy,32x32,4096,scalar,8.8533,8.6667,8.6667,8.6667,2.609,0.919,3.202,33,sweep/data/point-32x32-RR-copy.json
+layout,"Add, two stores",32x32,4096,native,27.1573,27.1573,27.1573,33.744,0.0,0.0,0.0,33,sweep/data/point-32x32-RRC-add.json
+layout,"Add, two stores",32x64,2048,native,26.8107,26.8107,26.8107,55.7867,0.0,0.0,0.0,33,sweep/data/point-32x64-RRC-add.json
+layout,Transpose,64x16,4096,compatible,10.208,11.184,17.9787,10.208,0.0,0.0,0.0,33,sweep/data/point-64x16-RC-copy.json
+layout,Copy,64x16,4096,scalar,8.9653,8.6347,8.6347,8.6347,3.358,2.295,4.88,33,sweep/data/point-64x16-RR-copy.json
+layout,"Add, two stores",64x16,4096,scalar,28.32,28.32,28.8373,28.8587,-1.726,-2.821,-0.97,33,sweep/data/point-64x16-RRC-add.json
+layout,LayerNorm,128x256,256,incumbent,52.768,52.768,64.16,223.7227,-17.586,-17.895,-17.157,33,sweep/data/norm-128x256-2-g256.json
+layout,LayerNorm,128x256,32,incumbent,12.5067,12.5067,13.1467,44.2613,-4.754,-5.325,-3.692,33,sweep/data/norm-128x256-2-g32.json
+layout,RMSNorm,16x256,2048,striped-4,37.824,37.824,38.848,37.824,0.0,0.0,0.0,33,sweep/data/norm-16x256-1-g2048.json
+layout,RMSNorm,16x256,256,incumbent,3.8667,3.8667,4.7893,4.208,-8.112,-8.46,-7.771,33,sweep/data/norm-16x256-1-g256.json
+layout,Softmax,16x512,1024,incumbent,38.5067,38.5067,40.32,39.8293,-3.435,-3.771,-2.944,33,sweep/data/norm-16x512-0-g1024.json
+layout,Softmax,16x512,128,incumbent,5.2587,5.2587,6.8107,6.6507,-21.006,-21.091,-20.787,33,sweep/data/norm-16x512-0-g128.json
+layout,RMSNorm,64x1024,128,striped-1,87.024,87.024,87.024,139.4773,0.0,0.0,0.0,33,sweep/data/norm-64x1024-1-g128.json
+layout,RMSNorm,64x1024,16,striped-1,20.2613,20.2613,20.2613,44.016,0.0,0.0,0.0,33,sweep/data/norm-64x1024-1-g16.json
+layout,LayerNorm,64x128,1024,striped-4,37.568,37.568,48.9333,37.568,0.0,0.0,0.0,33,sweep/data/norm-64x128-2-g1024.json
+layout,LayerNorm,64x128,128,striped-4,4.5333,4.5333,10.4,4.5333,0.0,0.0,0.0,33,sweep/data/norm-64x128-2-g128.json
+fixed FA replay,MHA full D64,N127 H8/8,8,1,21.96,21.96,21.912,27.552,-0.11,-0.366,0.036,48,"fa-fixed/fixed/time-127-0-{0,1}.json"
+fixed FA replay,MHA full D64,N127 H8/8,8,4,21.96,21.96,21.968,26.684,0.0,-0.073,0.147,48,"fa-fixed/fixed/time-127-0-{0,1}.json"
+fixed FA replay,MHA full D64,N127 H8/8,8,prefetch-v,22.016,22.016,22.016,27.46,-0.109,-0.182,0.0,48,"fa-fixed/fixed/time-127-0-{0,1}.json"
+fixed FA replay,MHA causal D64,N127 H8/8,8,1,22.696,22.696,22.8,27.92,-0.386,-0.421,-0.212,48,"fa-fixed/fixed/time-127-1-{0,1}.json"
+fixed FA replay,MHA causal D64,N127 H8/8,8,4,22.108,22.108,22.0,26.864,0.363,0.219,0.402,48,"fa-fixed/fixed/time-127-1-{0,1}.json"
+fixed FA replay,MHA causal D64,N127 H8/8,8,prefetch-v,22.732,22.732,22.792,27.932,-0.193,-0.281,-0.035,48,"fa-fixed/fixed/time-127-1-{0,1}.json"
+fixed FA replay,MHA full D64,N256 H8/8,8,1,40.804,40.804,41.116,59.796,0.079,0.02,0.116,48,"fa-fixed/fixed/time-256-0-{0,1}.json"
+fixed FA replay,MHA full D64,N256 H8/8,8,4,40.72,40.72,40.724,58.328,0.0,-0.058,0.029,48,"fa-fixed/fixed/time-256-0-{0,1}.json"
+fixed FA replay,MHA full D64,N256 H8/8,8,prefetch-v,40.788,40.788,40.724,59.968,0.168,0.106,0.203,48,"fa-fixed/fixed/time-256-0-{0,1}.json"
+fixed FA replay,MHA causal D64,N256 H8/8,8,1,41.456,41.456,41.392,58.744,0.222,0.155,0.251,48,"fa-fixed/fixed/time-256-1-{0,1}.json"
+fixed FA replay,MHA causal D64,N256 H8/8,8,4,39.568,39.568,39.656,57.056,-0.202,-0.262,-0.131,48,"fa-fixed/fixed/time-256-1-{0,1}.json"
+fixed FA replay,MHA causal D64,N256 H8/8,8,prefetch-v,41.212,41.212,41.104,59.088,0.195,0.127,0.243,48,"fa-fixed/fixed/time-256-1-{0,1}.json"
+fixed FA replay,MHA full D64,N511 H8/8,16,1,75.556,75.556,75.576,110.952,-0.016,-0.116,0.106,48,"fa-fixed/fixed/time-511-0-{0,1}.json"
+fixed FA replay,MHA full D64,N511 H8/8,16,4,74.328,74.328,74.328,107.792,0.011,-0.081,0.129,48,"fa-fixed/fixed/time-511-0-{0,1}.json"
+fixed FA replay,MHA full D64,N511 H8/8,16,prefetch-v,75.592,75.592,75.528,110.616,0.074,-0.09,0.127,48,"fa-fixed/fixed/time-511-0-{0,1}.json"
+fixed FA replay,MHA causal D64,N511 H8/8,16,1,77.904,77.904,77.96,112.528,-0.077,-0.123,-0.041,48,"fa-fixed/fixed/time-511-1-{0,1}.json"
+fixed FA replay,MHA causal D64,N511 H8/8,16,4,74.608,74.608,74.548,110.08,0.07,-0.032,0.14,48,"fa-fixed/fixed/time-511-1-{0,1}.json"
+fixed FA replay,MHA causal D64,N511 H8/8,16,prefetch-v,77.876,77.876,77.96,111.796,-0.118,-0.195,-0.051,48,"fa-fixed/fixed/time-511-1-{0,1}.json"
+fixed FA replay,MHA full D64,N640 H8/8,24,1,90.5,90.5,90.5,139.84,-0.027,-0.044,0.057,48,"fa-fixed/fixed/time-640-0-{0,1}.json"
+fixed FA replay,MHA full D64,N640 H8/8,24,4,88.124,88.124,88.116,134.456,-0.014,-0.154,0.041,48,"fa-fixed/fixed/time-640-0-{0,1}.json"
+fixed FA replay,MHA full D64,N640 H8/8,24,prefetch-v,91.1,91.1,91.208,136.672,-0.026,-0.101,0.071,48,"fa-fixed/fixed/time-640-0-{0,1}.json"
+fixed FA replay,MHA causal D64,N640 H8/8,24,1,92.468,92.468,92.468,140.988,0.004,-0.056,0.095,48,"fa-fixed/fixed/time-640-1-{0,1}.json"
+fixed FA replay,MHA causal D64,N640 H8/8,24,4,87.84,87.84,87.908,136.432,-0.064,-0.164,0.068,48,"fa-fixed/fixed/time-640-1-{0,1}.json"
+fixed FA replay,MHA causal D64,N640 H8/8,24,prefetch-v,92.772,92.772,93.544,140.252,-0.817,-0.919,-0.728,48,"fa-fixed/fixed/time-640-1-{0,1}.json"
+fixed FA replay,MHA full D64,N1025 H8/8,40,1,144.712,144.712,144.792,231.596,-0.061,-0.099,0.008,48,"fa-fixed/fixed/time-1025-0-{0,1}.json"
+fixed FA replay,MHA full D64,N1025 H8/8,40,4,141.328,141.328,141.256,221.472,0.057,0.006,0.096,48,"fa-fixed/fixed/time-1025-0-{0,1}.json"
+fixed FA replay,MHA full D64,N1025 H8/8,40,prefetch-v,145.544,145.544,145.672,226.888,-0.09,-0.148,-0.011,48,"fa-fixed/fixed/time-1025-0-{0,1}.json"
+fixed FA replay,MHA causal D64,N1025 H8/8,40,1,149.064,149.064,149.0,233.12,0.013,-0.032,0.059,48,"fa-fixed/fixed/time-1025-1-{0,1}.json"
+fixed FA replay,MHA causal D64,N1025 H8/8,40,4,142.34,142.34,142.436,225.612,0.003,-0.073,0.09,48,"fa-fixed/fixed/time-1025-1-{0,1}.json"
+fixed FA replay,MHA causal D64,N1025 H8/8,40,prefetch-v,149.568,149.568,150.504,233.392,-0.636,-0.733,-0.566,48,"fa-fixed/fixed/time-1025-1-{0,1}.json"
+fixed FA replay,MHA full D64,N1536 H8/8,48,1,208.796,208.796,208.62,326.832,0.098,0.0,0.208,48,"fa-fixed/fixed/time-1536-0-{0,1}.json"
+fixed FA replay,MHA full D64,N1536 H8/8,48,4,203.7,203.7,203.804,313.404,-0.006,-0.133,0.085,48,"fa-fixed/fixed/time-1536-0-{0,1}.json"
+fixed FA replay,MHA full D64,N1536 H8/8,48,prefetch-v,210.172,210.172,210.088,316.56,-0.004,-0.11,0.143,48,"fa-fixed/fixed/time-1536-0-{0,1}.json"
+fixed FA replay,MHA causal D64,N1536 H8/8,48,1,215.24,215.24,215.008,328.14,0.061,-0.067,0.132,48,"fa-fixed/fixed/time-1536-1-{0,1}.json"
+fixed FA replay,MHA causal D64,N1536 H8/8,48,4,204.536,204.536,204.704,317.392,0.072,-0.137,0.172,48,"fa-fixed/fixed/time-1536-1-{0,1}.json"
+fixed FA replay,MHA causal D64,N1536 H8/8,48,prefetch-v,214.276,214.276,215.964,324.356,-0.795,-0.94,-0.719,48,"fa-fixed/fixed/time-1536-1-{0,1}.json"
+C2 frozen replay,ss store,128x512x16,128,12,51.3467,51.3467,48.0973,51.3467,6.646,6.372,6.861,64,"c2-replay/times-ss-store-128-{0,1}.json"
+C2 frozen replay,ss store,128x512x16,128,21,49.6453,49.6453,54.3387,49.6453,0.0,0.0,0.0,64,"c2-replay/times-ss-store-128-{0,1}.json"
+C2 frozen replay,ss store,128x512x16,128,open,49.6453,49.6453,54.3387,51.3467,-3.352,-3.509,-3.131,64,"c2-replay/times-ss-store-128-{0,1}.json"
+C2 frozen replay,ss row,128x512x16,128,12,4.2853,4.2853,4.4733,4.2853,0.0,0.0,0.0,64,"c2-replay/times-ss-row-128-{0,1}.json"
+C2 frozen replay,ss row,128x512x16,128,21,4.144,4.144,4.22,4.144,0.0,0.0,0.0,64,"c2-replay/times-ss-row-128-{0,1}.json"
+C2 frozen replay,ss row,128x512x16,128,open,4.144,4.144,4.22,4.2853,-1.622,-1.832,-1.522,64,"c2-replay/times-ss-row-128-{0,1}.json"
+C2 frozen replay,ss col,128x512x16,128,12,19.6267,19.6267,19.5013,19.6267,0.657,0.588,0.684,64,"c2-replay/times-ss-col-128-{0,1}.json"
+C2 frozen replay,ss col,128x512x16,128,21,24.992,24.992,25.1,24.992,0.0,0.0,0.0,64,"c2-replay/times-ss-col-128-{0,1}.json"
+C2 frozen replay,ss col,128x512x16,128,open,19.6267,19.6267,25.1,19.6267,0.0,0.0,0.0,64,"c2-replay/times-ss-col-128-{0,1}.json"
+C2 frozen replay,rs store,128x512x16,128,12,51.196,51.196,48.284,51.196,6.321,5.907,6.525,64,"c2-replay/times-rs-store-128-{0,1}.json"
+C2 frozen replay,rs store,128x512x16,128,21,49.3893,49.3893,54.6987,49.3893,0.0,0.0,0.0,64,"c2-replay/times-rs-store-128-{0,1}.json"
+C2 frozen replay,rs store,128x512x16,128,open,49.3893,49.3893,54.6987,51.196,-3.591,-3.761,-3.527,64,"c2-replay/times-rs-store-128-{0,1}.json"
+C2 frozen replay,rs row,128x512x16,128,12,4.5467,4.5467,4.7347,4.5467,0.0,0.0,0.0,64,"c2-replay/times-rs-row-128-{0,1}.json"
+C2 frozen replay,rs row,128x512x16,128,21,4.3587,4.3587,4.424,4.3587,0.0,0.0,0.0,64,"c2-replay/times-rs-row-128-{0,1}.json"
+C2 frozen replay,rs row,128x512x16,128,open,4.3587,4.3587,4.424,4.5467,-1.448,-1.689,-1.267,64,"c2-replay/times-rs-row-128-{0,1}.json"
+C2 frozen replay,rs col,128x512x16,128,12,20.044,20.044,19.884,20.044,0.792,0.75,0.849,64,"c2-replay/times-rs-col-128-{0,1}.json"
+C2 frozen replay,rs col,128x512x16,128,21,25.48,25.48,25.404,25.48,0.131,0.084,0.169,64,"c2-replay/times-rs-col-128-{0,1}.json"
+C2 frozen replay,rs col,128x512x16,128,open,25.48,25.48,25.404,20.044,27.032,27.0,27.101,64,"c2-replay/times-rs-col-128-{0,1}.json"
