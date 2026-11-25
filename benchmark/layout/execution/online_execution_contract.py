@@ -9,6 +9,30 @@ def _int(value, lo, hi):
     return value
 
 
+def short_causal_row_major_v(rows, key_rows, heads, kv_heads, dim, value_dim, causal, output_bits):
+    # In the short Q64 family a partial Q tile benefits from the row-major
+    # V descriptor even when all physical eight-row V groups are complete.
+    return (causal and dim == value_dim == 64 and output_bits == 32 and heads == kv_heads
+            and rows == key_rows and rows >= 8 and rows % 64 != 0
+            and (key_rows + 127) // 128 <= 2)
+
+
+def short_kv64_sw128_tma(rows, key_rows, heads, kv_heads, dim, value_dim, causal, output_bits):
+    """Geometry admitted for the short Q64/KV64 by-value SW128 double buffer."""
+    return (causal and dim == value_dim == 64 and rows == key_rows
+            and heads == kv_heads and output_bits == 32 and (rows + 63) // 64 in (2, 3))
+
+
+def three_query_block_tma(rows, key_rows, heads, kv_heads, dim, value_dim, causal, output_bits):
+    return ((rows + 63) // 64 == 3 and
+            short_kv64_sw128_tma(rows, key_rows, heads, kv_heads, dim, value_dim, causal, output_bits))
+
+
+def packed_copy_supports_lookahead(kv_tiles):
+    """Minimum loop length for the native packed-copy two-slot schedule."""
+    return kv_tiles >= 4
+
+
 def single_group(wait_batch=1, threads=256):
     if type(threads) is not int or threads not in (128,256):
         raise ValueError("unsupported synchronous attention domain")

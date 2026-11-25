@@ -1,4 +1,5 @@
 """Native multi-CTA launch of Frisk's two-warpgroup online attention."""
+from online_execution_contract import packed_copy_supports_lookahead, short_kv64_sw128_tma
 from wide_execution import WideEmitter
 
 
@@ -112,10 +113,22 @@ class NativeOnlineEmitter(WideEmitter):
                        ss['attrs']['frisk.mma_contract']['grid'] == [2,1] and
                        rs['attrs']['frisk.mma_contract']['grid'] == [2,1])
         group_k = 16 * self.mma_group_size
+        short_ring = (self.pruned_loop is loop and self.qtile == self.dim == self.value_dim == 64
+                      and self.rows == self.kv_rows and self.kv_rows >= 8
+                      and self.group == 1 and self.output_bytes == 4
+                      and self.k_transport == self.v_transport == 'tma' and self.k_map_abi == 'value'
+                      and ((self.kv_tile == 128 and self.ktiles <= 2) or
+                           (self.kv_tile == 64 and self.threads == 128 and self.mma_group_size == 4
+                            and short_kv64_sw128_tma(self.rows, self.kv_rows, self.heads, kv_heads,
+                                                       self.dim, self.value_dim, self.causal, 8*self.output_bytes)
+                            and rs['attrs']['frisk.mma_contract']['b_descriptor']['swizzle'] == 128
+                            and not getattr(self, 'cross_iteration_pv', False)
+                            and not getattr(self, 'prefetch_after_qk', False)
+                            and getattr(self, 'kv_prefetch_edges', None) is None)))
         self.ring_candidate = (
             (schedule == 'auto' or grouped_qk)
             and getattr(self, 'defer_v_wait', False) and self.aligned_online_inputs
-            and (self.threads == 128 or paired_rows) and self.ktiles >= 4
+            and (self.threads == 128 or paired_rows) and (packed_copy_supports_lookahead(self.ktiles) or short_ring)
             and (self.output_bytes == 4 or (self.dim == self.value_dim == 64 and self.k_transport == "tma"))
             and (ss['attrs']['k'] == group_k or (grouped_qk and ss['attrs']['k'] % group_k == 0))
             and rs['attrs']['k'] % group_k == 0)
@@ -415,6 +428,8 @@ class NativeOnlineEmitter(WideEmitter):
                     break
                 groups.append(start)
             else:
+                if self.has_complete_v_partial_q() and self.emit_partial_q_store(root, groups, regs, lanes, width):
+                    return
                 for i,start in enumerate(groups):
                     off = self.map(start)
                     addr = self.address(root,off)
@@ -502,6 +517,80 @@ class NativeOnlineEmitter(WideEmitter):
         self.emit(f'setp.lt.u32 {pred}, {row}, {limit};')
         return '@'+pred+' '
 
+    def has_complete_v_partial_q(self):
+        # SW128 represents each D64 row directly. Specialize the partial-Q
+        # epilogue only in the short causal single-group TMA family.
+        return (self.ring_stride and self.causal and self.group == 1
+                and self.rows == self.kv_rows and self.qtile == self.dim == self.value_dim == 64
+                and self.output_bytes == 4 and self.v_tma and self.v_tma["swizzle_bytes"] == 128
+                and self.rows % self.qtile != 0 and self.kv_rows % 8 == 0
+                and (self.kv_rows + 127) // 128 <= 2)
+
+    def emit_partial_q_store(self, root, groups, regs, lanes, width):
+        """Fold constant vector offsets and share identical output row guards."""
+        stride = self.value_dim * width
+        first = groups[0]
+        deltas = []
+        for start in groups:
+            delta = start[0] - first[0]
+            dr = start[0] // stride - first[0] // stride
+            if delta < 0 or any(x - y != delta or x // stride - y // stride != dr
+                                for x, y in zip(start, first, strict=True)):
+                return False
+            deltas.append((delta, dr))
+        off = self.map(first)
+        addr = self.address(root, off)
+        row = self.tmp()
+        self.emit(f'shr.u32 {row}, {off}, {stride.bit_length()-1};')
+        self.emit(f'add.u32 {row}, {row}, {self.qrow};')
+        guards = {}
+        for index, (delta, dr) in enumerate(deltas):
+            if dr not in guards:
+                guards[dr] = self.tmp('pred')
+                self.emit(f'setp.lt.s32 {guards[dr]}, {row}, {self.rows-dr};')
+            values = ', '.join(regs[lanes * index:lanes * (index + 1)])
+            opcode = f'v{lanes}.b{width*8}' if lanes > 1 else f'b{width*8}'
+            src = '{' + values + '}' if lanes > 1 else values
+            self.emit(f'@{guards[dr]} st.global.{opcode} [{addr}+{delta}], {src};')
+        return True
+
+    def emit_short_causal_mask(self, value):
+        """Mask the diagonal tile using the certified per-thread score coordinates."""
+        tiles = self.tensor_slots(value)
+        rows = [index // self.kv_tile for index in tiles[0]]
+        cols = [index % self.kv_tile for index in tiles[0]]
+        offsets = []
+        for tile in tiles:
+            dr = tile[0] // self.kv_tile - rows[0]
+            dc = tile[0] % self.kv_tile - cols[0]
+            if any(divmod(index, self.kv_tile) != (r + dr, c + dc)
+                   for index, r, c in zip(tile, rows, cols, strict=True)):
+                return False
+            offsets.append((dr, dc))
+        # Earlier visits are entirely visible. On the diagonal visit the key
+        # origin is determined by the CTA row, independently of the loop IV.
+        origin, before = self.tmp(), self.tmp('pred')
+        done = f'frisk_diagonal_done_{self.loop_version}'
+        self.emit(f'and.b32 {origin}, {self.qrow}, {-self.kv_tile};')
+        self.emit(f'setp.lt.u32 {before}, {self.krow}, {origin};')
+        self.emit(f'@{before} bra.uni {done};')
+        lane_row, lane_col = self.map(rows), self.map(cols)
+        self.emit(f'add.u32 {lane_row}, {lane_row}, {self.qrow};')
+        self.emit(f'add.u32 {lane_col}, {lane_col}, {origin};')
+        limits = {}
+        for dr in sorted({r for r, _ in offsets}):
+            limit = self.tmp()
+            self.emit(f'add.u32 {limit}, {lane_row}, {dr};')
+            self.emit(f'min.u32 {limit}, {limit}, {self.kv_rows - 1};')
+            self.emit(f'sub.s32 {limit}, {limit}, {lane_col};')
+            limits[dr] = limit
+        for reg, (dr, dc) in zip(self.regs(value), offsets, strict=True):
+            visible = self.tmp('pred')
+            self.emit(f'setp.ge.s32 {visible}, {limits[dr]}, {dc};')
+            self.emit(f'selp.f32 {reg}, {reg}, 0fff800000, {visible};')
+        self.emit(done + ':')
+        return True
+
     def operation(self,op):
         if self.ring_stride and any(op is pending for pending in self.normalizer_ops):
             self.pending_normalizer.append(op)
@@ -512,6 +601,13 @@ class NativeOnlineEmitter(WideEmitter):
             self.emit('fence.proxy.async.shared::cta;')
         super().operation(op)
         if op is not self.logits or not (self.causal or self.kv_rows%self.kv_tile):
+            return
+        if (self.pruned_loop is self.kv_loop and self.ring_stride and self.group == 1
+                and self.qtile == self.dim == self.value_dim == 64 and self.output_bytes == 4
+                and self.rows == self.kv_rows and self.kv_tile % self.qtile == 0
+                and self.v_tma and self.v_tma["swizzle_bytes"] == 128
+                and (self.kv_rows % 8 or self.has_complete_v_partial_q())
+                and self.emit_short_causal_mask(op['results'][0])):
             return
         if self.ring_stride:
             last, interior = self.tmp(), self.tmp('pred')

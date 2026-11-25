@@ -1015,6 +1015,7 @@ static FailureOr<int64_t> slicedReductionExchange(RankedTensorType from) {
 LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
                                    unsigned timeout, unsigned oracleLimit, bool scoreReduction, bool allowStripes,
                                    bool replayScratch, bool bankFloor, StringRef globalAccess, bool subgroupCandidates,
+                                   bool minimizeConversions,
                                    unsigned residentAtoms, unsigned stagedKTiles, StringRef delivery, bool autoWidth,
                                    unsigned gridCtas, unsigned smCount) {
   PassManager prepare(module.getContext());
@@ -1178,8 +1179,7 @@ LogicalResult selectIntegerAnchors(ModuleOp module, unsigned freeBits,
   };
   auto solved = solveCertifiedMultiAnchor(module, certificates, price, striped,
                                           freeBits, timeout, oracleLimit, scoreReduction,
-                                          !replayScratch && (globalAccess == "native" ||
-                                            (globalAccess == "pointwise" && anchors.empty() && !hasReduction(module))), subgroupCandidates, sliceUnits, delivery);
+                                          replayScratch ? StringRef("scalar") : globalAccess, subgroupCandidates, minimizeConversions, sliceUnits, delivery);
   if (failed(solved))
     return failure();
   SmallVector<int64_t> selected(domains.size(), -1);
@@ -1450,6 +1450,9 @@ public:
   Option<std::string> scratchBackend{*this, "integer-scratch-backend",
       llvm::cl::desc("Shared scratch lowering used for pricing (native or gluon34)"),
       llvm::cl::init("native")};
+  Option<bool> pointwiseMinConversions{*this, "integer-pointwise-min-conversions",
+      llvm::cl::desc("Select a pointwise alternative by distinct conversions, then service"),
+      llvm::cl::init(false)};
   Option<std::string> globalAccess{*this, "integer-global-access",
       llvm::cl::desc("Price aligned native vector loads/stores: scalar, pointwise, or native"),
       llvm::cl::init("scalar")};
@@ -1501,6 +1504,9 @@ public:
     if (anchorSolver == "integer" &&
         (fixedAnchors || stripedReplay || materialize != "auto"))
       return error("integer anchor solving uses native SSA delivery");
+    if (pointwiseMinConversions && (anchorSolver != "integer" ||
+        !anchorsIn(original).empty() || hasReduction(original)))
+      return error("minimum-conversion pointwise trial requires an integer graph without MMA or reductions");
     if (globalAccess != "scalar" && globalAccess != "pointwise" && globalAccess != "native")
       return error("unknown integer Global access pricing mode");
     if (scratchBackend != "native" && scratchBackend != "gluon34")
@@ -1519,7 +1525,7 @@ public:
         return selectIntegerAnchors(graph, completionBits, integerTimeout,
                                     oracleLimit, scoreReduction, allowStripes,
                                     scratchBackend == "gluon34", bankFloor,
-                                    globalAccess, expand, nativeResidentAtoms, nativeKSlots, nativeDelivery, nativeAutoWidth,
+                                    globalAccess, expand, pointwiseMinConversions, nativeResidentAtoms, nativeKSlots, nativeDelivery, nativeAutoWidth,
                                     nativeGridCtas, nativeSmCount);
       };
       if (!subgroupCandidates)
@@ -1545,13 +1551,15 @@ public:
       auto receipt = [](ModuleOp graph) {
         return graph->getAttrOfType<DictionaryAttr>("frisk.protected_graph");
       };
-      auto objective = [](DictionaryAttr proof) {
+      auto objective = [&](DictionaryAttr proof) {
         // billWitness has checked the full sum for signed overflow.
         int64_t service = 0;
         for (StringRef k : {"main_loop_units", "reduction_units", "access_units",
                             "conversion_units", "compiled_spill_units"})
           if (auto v = proof.getAs<IntegerAttr>(k)) service += v.getInt();
-        return std::make_pair(service, proof.getAs<IntegerAttr>("distinct_conversions").getInt());
+        int64_t routes = proof.getAs<IntegerAttr>("distinct_conversions").getInt();
+        return pointwiseMinConversions ? std::make_pair(routes, service)
+                                       : std::make_pair(service, routes);
       };
       auto candidate = expanded ? receipt(*challenger) : DictionaryAttr{};
       bool promote = expanded && (!feasible || objective(candidate) < objective(receipt(mod)));

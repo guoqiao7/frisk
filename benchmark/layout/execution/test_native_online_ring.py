@@ -36,6 +36,35 @@ class KVStorageTest(unittest.TestCase):
         self.assertEqual(self.emitter.ring_stride, 0)
 
 
+class CausalDiagonalMaskTest(unittest.TestCase):
+    def test_lane_dependent_register_offset_falls_back_before_emission(self):
+        from native_online_launch import NativeOnlineEmitter
+        emitter = SimpleNamespace(kv_tile=64, tensor_slots=lambda _: [[0, 64], [1, 66]])
+        # The second register has a different column displacement in each lane.
+        # No partial PTX may precede the generic mask on fallback.
+        self.assertFalse(NativeOnlineEmitter.emit_short_causal_mask(emitter, 0))
+
+
+class PartialQueryStoreTest(unittest.TestCase):
+    def test_lane_dependent_row_carry_preserves_generic_store(self):
+        from native_online_launch import NativeOnlineEmitter
+        emitter = SimpleNamespace(value_dim=64)
+        # The byte increment is constant but crosses a row in only one lane.
+        self.assertFalse(NativeOnlineEmitter.emit_partial_q_store(
+            emitter, 0, [[0, 248], [8, 256]], [], 2, 4))
+
+    def test_two_vectors_in_one_row_share_the_guard(self):
+        from native_online_launch import NativeOnlineEmitter
+        code = []
+        emitter = SimpleNamespace(value_dim=64, rows=224, qrow='q',
+                                  map=lambda _: 'base', address=lambda *_: 'addr',
+                                  tmp=lambda *args: 'pred' if args else 'row', emit=code.append)
+        self.assertTrue(NativeOnlineEmitter.emit_partial_q_store(
+            emitter, 0, [[0, 8], [16, 24]], list('abcd'), 2, 4))
+        self.assertEqual(sum('setp.lt' in s for s in code), 1)
+        self.assertTrue(any('[addr+16]' in s and '{c, d}' in s for s in code))
+
+
 class CrossIterationPVTest(unittest.TestCase):
     def emitter(self):
         from native_online_launch import NativeOnlineEmitter

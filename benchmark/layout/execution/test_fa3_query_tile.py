@@ -12,6 +12,23 @@ class QueryTileTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             select_query_geometry(1409,1409,16,False,"tma",guarded_query=True)
 
+    def test_ordinary_partial_query_separates_writer_legality_from_scoring(self):
+        result = select_query_geometry(193, 193, 4, False)
+        self.assertEqual(result["score_domain"], "ordinary_mha_partial_q_extrapolation")
+        self.assertEqual({p["query_tile"] for p in result["candidates"]}, {64, 128})
+        for p in result["candidates"]:
+            self.assertEqual(p["eligible_writers"], ["register"])
+            self.assertEqual(p["cta_dispatch"], "forward")
+        with self.assertRaisesRegex(ValueError, "guarded register writer"):
+            select_query_geometry(193, 193, 4, False, "tma")
+        # The newly executable Q128 alternative must not replace a previously
+        # profiled Q64 choice solely on its extrapolated estimate.
+        mixed = select_query_geometry(192, 257, 4, False)
+        self.assertEqual((mixed["query_tile"], mixed["score_domain"]), (64, "existing_profile"))
+        self.assertEqual(select_query_geometry(192, 257, 4, False, "tma")["query_tile"], 64)
+        forced = select_query_geometry(192, 257, 4, False, "register", query_tile=128)
+        self.assertEqual(forced["score_domain"], "ordinary_mha_partial_q_extrapolation")
+
     def test_reverse_feedback_uses_issued_cta_order(self):
         from fa3_query_tile import dispatch_query_tiles, launch_costs
         self.assertEqual(list(dispatch_query_tiles(3,2,True)),[2,2,1,1,0,0])

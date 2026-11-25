@@ -97,6 +97,20 @@ def launch_costs(rows,keys,heads,causal,query_tile,writeback,*,cta_dispatch="for
     return _launch_costs(features,query_tile,writeback)
 
 
+def eligible_writebacks(rows, query_tile, writeback):
+    """Only the register writer predicates each output row in a partial Q tile."""
+    if writeback not in ("auto", "register", "tma"):
+        raise ValueError("unknown FA3 writer")
+    writers = ("tma", "register") if writeback == "auto" else (writeback,)
+    return tuple(w for w in writers if rows % query_tile == 0 or w == "register")
+
+
+def query_score_domain(rows, query_tile, causal, grouped):
+    if rows % query_tile and not (causal or grouped):
+        return "ordinary_mha_partial_q_extrapolation"
+    return "existing_profile"
+
+
 def select_query_geometry(rows, keys, heads, causal, writeback="auto", *,
                           cta_dispatch="auto", query_tile=None, sm_count=114, guarded_query=False):
     """Rank geometry and dispatch together in launch microseconds before layout."""
@@ -106,27 +120,31 @@ def select_query_geometry(rows, keys, heads, causal, writeback="auto", *,
         raise ValueError("reverse dispatch requires causal attention")
     if query_tile not in (None,64,128):
         raise ValueError("unknown FA3 query geometry")
-    writers=("register","tma") if writeback=="auto" else (writeback,)
     orders=(("forward","reverse") if causal else ("forward",)) if cta_dispatch=="auto" else (cta_dispatch,)
     candidates=[]
     for tile in ((64,128) if query_tile is None else (query_tile,)):
-        eligible=[w for w in writers if rows%tile==0 or ((causal or guarded_query) and w=="register")]
+        eligible = eligible_writebacks(rows, tile, writeback)
         if not eligible:
             continue
         for order in orders:
             features=launch_features(rows,keys,heads,causal,tile,sm_count,reverse=order=="reverse")
             estimate=min(min(_launch_costs(features,tile,w).values()) for w in eligible)
             candidates.append(dict(query_tile=tile,cta_dispatch=order,estimated_us=estimate,
-                                   eligible_writers=eligible,kv_trips_per_sm=features[3]))
+                                   eligible_writers=list(eligible), kv_trips_per_sm=features[3],
+                                   score_domain=query_score_domain(rows, tile, causal, guarded_query)))
     if not candidates:
-        raise ValueError("automatic FA3 query tiling requires complete query tiles or a guarded causal writer")
-    best=min(c["estimated_us"] for c in candidates)
+        raise ValueError("partial FA3 output tiles require the guarded register writer")
+    # Preserve measured-domain choices when a full tile is available. For an
+    # all-tail ordinary grid the full-tile model supplies an explicit fallback.
+    profiled = [c for c in candidates if c["score_domain"] == "existing_profile"]
+    ranked = profiled or candidates
+    best=min(c["estimated_us"] for c in ranked)
     # Compare every legal pair against one minimum. The same uncertainty band
     # applies once; prefer lower aggregate K/V traffic, then ordinary grid order.
-    near=[c for c in candidates if math.log(c["estimated_us"]/best)<=_TILE_LOG_RATIO_ERROR]
+    near=[c for c in ranked if math.log(c["estimated_us"]/best)<=_TILE_LOG_RATIO_ERROR]
     winner=min(near,key=lambda c:(c["kv_trips_per_sm"],c["cta_dispatch"]!="forward",c["estimated_us"]))
     return dict(query_tile=winner["query_tile"],cta_dispatch=winner["cta_dispatch"],
-                candidates=candidates,log_margin=_TILE_LOG_RATIO_ERROR,sm_count=sm_count)
+                candidates=candidates,score_domain=winner["score_domain"],log_margin=_TILE_LOG_RATIO_ERROR,sm_count=sm_count)
 
 
 def select_query_tile(rows,keys,heads,causal,writeback="auto"):

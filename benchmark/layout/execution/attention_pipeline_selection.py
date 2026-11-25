@@ -4,7 +4,7 @@ Each candidate binds its execution contract before the multi-anchor layout pass.
 The caller supplies independent screening measurements for the executable plans.
 """
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 import json
 import math
@@ -13,53 +13,9 @@ import statistics
 import subprocess
 
 from backend import compile_execution
+from attention_pipeline_candidates import AttentionPipeline, attention_pipelines, pipeline_candidates
 from native_online_fixture import online_fixture
-from online_execution_contract import fa3_query_plan, from_overlap, single_group
-
-
-@dataclass(frozen=True)
-class AttentionPipeline:
-    name: str
-    query_tile: int
-    contract: dict
-    writeback: str = "tma"
-    half_output: bool = False
-    defer_v_wait: bool = False
-    fringe_policy: str = "base"
-    event_schedule: str = None
-    kv_tile: int = None
-    prefetch_after_qk: bool = False
-    kv_prefetch_edges: tuple[str, str] = None
-    v_transport: str = "cp.async"
-    cta_dispatch: str = None
-    v_row_major_tma: bool = False
-
-
-def attention_pipelines(output_bits, overlap_schedules=(), *, native_delivery=False, aligned_inputs=False, include_late_k=False, fa3_query_tile=128):
-    extra = []
-    if native_delivery and output_bits in (16,32):
-        extra.append(AttentionPipeline("q64-producer-wait4",64,single_group(4,128),
-                                       "producer",output_bits==16))
-        if aligned_inputs:
-            extra.append(AttentionPipeline("q64-producer-wait4-late-v",64,single_group(4,128),
-                                           "producer",output_bits==16,True))
-    if output_bits == 16:
-        plans = []
-        for source in overlap_schedules:
-            with Path(source).open() as stream:
-                contract = from_overlap(json.load(stream))
-                if fa3_query_tile != 128:
-                    contract = fa3_query_plan(contract, fa3_query_tile)
-            plans.append(AttentionPipeline(Path(source).stem, fa3_query_tile, contract))
-            if include_late_k and contract['kind']=='fa3_qk_next':
-                plans.append(replace(plans[-1],name=plans[-1].name+"-late-k",event_schedule="late_k"))
-        if not plans and not extra:
-            raise ValueError("supply imported FA3 schedules for the FP16 output path")
-        return plans + [replace(p,name=p.name+"-register",writeback="register") for p in plans] + extra
-    if output_bits != 32:
-        raise ValueError("unsupported attention output type")
-    return [AttentionPipeline(f"q{q}-wait{w}", q, single_group(w,128 if q==64 else 256))
-            for q, w in ((128,1),(128,4),(256,1),(256,4),(64,1),(64,4))] + extra
+from online_execution_contract import packed_copy_supports_lookahead
 
 
 def fringe_pipelines(plan, rows, keys, heads, dim, causal, sm_count, allow_reassociated):
@@ -215,7 +171,7 @@ def _online_expectation(plan, k_transport):
                 post_qk=plan.prefetch_after_qk, plan=plan.name)
 
 
-def compile_attention_pipeline(plan, opt, directory, *, rows, heads, dim, causal, aligned_inputs=False, row_reciprocal=False, softmax_math="default", kv_rows=None, kv_heads=None, value_dim=None, k_transport="cp.async", k_map_abi="value", overlap_pv_normalizer=True, cross_iteration_pv=False, _layout_cache=None, _audit_expected=None):
+def compile_attention_pipeline(plan, opt, directory, *, rows, heads, dim, causal, aligned_inputs=False, row_reciprocal=False, softmax_math="default", kv_rows=None, kv_heads=None, value_dim=None, k_transport="cp.async", k_map_abi="value", overlap_pv_normalizer=True, cross_iteration_pv=False, _layout_cache=None):
     """Compile one plan. A joint K/V TMA plan uses two by-value tensor maps."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -335,11 +291,32 @@ def compile_attention_pipeline(plan, opt, directory, *, rows, heads, dim, causal
             consumes_conversion=any(op['name']=='frisk.convert_layout' and
                                     store['operands'][0] in op['results'] for op in data['operations']),
             solver_cost_stage='before physical store selection')
-    if _audit_expected is None and not is_fa3 and dim == value_dim == 64 and aligned_inputs:
-        _audit_expected = _online_expectation(plan,k_transport)
-    if _audit_expected is not None:
+    if not is_fa3:
+        from attention_execution_audit import digest
+        physical = asdict(plan)
+        physical.pop("name")
+        physical.update(rows=rows, keys=rows if kv_rows is None else kv_rows, heads=heads,
+                        kv_heads=kv_heads, dim=dim, value_dim=value_dim, k_transport=k_transport,
+                        k_map_abi=k_map_abi if k_transport == "tma" else None,
+                        aligned_inputs=aligned_inputs, row_reciprocal=row_reciprocal,
+                        softmax_math=softmax_math, overlap_pv_normalizer=overlap_pv_normalizer,
+                        cross_iteration_pv=cross_iteration_pv, causal=causal)
+        info.update(physical_candidate=plan.name, physical_contract=physical,
+                    physical_contract_sha256=digest(physical))
+    audit_grouped = (dim == value_dim == 128 and kv_heads < heads and not plan.half_output
+                     and plan.query_tile == 64 and plan.defer_v_wait)
+    if not is_fa3 and aligned_inputs and (dim == value_dim == 64 or audit_grouped):
         from attention_execution_audit import audit_attention
-        info["execution_audit"] = audit_attention(data,info,image.asm,_audit_expected)
+        expected = _online_expectation(plan, k_transport)
+        if plan.v_transport == "tma":
+            expected["v_swizzle"] = 128 if plan.v_row_major_tma else 32
+        if k_transport == "tma" or grouped_qk_ring:
+            expected["kv_versions"] = 2
+        elif kv_rows in (None, rows) and not cross_iteration_pv:
+            lookahead = (dim == 64 and not plan.half_output and plan.defer_v_wait and
+                         plan.contract["cta"] == 128 and packed_copy_supports_lookahead((rows+63)//64))
+            expected["kv_versions"] = 2 if lookahead else 1
+        info["execution_audit"] = audit_attention(data, info, image.asm, expected)
         info["layout_solve_reused"] = cached is not None
     (directory/'metadata.json').write_text(json.dumps(info,indent=2))
     return image, info
@@ -353,56 +330,28 @@ def compile_static_d64_attention(opt, directory, *, rows, heads, causal, sm_coun
     row reciprocals, and 16-byte input alignment. Other numerical or launch
     contracts can continue to use compile_attention_pipeline or measured tuning.
     """
-    from d64_static_pipeline import rank_d64_pipelines
+    from d64_static_pipeline import select_d64_pipeline
     if not aligned_inputs or not row_reciprocal or softmax_math != "base2-ftz":
         raise ValueError("D64 static policy requires aligned packed inputs, row reciprocals and base2-ftz")
-    receipt = rank_d64_pipelines(rows, heads, causal, sm_count, output_bits=output_bits)
-    return _compile_static_online(opt,directory,rows,heads,heads,64,causal,receipt,output_bits)
+    candidate, receipt = select_d64_pipeline(rows, heads, causal, sm_count, output_bits=output_bits)
+    return _compile_static_online(opt,directory,rows,heads,heads,64,causal,candidate,receipt)
 
 
 def compile_static_gqa_attention(opt, directory, *, rows, heads, kv_heads, dim, causal,
                                  aligned_inputs, row_reciprocal, softmax_math, sm_count=114, output_bits=32):
     """Select and compile one single-group GQA image on H100 PCIe."""
-    from d64_static_pipeline import rank_grouped_attention
+    from d64_static_pipeline import select_grouped_pipeline
     if not aligned_inputs or not row_reciprocal or softmax_math!="base2-ftz":
         raise ValueError("GQA static policy requires aligned packed inputs, row reciprocals and base2-ftz")
-    receipt = rank_grouped_attention(rows,heads,kv_heads,dim,causal,sm_count,output_bits=output_bits)
-    return _compile_static_online(opt,directory,rows,heads,kv_heads,dim,causal,receipt,output_bits)
+    candidate, receipt = select_grouped_pipeline(rows,heads,kv_heads,dim,causal,sm_count,output_bits=output_bits)
+    return _compile_static_online(opt,directory,rows,heads,kv_heads,dim,causal,candidate,receipt)
 
 
-def _compile_static_online(opt,directory,rows,heads,kv_heads,dim,causal,receipt,output_bits):
-    from d64_static_pipeline import PROFILE
-    name = receipt['selected']
-    if name.startswith('cp-'):
-        plans = attention_pipelines(32, native_delivery=True, aligned_inputs=True)
-        plan = next(p for p in plans if 'cp-' + p.name == name)
-        k_transport = "cp.async"
-    else:
-        query = 128 if name.startswith("q128-") else 64
-        profile_name = name.replace("q128-", "q64-", 1) if query == 128 else name
-        tile = int(name[4:]) if name.startswith("ring") else PROFILE[profile_name][1]
-        plan = AttentionPipeline(name, query, single_group(4,2*query), "producer", False, True,
-                                 kv_tile=tile, prefetch_after_qk='-post-qk' in name,
-                                 v_transport="tma" if name.endswith('-v-tma') else "cp.async")
-        k_transport = "cp.async" if name.startswith("ring") else "tma"
-    # In ordinary packed D64 GQA the entire 64-half V row fits a SW128 box.
-    # The layout solver must certify the resulting MN-major PV descriptor.
-    row_major_v = (dim == 64 and output_bits == 32 and heads > kv_heads and not causal
-                   and plan.v_transport == "tma" and plan.prefetch_after_qk)
-    plan = replace(plan, half_output=output_bits == 16, v_row_major_tma=row_major_v)
-    expected = _online_expectation(plan,k_transport)
-    expected["plan"] = name
-    if k_transport == "tma" or name.startswith("ring"):
-        expected["kv_versions"] = 2
-    else:
-        # The single-group packed-copy ring needs at least four KV iterations.
-        expected["kv_versions"] = 2 if (dim == 64 and output_bits == 32 and plan.defer_v_wait and
-                                         plan.contract["cta"]==128 and (rows+63)//64 >= 4) else 1
-    if plan.v_transport == "tma":
-        expected["v_swizzle"] = 128 if row_major_v else 32
-    image, metadata = compile_attention_pipeline(plan, opt, directory, rows=rows, heads=heads,
-        dim=dim, kv_heads=kv_heads, causal=causal, aligned_inputs=True, row_reciprocal=True,
-        softmax_math="base2-ftz", k_transport=k_transport, k_map_abi="value", _audit_expected=expected)
+def _compile_static_online(opt, directory, rows, heads, kv_heads, dim, causal, candidate, receipt):
+    image, metadata = compile_attention_pipeline(
+        candidate.plan, opt, directory, rows=rows, heads=heads, kv_heads=kv_heads, dim=dim,
+        causal=causal, aligned_inputs=True, row_reciprocal=True, softmax_math="base2-ftz",
+        k_transport=candidate.k_transport, k_map_abi="value")
     receipt["execution_audit"] = metadata["execution_audit"]
     return image, metadata, receipt
 
@@ -434,72 +383,24 @@ def tune_attention_pipelines(opt, directory, *, rows, heads, dim, causal,
     paired latency dictionaries. Measurement is supplied by the runtime so the
     compiler does not assume an allocator, CUDA context, or tensor library.
     """
-    d64 = dim == 64 and value_dim in (None, 64)
-    grouped_d128 = dim == 128 and value_dim in (None, 128) and kv_heads not in (None, heads)
-    mixed_profile = (d64 and output_bits in (16, 32)) or (grouped_d128 and output_bits == 32)
-    combined = k_transport is None and aligned_inputs and k_map_abi == "value" and mixed_profile
-    k_transport = k_transport or ("tma" if combined else "cp.async")
-    key_rows = rows if kv_rows is None else kv_rows
-    if (include_post_qk_prefetch or include_independent_kv) and (dim!=64 or k_transport != 'tma' or k_map_abi != 'value'):
-        raise ValueError('post-QK prefetch tuning requires by-value K TMA')
-    geometry = None
-    if overlap_schedules and dim == 128 and output_bits == 16 and fa3_query_tile == "auto":
-        from fa3_query_tile import select_query_geometry
-        if sm_count not in (None, 114):
-            raise ValueError("automatic FA3 query tiling uses the full H100 PCIe profile")
-        geometry=select_query_geometry(rows,kv_rows or rows,heads,causal,guarded_query=kv_heads not in (None,heads))
-        fa3_query_tile=geometry["query_tile"]
-    if k_transport == "tma":
-        if not aligned_inputs or output_bits not in ((16,32) if dim==64 else (32,)) or not ((dim==64 and value_dim in (None,64)) or (grouped_d128 and k_map_abi=="value")):
-            raise ValueError("TMA tuning requires aligned D64 FP16/FP32 output or grouped D128 FP32 output")
-        base = AttentionPipeline("q64-kv64-k-tma",64,single_group(4,128),"producer",output_bits==16,True,kv_tile=64)
-        plans = [base] if (key_rows+63)//64>=4 else []
-        if k_map_abi=="value" and (key_rows+127)//128 >= 4:
-            plans.append(replace(base,name="q64-kv128-k-tma",kv_tile=128))
-        if (include_post_qk_prefetch or (combined and d64)) and not causal:
-            plans += [replace(p, name=p.name+"-post-qk", prefetch_after_qk=True)
-                      for p in plans if (key_rows+p.kv_tile-1)//p.kv_tile >= 4]
-        if include_v_tma and k_map_abi == 'value' and key_rows >= 8:
-            plans += [replace(p, name=p.name+'-v-tma', v_transport='tma')
-                      for p in plans if (key_rows+p.kv_tile-1)//p.kv_tile >= 4]
-        if (d64 and not causal and output_bits == 32 and kv_heads not in (None, heads)
-                and key_rows == rows and k_map_abi == "value"):
-            plans += [replace(p, name=p.name.replace("q64-", "q128-", 1),
-                              query_tile=128, contract=single_group(4,256))
-                      for p in plans if p.v_transport == "tma"]
-        if include_independent_kv and not causal and (key_rows+63)//64 >= 4:
-            # The unmodified base plan already issues both transfers before QK.
-            for k_edge, v_edge in [('before','after'), ('after','before'), ('after','after')]:
-                plans.append(replace(base, name=f"{base.name}-k-{k_edge}-v-{v_edge}",
-                                     kv_prefetch_edges=(k_edge,v_edge)))
-    else:
-        plans = attention_pipelines(output_bits, overlap_schedules, native_delivery=True,
-                                    aligned_inputs=aligned_inputs,include_late_k=include_late_k, fa3_query_tile=fa3_query_tile)
-    if geometry and geometry["cta_dispatch"]=="reverse":
-        # Q128/register already has an equivalent legacy fringe candidate.
-        plans += [replace(p,name=p.name+"-dispatch-reverse",cta_dispatch="reverse") for p in plans
-                  if p.contract["kind"]!="single" and (p.query_tile!=128 or p.writeback!="register")]
-    if combined:
-        plans += attention_pipelines(output_bits,native_delivery=True,aligned_inputs=aligned_inputs)
-    cp_rings = {}
-    if grouped_d128 and combined:
-        for width in (64,128):
-            if (key_rows+width-1)//width>=4:
-                candidate=replace(base,name=f"ring{width}",kv_tile=width)
-                cp_rings[candidate.name]=candidate
-        plans.extend(cp_rings.values())
-    if len({plan.name for plan in plans}) != len(plans):
-        raise ValueError("each proposed schedule must have a distinct name")
+    candidates = pipeline_candidates(
+        rows=rows, heads=heads, dim=dim, causal=causal, output_bits=output_bits,
+        aligned_inputs=aligned_inputs, kv_rows=kv_rows, kv_heads=kv_heads, value_dim=value_dim,
+        k_transport=k_transport, k_map_abi=k_map_abi, include_post_qk_prefetch=include_post_qk_prefetch,
+        include_independent_kv=include_independent_kv, include_v_tma=include_v_tma,
+        overlap_schedules=overlap_schedules, sm_count=sm_count, include_late_k=include_late_k,
+        fa3_query_tile=fa3_query_tile)
     admitted, images, rejected = [], {}, {}
     layout_cache = {}
-    for plan in plans:
+    for candidate in candidates:
+        plan = candidate.plan
         try:
             images[plan.name] = compile_attention_pipeline(
                 plan, opt, Path(directory)/plan.name,
                 rows=rows, heads=heads, dim=dim, causal=causal,
                 aligned_inputs=aligned_inputs, row_reciprocal=row_reciprocal, softmax_math=softmax_math, kv_rows=kv_rows,
                 kv_heads=kv_heads, value_dim=value_dim,
-                k_transport=("cp.async" if (combined and plan.kv_tile is None) or plan.name in cp_rings else k_transport),
+                k_transport=candidate.k_transport,
                 k_map_abi=k_map_abi, _layout_cache=layout_cache)
         except (ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
             rejected[plan.name] = str(exc)

@@ -147,6 +147,7 @@ class _TileWork:
 
 def rank_transport_events(transport, rows, keys, causal, budget, *, heads, cta_dispatch="forward"):
     """Select the calibrated profile by the actual paths, and bill its physical work."""
+    from fa3_query_tile import eligible_writebacks, query_score_domain
     from fa3_static_schedule import rank_fa3_events
     facts = transport.facts
     moves = facts["moves"]
@@ -158,11 +159,13 @@ def rank_transport_events(transport, rows, keys, causal, budget, *, heads, cta_d
     # The frozen profile already measures these paths, including overlapping
     # service and waits. Adding serialized bandwidth time would bill them twice.
     q_height, k_height, v_height = (moves[r]["box"][1] for r in ("q","k","v"))
-    tail = rows % q_height
-    if k_height != v_height or (tail and not (register and (causal or moves["k"].get("query_heads_per_kv_head",1)>1))):
-        raise ValueError("unsupported TMA tile extent for the calibrated phase profile")
-    if q_height not in (64,128) or k_height != 128:
+    if q_height not in (64,128) or k_height != 128 or v_height != k_height:
         raise ValueError("unsupported FA3 TMA extent")
+    writer = "register" if register else "tma"
+    if not eligible_writebacks(rows, q_height, writer):
+        raise ValueError("partial FA3 output tiles require the guarded register writer")
+    tail = rows % q_height
+    domain = query_score_domain(rows, q_height, causal, moves["k"].get("query_heads_per_kv_head", 1) > 1)
     tiles = _TileWork((rows+q_height-1)//q_height, (keys+k_height-1)//k_height, bool(causal),k_height//q_height)
     if q_height==128:
         receipt=rank_fa3_events(plan,rows,keys,causal,budget,heads=heads,tile_work=tiles,cta_dispatch=cta_dispatch)
@@ -226,6 +229,8 @@ def rank_transport_events(transport, rows, keys, causal, budget, *, heads, cta_d
         receipt["selected"] = sorted(receipt["costs"], key=lambda a: receipt["costs"][a]["total_us"])[:budget]
     family = "sm90_tma_qkv_register_o" if register else "sm90_tma_qkv_bulk_o"
     if q_height==64: family+="_q64"
-    receipt.update(transport_sha256=transport.fingerprint, transport_profile=family,
-                   transport_work=work, transport_cost_included_in="calibrated phase and boundary costs")
+    cost_source = ("full-tile phase and boundary cost extrapolation"
+                   if domain == "ordinary_mha_partial_q_extrapolation" else "calibrated phase and boundary costs")
+    receipt.update(score_domain=domain, transport_sha256=transport.fingerprint, transport_profile=family,
+                   transport_work=work, transport_cost_included_in=cost_source)
     return receipt

@@ -3,6 +3,9 @@ import heapq
 import math
 from functools import lru_cache
 
+from attention_pipeline_candidates import bind_ranked_pipeline
+from online_execution_contract import packed_copy_supports_lookahead, short_causal_row_major_v, short_kv64_sw128_tma
+
 # Each arm has (Q rows, KV rows, resident CTAs/SM). Capacities use the
 # driver occupancy of the compiled kernel including dynamic shared memory.
 PROFILE = {'cp-q128-wait4': (128, 64, 2),
@@ -133,6 +136,15 @@ def _kv_pair_features(rows, heads, causal, sms, capacity64, capacity128):
             math.log(occupancy[0] / occupancy[1]), 1 / occupancy[1])
 
 
+def _set_pair_ratio(costs, first, second, log_ratio):
+    """Price first/second without moving their common minimum against other plans."""
+    best = min(costs[first], costs[second])
+    if log_ratio > 0:
+        costs[first], costs[second] = best * math.exp(log_ratio), best
+    else:
+        costs[first], costs[second] = best, best * math.exp(-log_ratio)
+
+
 def _score_kv_pairs(costs, rows, heads, causal, sms):
     for (suffix, masked), coefficients in _PAIR_COEFFICIENTS.items():
         if masked != causal:
@@ -150,11 +162,35 @@ def _score_kv_pairs(costs, rows, heads, causal, sms):
             continue
         # Calibrate only the width. The best score of each transport/issue
         # family remains its cross-family estimate from the absolute model.
-        best = min(costs[small], costs[large])
-        if log_ratio > 0:
-            costs[small], costs[large] = best * math.exp(log_ratio), best
-        else:
-            costs[small], costs[large] = best, best * math.exp(-log_ratio)
+        _set_pair_ratio(costs, small, large, log_ratio)
+
+
+# H100 PCIe, packed non-causal D64 MHA, FP32 output. Paired log latency
+# (K/V TMA with post-QK prefetch / late-V cp.async). The uncertainty band is
+# the leave-one-length-out P95 absolute log error. No inference-time timing.
+_SHORT_MHA_POST_QK = (-0.099493260, 0.191795094, 0.048764961)
+
+
+def _score_short_mha_transport(costs, rows, heads, sms):
+    post = "q64-kv64-k-tma-post-qk-v-tma"
+    late = "cp-q64-producer-wait4-late-v"
+    if post not in costs or "q64-kv128-k-tma-post-qk-v-tma" in costs:
+        return None  # In the two-width regime the existing width model applies.
+    q, kv, capacity = PROFILE[post]
+    blocks = heads * ((rows + q - 1) // q)
+    if blocks > sms * min(capacity, PROFILE[late][2]):
+        return None
+    visits = (rows + kv - 1) // kv
+    # The transformed V tensor map covers groups of eight rows. A residual
+    # group requires the safe copy path on the final KV visit only.
+    tail_fraction = int(rows % 8 != 0) / visits
+    intercept, tail_cost, error = _SHORT_MHA_POST_QK
+    log_ratio = intercept + tail_cost * tail_fraction
+    confident = abs(log_ratio) > error
+    if confident:
+        _set_pair_ratio(costs, post, late, log_ratio)
+    return dict(kv_visits=visits, v_tail_visit_fraction=tail_fraction, blocks=blocks,
+                post_over_late=math.exp(log_ratio), log_error_p95=error, applied=confident)
 
 
 # Log K-TMA latency relative to late-V cp.async, calibrated on paired SM90a
@@ -177,6 +213,176 @@ def _compare_causal_transport(costs, rows, heads, sm_count):
     for arm, coefficients in zip(alternatives, _CAUSAL_K_TMA_LOG_RATIOS):
         log_ratio = sum(feature * weight for feature, weight in zip(terms, coefficients))
         costs[arm] = costs[baseline] * math.exp(log_ratio)
+
+
+
+# Physical GPU0, 114-SM H100 PCIe at 1755 MHz. With independent K and V
+# completion probes, these are the excess SW32 versus SW128 cycles for a
+# full first V box. Use valid rows for a partial first box. The following
+# prefetched visits showed only the barrier polling floor on both paths.
+_SHORT_V_READY_CYCLES = {64: 237.0, 128: 459.0}
+_SHORT_PROFILE_CYCLES_PER_US = 1755.0
+
+
+def _first_v_ready_saving(rows, width):
+    fill = min(rows, width) / width
+    return _SHORT_V_READY_CYCLES[width] * fill / _SHORT_PROFILE_CYCLES_PER_US
+
+
+# Paired H100 PCIe SW128 timing, log(KV128 / KV64) once CTAs share SMs.
+# Coefficients price the baseline, padded fraction of the final Q tile,
+# additional resident CTA depth, and partially filled last dispatch.
+_SHORT_CAUSAL_RESIDENT_WIDTH = (-0.097684748, 0.051784761, 0.044781439, 0.062163466)
+
+
+def _score_resident_causal_width(costs, wide, narrow, rows, heads, sms):
+    q = PROFILE[wide][0]
+    query_tiles = (rows + q - 1) // q
+    blocks = query_tiles * heads
+    if blocks <= sms:
+        return None
+    peers, offset = divmod(blocks - 1, sms)
+    last_blocks = offset + 1
+    empty_fraction = 1 - last_blocks / sms
+    padding = (query_tiles * q - rows) / q
+    # A resident pair has two causal prefix lengths. Estimate exposure to a
+    # particular costly pair as the partial cohort grows. Dispatch itself is
+    # hardware controlled; this term is a proxy, not a placement guarantee.
+    pair_exposure = 1 - (1 - 1 / query_tiles**2)**last_blocks
+    features = (1.0, padding, peers, empty_fraction * pair_exposure)
+    log_ratio = sum(weight * value for weight, value in
+                    zip(_SHORT_CAUSAL_RESIDENT_WIDTH, features, strict=True))
+    _set_pair_ratio(costs, wide, narrow, log_ratio)
+    return dict(grid_ctas=blocks, resident_peer_depth=peers, last_cohort_ctas=last_blocks,
+                q_padding_fraction=padding, pair_exposure=pair_exposure,
+                wide_over_narrow=math.exp(log_ratio))
+
+
+# Paired log latency of SW128 K/V TMA with lookahead relative to
+# single-version packed copies. Calibrated on grids sharing a 114-SM H100.
+_SHORT_CAUSAL_TRANSPORT = (-0.050197602, -0.029028231)
+
+
+def _score_short_causal_width(costs, rows, heads, sms, row_major_v):
+    """Compare the two-slot KV128 ring to the incumbent on short causal MHA."""
+    wide = "q64-kv128-k-tma-v-tma"
+    width = PROFILE[wide][1]
+    visits = (rows + width - 1) // width
+    if rows < 8 or visits > 2:
+        return None
+    incumbent = min(costs, key=costs.get)
+    copy = "cp-q64-producer-wait4-late-v"
+    if incumbent not in (copy, "q64-kv64-k-tma-v-tma"):
+        return None
+    q, narrow, _ = PROFILE[incumbent]
+    ends = [min(start + q, rows) for start in range(0, rows, q)]
+    if heads * len(ends) > sms * PROFILE[wide][2]:
+        return None  # This short-grid comparison covers a single resident wave.
+    small = [(end + narrow - 1) // narrow for end in ends]
+    large = [(end + width - 1) // width for end in ends]
+    saved = max(small) - max(large)
+    # Excess physical QK/PV work in units of a narrow KV tile per SM.
+    extra = heads * sum(w * (width // narrow) - s for s, w in zip(small, large)) / sms
+    # H100 PCIe paired log(time_wide / time_incumbent). Intercept captures
+    # startup and drain. The extra transport setup applies to a cp.async incumbent.
+    charged_extra = extra
+    if row_major_v and incumbent == copy:
+        # The critical CTA already pays startup and its serialized KV visits.
+        # Excess fragments contribute additional grid contention only for CTAs
+        # sharing an SM. Charging idle SMs inflated the SW32 reference too.
+        blocks = heads * len(ends)
+        charged_extra *= max(0, blocks - sms) / blocks
+    log_ratio = (0.005487390 + 0.056303633 * (incumbent == copy)
+                 - 0.045328853 * saved + 0.170695850 * charged_extra)
+    costs[wide] = costs[incumbent] * math.exp(log_ratio)
+    ready_saving = {}
+    if row_major_v:
+        # Each CTA issues both first transfers before the joint wait. Reprice
+        # that exposed V dependency once on the single resident wave; preserve
+        # the original candidate set and independently price each TMA width.
+        for arm in ("q64-kv64-k-tma-v-tma", wide):
+            if arm in costs:
+                ready_saving[arm] = _first_v_ready_saving(rows, PROFILE[arm][1])
+                costs[arm] -= ready_saving[arm]
+    narrow_tma = "q64-kv64-k-tma-v-tma"
+    resident_width = None
+    if narrow_tma in ready_saving:
+        # Compare only admitted SW128 arms. Keep the faster family score
+        # against cp.async and the other transport families unchanged.
+        resident_width = _score_resident_causal_width(costs, wide, narrow_tma, rows, heads, sms)
+    single_slot_transport = None
+    blocks = heads * len(ends)
+    if (wide in ready_saving and incumbent == copy and blocks > sms
+            and not packed_copy_supports_lookahead(max(small)) and max(large) > 1):
+        # The packed loop publishes fresh K/V on every visit. The native TMA
+        # ring prefetches the next visit and uses a single issuer. Pricing
+        # only the extra padded GMMA work overcharges wide as grid load grows.
+        # This measured end-to-end ratio already includes first V readiness.
+        resident_peers = blocks / sms - 1
+        base, per_peer = _SHORT_CAUSAL_TRANSPORT
+        ratio = base + per_peer * resident_peers
+        _set_pair_ratio(costs, wide, copy, ratio)
+        single_slot_transport = dict(packed_versions=1, tma_versions=2,
+                                     resident_peers_per_sm=resident_peers,
+                                     wide_over_copy=math.exp(ratio))
+    result = dict(incumbent=incumbent, kv128_visits=large, critical_visits_saved=saved,
+                  extra_kv64_tiles_per_sm=extra, charged_extra_kv64_tiles_per_sm=charged_extra,
+                  v_ready_saving_us=ready_saving, wide_over_incumbent=costs[wide] / costs[incumbent])
+    if single_slot_transport is not None:
+        result["single_slot_transport"] = single_slot_transport
+    if resident_width is not None:
+        result["resident_width"] = resident_width
+    return result
+
+
+# Paired H100 PCIe log latency ratios for the short KV64 SW128 ring.
+# Both references use the same producer writeback. Prices include the full
+# copy, wait and math sequence. The SW128 first-V credit is already in them.
+_THREE_BLOCK_KV64_LOG_RATIOS = {
+    "q64-kv128-k-tma-v-tma": (-0.025412730, -0.037512384),
+    "cp-q64-producer-wait4-late-v": (-0.073627809, -0.042047227),
+}
+
+
+def _score_three_block_kv64(costs, rows, heads, sms, wide_uses_sw128):
+    narrow = "q64-kv64-k-tma-v-tma"
+    wide = "q64-kv128-k-tma-v-tma"
+    # Aligned full Q tiles may use the old SW32 wide arm. Use the existing
+    # packed-copy price when a matching SW128 wide reference is unavailable.
+    reference = wide if wide_uses_sw128 and wide in costs else "cp-q64-producer-wait4-late-v"
+    q, _, capacity = PROFILE[narrow]
+    grid = heads * ((rows + q - 1) // q)
+    active_ctas_per_sm = min(grid / sms, capacity)
+    base, per_cta = _THREE_BLOCK_KV64_LOG_RATIOS[reference]
+    ratio = math.exp(base + per_cta * active_ctas_per_sm)
+    costs[narrow] = costs[reference] * ratio
+    return dict(reference=reference, narrow_over_reference=ratio,
+                grid_ctas=grid, active_ctas_per_sm=active_ctas_per_sm)
+
+
+# H100 PCIe paired log(time_KV64 / time_reference) for two Q blocks.
+# At KV128 both CTAs make one visit; at KV64 only the second can prefetch.
+# These are whole-kernel ratios, including the cost of the first TMA wait.
+_TWO_BLOCK_KV64_LOG_RATIOS = {
+    "q64-kv128-k-tma-v-tma": (-0.015617303, -0.067884662, 0.059528733),
+    "cp-q64-producer-wait4-late-v": (-0.016790615, -0.041567482, 0.009715625),
+}
+
+
+def _score_two_block_kv64(costs, rows, heads, sms, wide_uses_sw128):
+    narrow = "q64-kv64-k-tma-v-tma"
+    wide = "q64-kv128-k-tma-v-tma"
+    q, _, capacity = PROFILE[narrow]
+    tiles = (rows + q - 1) // q
+    resident = min(heads * tiles / sms, capacity)
+    tail_fill = (rows - (tiles - 1) * q) / q
+    ratios = {}
+    for arm, (base, per_cta, per_tail) in _TWO_BLOCK_KV64_LOG_RATIOS.items():
+        if arm in costs and (arm != wide or wide_uses_sw128):
+            ratios[arm] = math.exp(base + per_cta * resident + per_tail * tail_fill)
+    # T_narrow/min(T_refs) = max(T_narrow/T_ref). Keep all legacy prices.
+    costs[narrow] = min(costs[arm] for arm in ratios) * max(ratios.values())
+    return dict(active_ctas_per_sm=resident, tail_fill=tail_fill, narrow_over_reference=ratios)
 
 
 # Paired SM90a log latency ratios. D64 compares V-TMA with the same K-TMA
@@ -642,14 +848,14 @@ def _score_joint_grouped_tiles(costs, rows, heads, sm_count, *, kv_heads=None):
     return comparison, joint
 
 
-def rank_grouped_attention(rows, heads, kv_heads, dim, causal, sm_count=114, *, output_bits=32):
+def _rank_grouped_families(rows, heads, kv_heads, dim, causal, sm_count=114, *, output_bits=32):
     """Packed square GQA; head counts include the batch, with contiguous KV groups."""
     if (type(heads) is not int or type(kv_heads) is not int or kv_heads<1
             or heads<=kv_heads or heads%kv_heads or type(rows) is not int or rows<1
             or dim not in (64,128) or sm_count!=114):
         raise ValueError("expected a packed D64/D128 grouped launch on H100 PCIe")
     if dim==64:
-        return rank_d64_pipelines(rows,heads,causal,sm_count,kv_heads=kv_heads,output_bits=output_bits)
+        return _rank_d64_families(rows,heads,causal,sm_count,kv_heads=kv_heads,output_bits=output_bits)
     if output_bits!=32:
         raise ValueError("D128 FP16 GQA uses compile_static_fa3 with kv_heads")
     costs = {"cp-q64-producer-wait4-late-v":1.0}
@@ -658,7 +864,7 @@ def rank_grouped_attention(rows, heads, kv_heads, dim, causal, sm_count=114, *, 
                 kv_heads=kv_heads, query_heads=heads, sm_count=sm_count)
 
 
-def rank_d64_pipelines(rows, heads, causal, sm_count=114, *, kv_heads=None, causal_v_tma=True, output_bits=32):
+def _rank_d64_families(rows, heads, causal, sm_count=114, *, kv_heads=None, causal_v_tma=True, output_bits=32):
     """Rank legal compiled families without timing or solving any candidate."""
     if type(rows) is not int or rows <= 0 or type(heads) is not int or heads <= 0:
         raise ValueError("positive sequence and head counts are required")
@@ -683,12 +889,26 @@ def rank_d64_pipelines(rows, heads, causal, sm_count=114, *, kv_heads=None, caus
         x = features(rows,heads,is_causal,q,k,capacity,sm_count)
         costs[arm] = sum(a*b for a,b in zip(x,coefs))
     _score_kv_pairs(costs, rows, heads, is_causal, sm_count)
+    short_transport = None
+    if not is_causal and kv_heads == heads and output_bits == 32:
+        short_transport = _score_short_mha_transport(costs, rows, heads, sm_count)
     if is_causal:
         _compare_causal_transport(costs,rows,heads,sm_count)
         if causal_v_tma:
             for arm, ratio in _relative_transport_costs(rows,heads,kv_heads,True,64).items():
                 same_k = arm.removesuffix("-v-tma")
                 costs[arm] = costs[same_k] * ratio
+    short_causal_width = None
+    three_block_kv64 = None
+    two_block_kv64 = None
+    if is_causal and causal_v_tma and kv_heads == heads and output_bits == 32:
+        row_major_v = short_causal_row_major_v(rows, rows, heads, kv_heads, 64, 64, is_causal, output_bits)
+        short_causal_width = _score_short_causal_width(costs, rows, heads, sm_count, row_major_v)
+        if short_kv64_sw128_tma(rows, rows, heads, kv_heads, 64, 64, is_causal, output_bits):
+            if (rows + 63) // 64 == 2:
+                two_block_kv64 = _score_two_block_kv64(costs, rows, heads, sm_count, row_major_v)
+            else:
+                three_block_kv64 = _score_three_block_kv64(costs, rows, heads, sm_count, row_major_v)
     comparison = None
     if kv_heads < heads:
         comparison = _score_grouped_width(costs, rows, heads, kv_heads, is_causal, sm_count)
@@ -696,6 +916,14 @@ def rank_d64_pipelines(rows, heads, causal, sm_count=114, *, kv_heads=None, caus
     if kv_heads < heads and not is_causal and output_bits == 32:
         geometry, joint = _score_joint_grouped_tiles(costs, rows, heads, sm_count, kv_heads=kv_heads)
     result = dict(selected=min(costs,key=costs.get),estimated_us=costs,sm_count=sm_count)
+    if two_block_kv64 is not None:
+        result["two_block_kv64"] = two_block_kv64
+    if three_block_kv64 is not None:
+        result["three_block_kv64"] = three_block_kv64
+    if short_causal_width is not None:
+        result["short_causal_width"] = short_causal_width
+    if short_transport is not None:
+        result["short_transport"] = short_transport
     if joint is not None:
         result["grouped_tiles"] = joint
     if geometry is not None:
@@ -703,3 +931,28 @@ def rank_d64_pipelines(rows, heads, causal, sm_count=114, *, kv_heads=None, caus
     if comparison is not None:
         result["grouped_width"] = comparison
     return result
+
+
+def select_d64_pipeline(rows, heads, causal, sm_count=114, *, kv_heads=None, causal_v_tma=True, output_bits=32):
+    families = _rank_d64_families(rows, heads, causal, sm_count, kv_heads=kv_heads,
+                                  causal_v_tma=causal_v_tma, output_bits=output_bits)
+    return bind_ranked_pipeline(families, rows, heads, heads if kv_heads is None else kv_heads,
+                                64, causal, output_bits)
+
+
+def select_grouped_pipeline(rows, heads, kv_heads, dim, causal, sm_count=114, *, output_bits=32):
+    families = _rank_grouped_families(rows, heads, kv_heads, dim, causal, sm_count, output_bits=output_bits)
+    return bind_ranked_pipeline(families, rows, heads, kv_heads, dim, causal, output_bits)
+
+
+def rank_d64_pipelines(rows, heads, causal, sm_count=114, *, kv_heads=None, causal_v_tma=True, output_bits=32):
+    """Return physical plan names for the winner and its estimated costs, without compiling."""
+    _, receipt = select_d64_pipeline(rows, heads, causal, sm_count, kv_heads=kv_heads,
+                                     causal_v_tma=causal_v_tma, output_bits=output_bits)
+    return receipt
+
+
+def rank_grouped_attention(rows, heads, kv_heads, dim, causal, sm_count=114, *, output_bits=32):
+    """Return the same physical names used to compile and measure grouped attention."""
+    _, receipt = select_grouped_pipeline(rows, heads, kv_heads, dim, causal, sm_count, output_bits=output_bits)
+    return receipt

@@ -13,7 +13,7 @@ import tempfile
 from online_execution_contract import packet_contract
 from fa3_transport import resolve_verified_transport, rank_transport_events
 from fa3_event_schedule import SCHEDULES, resolve_events
-from fa3_query_tile import rank_cta_dispatch
+from fa3_query_tile import eligible_writebacks, rank_cta_dispatch
 
 # The canonical fixture is online_fixture(128,128,8192,16,16,execution_contract=plan)
 # after --frisk-layout-pipeline --frisk-export-execution. This specialization
@@ -349,12 +349,14 @@ def compile_budgeted_fa3(data, *, budget=1, directory=None, tilelang_root=None, 
     """Apply one shared compilation budget across all requested writers and event orders."""
     from backend import compile_execution
     rows, heads, causal = _geometry(data)
-    writers = ("tma","register") if fa3_writeback=="auto" else (fa3_writeback,)
-    if fa3_writeback=="auto" and (causal or _kv_heads(data)<heads) and rows % _query_tile(packet_contract(data)):
-        writers = ("register",)
+    tile = _query_tile(packet_contract(data))
+    writers = eligible_writebacks(rows, tile, fa3_writeback)
+    if not writers:
+        raise ValueError("partial FA3 output tiles require the guarded register writer")
     transports = {w:_prepare_transport(data,w) for w in writers}
+    if any(t.facts["moves"]["q"]["box"][1] != tile for t in transports.values()):
+        raise ValueError("FA3 Q transport extent disagrees with the solved query tile")
     keys = _kv_rows(data)
-    tile = next(iter(transports.values())).facts["moves"]["q"]["box"][1]
     dispatch = rank_cta_dispatch(rows,keys,heads,causal,tile,mode=cta_dispatch)
     receipt, chosen = rank_fa3_writebacks(transports,rows,keys,causal,budget,heads=heads,cta_dispatch=dispatch["selected"])
     receipt["cta_dispatch"] = dispatch
@@ -480,10 +482,11 @@ if __name__=='__main__':
                       help='compile the static shortlist (default: one)')
     mode.add_argument('--replay-imported',action='store_true',help='replay the imported order explicitly')
     parser.add_argument("--query-tile",choices=("auto","64","128"),
-                        help="choose the query geometry before solving layout (causal static default: auto)")
+                        help="choose the query geometry before solving layout (causal and partial-Q static default: auto)")
     args=parser.parse_args()
     replay=bool(args.replay_imported or args.event_schedules)
-    default_auto=args.causal and not replay
+    cli_tile = 64 if args.query_tile == "64" else 128
+    default_auto = not replay and (args.causal or args.rows % cli_tile != 0)
     args.writeback=args.writeback or ("auto" if default_auto else "tma")
     requested=args.query_tile or ("auto" if default_auto else "128")
     tile=None if requested=="auto" else int(requested)
@@ -512,10 +515,10 @@ if __name__=='__main__':
             parser.error('duplicate event schedules')
         directory=Path(args.output).resolve()
         data=solve_overlap_fa3(args.plan,args.opt,directory,**options)
-        writers=("tma","register") if args.writeback=="auto" else (args.writeback,)
         rows, heads, causal = _geometry(data)
-        if args.writeback=="auto" and (causal or _kv_heads(data)<heads) and rows % query_tile:
-            writers=("register",)
+        writers = eligible_writebacks(rows, query_tile, args.writeback)
+        if not writers:
+            parser.error("partial FA3 output tiles require the guarded register writer")
         receipts={}
         for writer in writers:
             transport=_prepare_transport(data,writer)

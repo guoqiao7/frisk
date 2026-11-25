@@ -13,6 +13,7 @@
 #include "Dialect/Frisk/Target/SM90/SM90LayoutTarget.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
+#include "llvm/ADT/IntEqClasses.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/Support/MathExtras.h"
 #include <map>
@@ -103,7 +104,7 @@ static DistributedEncodingAttr spliceWithinGroup(RankedTensorType type,
 }
 Completions addCompletions(LayoutConstraintGraph &graph, LayoutTarget &target,
                            ModuleOp mod, unsigned limit, StoreMap storeMap,
-                           bool offerConsecutiveWriters, bool subgroupCandidates, bool slicedStores) {
+                           const llvm::SmallBitVector &memorySeeded, bool subgroupCandidates, bool slicedStores) {
   Completions out;
   for (auto &var : graph.getVariables()) {
     auto type = dyn_cast<RankedTensorType>(var.shapedType);
@@ -132,7 +133,7 @@ Completions addCompletions(LayoutConstraintGraph &graph, LayoutTarget &target,
     };
     auto seeds = var.candidates;
     // Offer the existing native consecutive-writer policy at each store use.
-    if (offerConsecutiveWriters && var.use && isa<TileStoreOp>(var.use->getOwner()) &&
+    if (!memorySeeded.test(var.id) && var.use && isa<TileStoreOp>(var.use->getOwner()) &&
         (type.getRank() == 2 || (slicedStores && type.getRank() == 1)) && type.getElementType().isF32())
       for (auto &seed : seeds) {
         auto enc = dyn_cast<DistributedEncodingAttr>(seed.value);
@@ -322,33 +323,71 @@ DistributedEncodingAttr memoryOrientation(RankedTensorType t, int threads,
       b.getI64IntegerAttr(1));
 }
 
-// Offer preferred orientations across a pointwise SSA component. Bound roles
-// retain their original domain. Non-pointwise relations use target proposals.
-bool seedPointwiseAccesses(LayoutConstraintGraph &g, LayoutTarget &target,
-                           ModuleOp mod, bool nativeVector) {
-  auto constraints = g.getConstraints();
-  if (llvm::any_of(constraints, [](const auto &c) {
-        return c.instruction || c.reduction || c.kind == ConstraintKind::TransformLayout ||
-               c.kind == ConstraintKind::BroadcastLayout;
-      })) return false;
-  using SeedSet = SmallVector<Attribute, 3>;
-  SmallVector<SeedSet> seeds(g.getVariables().size());
-  SmallVector<bool> bound(seeds.size(), false);
-  bool proposed = false;
-  auto insert = [&](LayoutVarID id, Attribute a) {
-    if (llvm::is_contained(seeds[id], a)) return false;
-    seeds[id].push_back(a);
-    return true;
+// Only distributed SSA relations connect ownership decisions. A common memory
+// root, CTA or enclosing operation does not connect two independent values.
+struct AccessComponents {
+  llvm::IntEqClasses ssa;
+  llvm::SmallBitVector nonPointwise, hasMmaOrReduction;
+  StringRef accessMode;
+
+  AccessComponents(const LayoutConstraintGraph &g, StringRef mode)
+      : ssa(g.getVariables().size()), accessMode(mode) {
+    for (const auto &c : g.getConstraints()) {
+      if (c.kind != ConstraintKind::SameLayout && c.kind != ConstraintKind::Convertible &&
+          !isBoundary(c))
+        continue;
+      std::optional<LayoutVarID> first;
+      for (auto id : c.vars) {
+        if (g.getVariable(id).kind != LayoutKind::Distributed) continue;
+        if (first) ssa.join(*first, id);
+        else first = id;
+      }
+    }
+    ssa.compress();
+    nonPointwise.resize(ssa.getNumClasses());
+    hasMmaOrReduction.resize(ssa.getNumClasses());
+    for (const auto &c : g.getConstraints()) {
+      if (!isBoundary(c)) continue;
+      for (auto id : c.vars) {
+        nonPointwise.set(ssa[id]);
+        if (c.reduction || (c.instruction && isa<MmaOp>(c.instruction->source)))
+          hasMmaOrReduction.set(ssa[id]);
+      }
+    }
+  }
+
+  static bool isBoundary(const LayoutConstraint &c) {
+    return c.instruction || c.reduction || c.kind == ConstraintKind::TransformLayout ||
+           c.kind == ConstraintKind::BroadcastLayout;
+  }
+
+  bool nativeAccess(LayoutVarID id) const {
+    return accessMode == "native" ||
+           (accessMode == "pointwise" && !hasMmaOrReduction.test(ssa[id]));
+  }
+};
+
+// Share candidate proposals, not layout decisions. Convertible uses still have
+// independent variables; fixed roles contribute their encoding but stay bound.
+llvm::SmallBitVector seedPointwiseAccesses(LayoutConstraintGraph &g, LayoutTarget &target,
+                                           ModuleOp mod, const AccessComponents &components) {
+  using SeedSet = SmallVector<Attribute, 4>;
+  SmallVector<SeedSet> seeds(components.ssa.getNumClasses());
+  llvm::SmallBitVector sensitive(seeds.size()), bound(g.getVariables().size());
+  auto insert = [&](unsigned component, Attribute a) {
+    if (!llvm::is_contained(seeds[component], a)) seeds[component].push_back(a);
   };
-  for (const auto &c : constraints) {
+  for (const auto &c : g.getConstraints()) {
     if (c.kind == ConstraintKind::RequireEncoding) {
       auto id = c.vars.front();
-      bound[id] = true;
+      bound.set(id);
       if (g.getVariable(id).kind == LayoutKind::Distributed)
-        insert(id, c.requiredEncoding);
+        insert(components.ssa[id], c.requiredEncoding);
     }
     if (c.kind != ConstraintKind::StorageAccess || c.vars.size() != 2) continue;
     auto id = c.vars[0], storage = c.vars[1];
+    auto component = components.ssa[id];
+    if (components.nonPointwise.test(component)) continue;
     auto &v = g.getVariable(id);
     auto &stores = g.getVariable(storage).candidates;
     if (stores.size() != 1) continue;
@@ -365,41 +404,37 @@ bool seedPointwiseAccesses(LayoutConstraintGraph &g, LayoutTarget &target,
         }
         CandidateAssignment a;
         a.values[id] = candidates[axis]; a.values[storage] = stores.front().value;
-        auto cost = accessUnits(g,c,a,nativeVector);
+        auto cost = accessUnits(g,c,a,components.nativeAccess(id));
         if (failed(cost)) { valid = false; break; }
         units[axis] = *cost;
       }
       if (valid && units[0] != units[1]) {
-        insert(id,candidates[units[1] < units[0]]);
-        proposed = true;
+        insert(component,candidates[units[1] < units[0]]);
+        sensitive.set(component);
       }
     }
   }
-  if (!proposed) return false;
-  bool changed;
-  do {
-    changed = false;
-    for (const auto &c : constraints) {
-      if (c.kind != ConstraintKind::SameLayout && c.kind != ConstraintKind::Convertible)
-        continue;
-      for (auto from : c.vars) for (auto to : c.vars) {
-        if (from == to) continue;
-        for (Attribute a : seeds[from]) changed |= insert(to,a);
-      }
-    }
-  } while (changed);
+  llvm::SmallBitVector seeded(g.getVariables().size());
   for (auto &v : g.getVariables()) {
-    if (v.kind != LayoutKind::Distributed || bound[v.id] || seeds[v.id].empty()) continue;
-    SmallVector<LayoutCandidate> domain;
-    for (Attribute a : seeds[v.id]) {
-      if (failed(target.verifyCandidate(v,a,mod.getLoc()))) continue;
+    auto component = components.ssa[v.id];
+    if (v.kind != LayoutKind::Distributed || !sensitive.test(component)) continue;
+    if (bound.test(v.id)) {
+      seeded.set(v.id);
+      continue;
+    }
+    for (Attribute a : seeds[component]) {
+      if (llvm::any_of(v.candidates, [&](const auto &candidate) { return candidate.value == a; })) {
+        seeded.set(v.id);
+        continue;
+      }
+      if (failed(target.verifyCandidate(v, a, mod.getLoc()))) continue;
+      seeded.set(v.id);
       auto origin = g.addProvenance(std::nullopt, v.anchor ? v.anchor : mod.getOperation(),
                                     "memory-orientation", "pointwise access or compatible bound role");
-      domain.push_back({a,origin,v.id});
+      v.candidates.push_back({a, origin, v.id});
     }
-    if (!domain.empty()) v.candidates = std::move(domain);
   }
-  return true;
+  return seeded;
 }
 
 // For a hardware prefix H, rank(M_H) - rank(dropAxis(M_H)) is the
@@ -591,9 +626,10 @@ struct Model {
   int64_t fixedBits = 0, freeBits = 0, bitDecisions = 0, next = 0;
   SmallVector<Attribute> masks;
   DenseMap<std::pair<Type, Type>, int64_t> prices;
-  bool nativeVector = false;
-  Model(ModuleOp m, LayoutConstraintGraph &g, LayoutTarget &t, RoutePrice p, StoreMap sm)
-      : module(m), graph(g), target(t), price(p), storeMap(sm) {}
+  const AccessComponents &accessComponents;
+  Model(ModuleOp m, LayoutConstraintGraph &g, LayoutTarget &t, RoutePrice p, StoreMap sm,
+        const AccessComponents &components)
+      : module(m), graph(g), target(t), price(p), storeMap(sm), accessComponents(components) {}
   z3::expr bit() {
     return ctx.bool_const(("b" + std::to_string(next++)).c_str());
   }
@@ -866,7 +902,7 @@ struct Model {
     }
     auto add = [&](CandidateAssignment &assignment,
                    const z3::expr &flag) -> LogicalResult {
-      auto units = accessUnits(graph, c, assignment, nativeVector, !sliceUnits.empty());
+      auto units = accessUnits(graph, c, assignment, accessComponents.nativeAccess(c.vars.front()), !sliceUnits.empty());
       if (failed(units)) {
         auto &v = graph.getVariable(c.vars.front());
         auto *source = graph.getProvenances()[c.provenance].source;
@@ -986,8 +1022,10 @@ struct Model {
 struct Bill {
   int64_t mainLoop = 0;
   int64_t access = 0, movement = 0, reduction = 0, spill = 0, count = 0;
-  auto objective() const {
-    return std::pair<int64_t, int64_t>(access + movement + reduction + spill + mainLoop, count);
+  int64_t service() const { return access + movement + reduction + spill + mainLoop; }
+  auto objective(bool minimizeConversions) const {
+    return minimizeConversions ? std::make_pair(count, service())
+                               : std::make_pair(service(), count);
   }
 };
 
@@ -1032,7 +1070,7 @@ std::optional<Bill> billWitness(Model &m, const CandidateAssignment &assignment,
       bill.reduction += *work;
     }
     if (c.kind == ConstraintKind::StorageAccess) {
-      auto amount = accessUnits(m.graph, c, assignment, m.nativeVector, !m.sliceUnits.empty());
+      auto amount = accessUnits(m.graph, c, assignment, m.accessComponents.nativeAccess(c.vars.front()), !m.sliceUnits.empty());
       if (failed(amount) || *amount > INT64_MAX - bill.access)
         return std::nullopt;
       bill.access += *amount;
@@ -1057,7 +1095,7 @@ std::optional<Bill> billWitness(Model &m, const CandidateAssignment &assignment,
 
 // Small diagnostic oracle. Enumerate actual encodings, pruning only with the
 // existing hard relation verifier. Never consult Z3 indicators or objectives.
-LogicalResult verifyByEnumeration(Model &m, unsigned limit,
+LogicalResult verifyByEnumeration(Model &m, unsigned limit, bool minimizeConversions,
                                   const Bill &selected, unsigned &nodes,
                                   unsigned &witnesses,
                                   std::optional<int64_t> &noConversion) {
@@ -1076,6 +1114,9 @@ LogicalResult verifyByEnumeration(Model &m, unsigned limit,
            m.graph.getVariable(y).candidates.size();
   });
   std::optional<std::pair<int64_t, int64_t>> best;
+  // Unary ownership/resource proofs depend only on their role's layout. In
+  // the independent oracle a replicated candidate can recur in many leaves.
+  DenseMap<std::pair<LayoutConstraintID, Attribute>, bool> unaryProofs;
   auto visit = [&](auto &&self, size_t level) -> void {
     if (nodes >= limit) {
       nodes = limit + 1;
@@ -1088,9 +1129,16 @@ LogicalResult verifyByEnumeration(Model &m, unsigned limit,
         if (from && to && !m.routeAllowed(c, from, to))
           return;
       }
-      if (!satisfiesLayoutConstraint(m.graph, c, a.values,
-                                     level == order.size()))
+      if (c.strength == ConstraintStrength::Hard && c.vars.size() == 1 &&
+          isSupportedUnaryLayoutConstraint(c.kind)) {
+        Attribute layout = a.values.lookup(c.vars.front());
+        if (!layout) continue;
+        auto [it, inserted] = unaryProofs.try_emplace(std::make_pair(c.id, layout), false);
+        if (inserted) it->second = satisfiesLayoutConstraint(m.graph, c, a.values, true);
+        if (!it->second) return;
+      } else if (!satisfiesLayoutConstraint(m.graph, c, a.values, level == order.size())) {
         return;
+      }
     }
     if (level < order.size()) {
       auto id = order[level];
@@ -1114,16 +1162,16 @@ LogicalResult verifyByEnumeration(Model &m, unsigned limit,
     if (!bill)
       return;
     ++witnesses;
-    if (bill->count == 0 && (!noConversion || bill->objective().first < *noConversion))
-      noConversion = bill->objective().first;
-    if (!best || bill->objective() < *best)
-      best = bill->objective();
+    if (bill->count == 0 && (!noConversion || bill->service() < *noConversion))
+      noConversion = bill->service();
+    if (!best || bill->objective(minimizeConversions) < *best)
+      best = bill->objective(minimizeConversions);
   };
   visit(visit, 0);
   if (nodes > limit)
     return m.module.emitError(
         "multi-anchor enumeration audit reached its node limit");
-  if (!best || *best != selected.objective())
+  if (!best || *best != selected.objective(minimizeConversions))
     return m.module.emitError(
         "independent enumeration disagrees with the integer optimum");
   return success();
@@ -1134,8 +1182,8 @@ LogicalResult verifyByEnumeration(Model &m, unsigned limit,
 FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
     ModuleOp module, const CertifiedInstructionDomains &domains,
     RoutePrice price, StoreMap storeMap, unsigned freeBits, unsigned timeoutMs,
-    unsigned oracleLimit, bool scoreReduction, bool nativeVector, bool subgroupCandidates,
-    const DenseMap<Attribute, int64_t> &sliceUnits, StringRef nativeDelivery) {
+    unsigned oracleLimit, bool scoreReduction, StringRef globalAccess, bool subgroupCandidates,
+    bool minimizeConversions, const DenseMap<Attribute, int64_t> &sliceUnits, StringRef nativeDelivery) {
 #ifndef FRISK_HAS_Z3
   return module.emitError(
       "multi-anchor integer solver requires Z3; configure FRISK_Z3_ROOT");
@@ -1146,11 +1194,14 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
       nullptr, &domains);
   if (failed(graph))
     return failure();
-  bool memorySeeds = domains.empty() && seedPointwiseAccesses(*graph, *target, module, nativeVector);
+  AccessComponents components(*graph, globalAccess);
+  if (minimizeConversions && components.nonPointwise.any())
+    return module.emitError("minimum-conversion pointwise trial requires pointwise layout relations");
+  auto memorySeeds = seedPointwiseAccesses(*graph, *target, module, components);
   // Pointwise stores already propose layouts through their storage access.
   // Honor the ordinary F2 expansion budget independently of that choice.
   auto completions = addCompletions(*graph, *target, module, freeBits, storeMap,
-                                    /*offerConsecutiveWriters=*/!memorySeeds, subgroupCandidates, !sliceUnits.empty());
+                                    memorySeeds, subgroupCandidates, !sliceUnits.empty());
   if (failed(propagateCommonToFixedPoint(*graph)))
     return failure();
   std::optional<NormalizationTrial> normalization;
@@ -1161,11 +1212,10 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
     if (failed(trial)) return failure();
     normalization = *trial;
   }
-  Model m(module, *graph, *target, price, storeMap);
+  Model m(module, *graph, *target, price, storeMap, components);
   m.delivery = nativeDelivery;
   m.sliceUnits = sliceUnits;
   m.scoreReduction = scoreReduction;
-  m.nativeVector = nativeVector;
   if (failed(m.buildDomains()) || failed(m.bindCompiledSpill()))
     return failure();
   for (const auto &c : graph->getConstraints()) {
@@ -1188,8 +1238,11 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
   z3::params p(m.ctx);
   p.set("timeout", timeoutMs);
   m.solver.set(p);
-  auto service = m.solver.minimize(m.access + m.movement + m.reduction + m.spill + m.mainLoop);
-  auto unique = m.solver.minimize(m.routes);
+  auto total = m.access + m.movement + m.reduction + m.spill + m.mainLoop;
+  const auto &primary = minimizeConversions ? m.routes : total;
+  const auto &secondary = minimizeConversions ? total : m.routes;
+  auto first = m.solver.minimize(primary);
+  auto second = m.solver.minimize(secondary);
   auto status = m.solver.check();
   if (status == z3::unsat)
     return module.emitError(
@@ -1203,7 +1256,7 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
            z3::eq(model.eval(objective, true).simplify(),
                   m.solver.lower(h).simplify());
   };
-  if (!optimal(service, m.access + m.movement + m.reduction + m.spill + m.mainLoop) || !optimal(unique, m.routes))
+  if (!optimal(first, primary) || !optimal(second, secondary))
     return module.emitError(
         "multi-anchor integer objective has no optimality certificate");
 
@@ -1254,7 +1307,7 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
         "physical conversion or access bill disagrees with integer model");
   unsigned nodes = 0, witnesses = 0;
   std::optional<int64_t> noConversion;
-  if (failed(verifyByEnumeration(m, oracleLimit, *bill, nodes, witnesses,
+  if (failed(verifyByEnumeration(m, oracleLimit, minimizeConversions, *bill, nodes, witnesses,
                                  noConversion)))
     return failure();
   solution.conversions = std::move(conversion->edges);
@@ -1292,10 +1345,10 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
     receipt.set("compiled_spill_units", b.getI64IntegerAttr(bill->spill));
     receipt.set("compiled_spill_cubin", arm.cubin);
   }
-  if (memorySeeds) {
+  if (memorySeeds.any()) {
     SmallVector<Attribute> roles;
     for (const auto &v : graph->getVariables()) {
-      if (v.kind != LayoutKind::Distributed) continue;
+      if (!memorySeeds.test(v.id)) continue;
       NamedAttrList info;
       info.set("role", b.getStringAttr(v.stableName));
       info.set("layouts", b.getArrayAttr(m.vars[v.id].values));
@@ -1303,6 +1356,8 @@ FailureOr<DictionaryAttr> mlir::frisk::solveCertifiedMultiAnchor(
     }
     receipt.set("memory_domains", b.getArrayAttr(roles));
   }
+  if (minimizeConversions)
+    receipt.set("minimize_conversions", b.getBoolAttr(true));
   receipt.set("optimal", b.getBoolAttr(true));
   receipt.set(
       "access_units",

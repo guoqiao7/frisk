@@ -56,16 +56,23 @@ class TransportCostTest(unittest.TestCase):
         other=rank_transport_events(register,896,2048,False,1,heads=18)
         self.assertEqual(other["transport_work"]["o"],result["transport_work"]["o"])
 
-    def test_causal_partial_output_accounts_for_guarded_rows(self):
+    def test_partial_output_accounts_for_guarded_rows(self):
         facts=contract("register_store_u32").facts
         facts["moves"]["o"].update(
             store_work=dict(bytes=32768,warp_stores=256,sector_requests=2048,width_bytes=4),
             tail_store_work=dict(bytes=256,warp_stores=16,sector_requests=16))
-        result=rank_transport_events(FA3Transport(canonical(facts)),257,600,True,1,heads=2)
-        self.assertEqual(result["transport_work"]["o"]["requested_bytes"],257*2*256)
-        self.assertEqual(result["transport_work"]["o"]["issued_instructions"],2*(2*256+16))
-        with self.assertRaises(ValueError):
-            rank_transport_events(contract(),257,600,True,1,heads=2)
+        for causal, group, domain in ((True, 1, "existing_profile"), (False, 3, "existing_profile"),
+                                      (False, 1, "ordinary_mha_partial_q_extrapolation")):
+            facts["moves"]["k"]["query_heads_per_kv_head"] = group
+            result = rank_transport_events(FA3Transport(canonical(facts)),257,600,causal,1,heads=6)
+            self.assertEqual(result["score_domain"], domain)
+            self.assertEqual(result["transport_work"]["o"]["requested_bytes"],257*6*256)
+            self.assertEqual(result["transport_work"]["o"]["issued_instructions"],6*(2*256+16))
+            with self.assertRaisesRegex(ValueError, "guarded register writer"):
+                rank_transport_events(contract(),257,600,causal,1,heads=6)
+        del facts["moves"]["o"]["tail_store_work"]
+        with self.assertRaisesRegex(ValueError, "register output tail"):
+            rank_transport_events(FA3Transport(canonical(facts)),257,600,False,1,heads=6)
 
     def test_store_work_uses_actual_lane_addresses(self):
         self.assertEqual(register_store_work({"logical":list(range(64))},32)["sector_requests"],4)

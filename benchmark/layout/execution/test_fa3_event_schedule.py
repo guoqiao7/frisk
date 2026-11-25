@@ -36,7 +36,7 @@ class FA3EventTest(unittest.TestCase):
         with TemporaryDirectory() as scratch:
             path=Path(scratch)/"imported.json"
             path.write_text("{}")
-            with patch("attention_pipeline_selection.from_overlap", return_value={"kind":"fa3_qk_next"}):
+            with patch("attention_pipeline_candidates.from_overlap", return_value={"kind":"fa3_qk_next"}):
                 plans=attention_pipelines(16,[path],include_late_k=True)
             late=[p for p in plans if p.event_schedule=="late_k"]
             self.assertEqual([(p.name,p.writeback) for p in late],

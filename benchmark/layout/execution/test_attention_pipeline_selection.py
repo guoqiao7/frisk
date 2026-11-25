@@ -50,6 +50,54 @@ class AttentionPipelineSelectionTest(unittest.TestCase):
                 measure=lambda images: [{name: 1.0 for name in images}])
         self.assertEqual(set(paths.values()),{("cp.async","cp.async"),("tma","cp.async"),("tma","tma")})
 
+    def test_short_causal_tuner_emits_the_two_slot_wide_plan(self):
+        for causal, heads, kv_heads, rows, expected in (
+                (True, 12, 12, 128, True), (True, 12, 12, 256, True),
+                (True, 12, 12, 257, False), (True, 12, 3, 256, False), (False, 12, 12, 256, False)):
+            plans = {}
+            def capture(plan, *args, **options):
+                plans[plan.name] = (options["k_transport"], plan.v_transport)
+                return plan.name, {}
+            with patch("attention_pipeline_selection.compile_attention_pipeline", side_effect=capture):
+                tune_attention_pipelines("opt", ".", rows=rows, heads=heads, kv_heads=kv_heads, dim=64,
+                    causal=causal, aligned_inputs=True, output_bits=32,
+                    measure=lambda images: [{name: 1.0 for name in images}])
+            self.assertEqual(plans.get("q64-kv128-k-tma-v-tma"), ("tma", "tma") if expected else None)
+
+    def test_short_causal_partial_query_adds_a_row_major_candidate(self):
+        for n,causal,kv_heads,expected in [(207, True, 12, True), (241, True, 12, True),
+                                           (224, True, 12, True), (192, True, 12, False),
+                                           (256, True, 12, False), (265, True, 12, False),
+                                           (207, False, 12, False), (207, True, 3, False)]:
+            captured = {}
+            def record(plan, *args, **options):
+                captured[plan.name] = (plan.v_row_major_tma, options["k_transport"], plan.v_transport)
+                return plan.name, {}
+            with patch("attention_pipeline_selection.compile_attention_pipeline", side_effect=record):
+                tune_attention_pipelines("opt", ".", rows=n, heads=12, kv_heads=kv_heads, dim=64,
+                    causal=causal, aligned_inputs=True, output_bits=32,
+                    measure=lambda images: [{name: 1.0 for name in images}])
+            name = "q64-kv128-k-tma-v-tma"
+            self.assertEqual(captured.get(name+"-sw128"), (True,"tma","tma") if expected else None)
+            if expected:
+                self.assertEqual(captured[name], (False,"tma","tma"))
+
+    def test_tuner_admits_short_narrow_sw128_ring_only_in_its_domain(self):
+        for n, causal, kv_heads, expected in ((64,True,8,False),(65,True,8,True),
+                                              (128,True,8,True),(129,True,8,True),
+                                              (192,True,8,True),(149,False,8,False),
+                                              (149,True,2,False)):
+            plans = {}
+            def capture(plan, *args, **opts):
+                plans[plan.name] = (plan.kv_tile, plan.v_row_major_tma, opts["k_transport"], plan.v_transport)
+                return plan.name, {}
+            with patch("attention_pipeline_selection.compile_attention_pipeline", side_effect=capture):
+                tune_attention_pipelines("opt", ".", rows=n, heads=8, kv_heads=kv_heads, dim=64,
+                    causal=causal, aligned_inputs=True, output_bits=32,
+                    measure=lambda images: [{name: 1.0 for name in images}])
+            self.assertEqual(plans.get("q64-kv64-k-tma-v-tma-sw128"),
+                             (64, True, "tma", "tma") if expected else None)
+
     def test_regular_grouped_d64_tuner_pairs_q_rows_on_joint_transfer(self):
         captured = {}
         def capture(plan, *args, **options):
@@ -80,6 +128,58 @@ class AttentionPipelineSelectionTest(unittest.TestCase):
                 for suffix, edge in (("", False), ("-post-qk", True)):
                     name = f"q64-kv{width}-k-tma{suffix}-v-tma"
                     self.assertEqual(arms[name], ("tma", "tma", edge))
+
+    def test_static_winner_is_one_of_the_tunable_physical_kernels(self):
+        from attention_pipeline_selection import compile_static_d64_attention, compile_static_gqa_attention
+        for n, h, g, d, causal, bits, physical in (
+                (920, 15, 1, 64, False, 32, "q64-kv128-k-tma-post-qk-v-tma-sw128"),
+                (760, 30, 2, 64, False, 32, "q128-kv128-k-tma-post-qk-v-tma-sw128"),
+                (116, 54, 54, 64, True, 32, "q64-kv64-k-tma-v-tma-sw128"),
+                (224, 19, 19, 64, True, 32, "q64-kv128-k-tma-v-tma-sw128"),
+                (256, 8, 8, 64, False, 32, "q64-kv64-k-tma-post-qk-v-tma"),
+                (64, 5, 5, 64, False, 16, "q64-producer-wait4-late-v"),
+                (193, 8, 1, 128, True, 32, "q64-kv64-k-tma-v-tma")):
+            with self.subTest(shape=(n, h, g, d, causal, bits)):
+                args = dict(rows=n, heads=h, causal=causal, output_bits=bits, aligned_inputs=True,
+                            row_reciprocal=True, softmax_math="base2-ftz")
+                def capture(plan, *args, **options):
+                    return (plan, options["k_transport"], options["k_map_abi"]), {"execution_audit": {}}
+                with patch("attention_pipeline_selection.compile_attention_pipeline", side_effect=capture) as compile_one:
+                    if h == g:
+                        image, _, receipt = compile_static_d64_attention("opt", ".", **args)
+                    else:
+                        image, _, receipt = compile_static_gqa_attention("opt", ".", dim=d, kv_heads=g, **args)
+                    compile_one.assert_called_once()
+                    self.assertEqual(receipt["selected"], physical)
+                    self.assertEqual(receipt["physical_by_family"][receipt["ranked_family"]], physical)
+                    from d64_static_pipeline import rank_d64_pipelines, rank_grouped_attention
+                    ranked = (rank_d64_pipelines(n, h, causal, output_bits=bits) if h == g else
+                              rank_grouped_attention(n, h, g, d, causal, output_bits=bits))
+                    self.assertEqual(ranked["selected"], physical)
+                    def measure(images):
+                        self.assertEqual(image, images[physical][0])
+                        costs = receipt.get("estimated_us", receipt.get("estimated_ratio"))
+                        self.assertIn(physical, costs)
+                        self.assertTrue(costs.keys() <= images.keys())
+                        return [{name: 1. if name == physical else 2. for name in images}]
+                    tuned, _, winner = tune_attention_pipelines("opt", ".", dim=d, kv_heads=g,
+                                                                 measure=measure, **args)
+                    self.assertEqual((tuned, winner["selected"]), (image, physical))
+
+    def test_grouped_swizzles_are_distinct_and_obey_explicit_restrictions(self):
+        from attention_pipeline_candidates import pipeline_candidates
+        args = dict(rows=920, heads=15, kv_heads=1, dim=64, causal=False,
+                    output_bits=32, aligned_inputs=True)
+        base = "q64-kv128-k-tma-post-qk-v-tma"
+        candidates = {c.plan.name: c for c in pipeline_candidates(**args)}
+        self.assertFalse(candidates[base].plan.v_row_major_tma)
+        self.assertIsNone(candidates[base].ranked_family)
+        self.assertTrue(candidates[base+"-sw128"].plan.v_row_major_tma)
+        self.assertEqual(candidates[base+"-sw128"].ranked_family, base)
+        for opts in (dict(include_v_tma=False), dict(k_transport="cp.async"),
+                     dict(k_transport="tma", k_map_abi="global")):
+            pool = pipeline_candidates(**args, **opts)
+            self.assertFalse(any(c.plan.v_transport == "tma" for c in pool))
 
     def test_compared_plans_remain_bound_to_their_contract(self):
         plans = attention_pipelines(32)[:2]

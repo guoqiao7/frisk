@@ -91,6 +91,7 @@ class BudgetedFA3Test(unittest.TestCase):
 
     def test_default_launches_one_native_compile(self):
         with patch("native_fa3_execution._geometry",return_value=(1024,16,False)), \
+                patch("native_fa3_execution.packet_contract",return_value={"buffers":{"q":{"tile_bytes":32768}}}), \
                 patch("native_fa3_execution._kv_rows",return_value=1024), \
                 patch("native_fa3_execution._prepare_transport") as prepare, \
                 patch("native_fa3_execution.rank_transport_events",return_value={"selected":["qk_next"]}), \

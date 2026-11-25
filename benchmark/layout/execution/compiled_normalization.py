@@ -12,6 +12,8 @@ import re
 import subprocess
 import tempfile
 
+from normalization_reuse import validate_reuse
+from normalization_schedule import active_ctas, check_grid, rank_grid, schedule_profile
 from compiled_sum_spill import compile_sum_arms
 from compiled_global_access import UnsupportedGlobalAccess, global_access, physical_choice
 
@@ -160,17 +162,38 @@ class NormalizationSelection:
     receipt: dict
 
 
-def compile_normalization_layout(source, opt, output_dir, rows, columns, prepare, *, audit=False):
+def compile_normalization_layout(source, opt, output_dir, rows, columns, prepare, *,
+                                 audit=False, grid_ctas=None, sm_count=None, reuse=None, l2_bytes=None):
     """Compile legal candidates, bind whole-image spill to each witness, dispatch the winner.
 
-    audit=True additionally compiles alternatives for a spill-free incumbent.
-    It does not change the gate or the selected layout.
+    With grid_ctas, compare the fixed audit candidates even for a spill-free
+    incumbent. sm_count defaults to the active CUDA device. Without a launch
+    contract the previous spill-triggered policy remains available; audit=True
+    compiles its alternatives for inspection without changing its decision.
+    Supply NormalizationReuse for launch-specific input/output reuse. L2 capacity
+    defaults to that of the device compiling this kernel.
     """
+    if reuse is None and l2_bytes is not None:
+        raise ValueError("l2_bytes needs an operand reuse contract")
+    if reuse is not None:
+        if grid_ctas is None:
+            raise ValueError("reuse ranking requires the actual launch grid")
+        if l2_bytes is None:
+            import torch
+            l2_bytes = torch.cuda.get_device_properties(torch.cuda.current_device()).L2_cache_size
+        validate_reuse(reuse, l2_bytes)
+    if grid_ctas is not None:
+        if sm_count is None:
+            import torch
+            sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        check_grid(grid_ctas, sm_count)
+    elif sm_count is not None:
+        raise ValueError("sm_count needs grid_ctas")
     location = Path(output_dir)
     location.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="norm-", dir=location))
     from triton.runtime.errors import OutOfResources
-    records, arms, errors = {}, {}, {}
+    records, arms, errors, schedules = {}, {}, {}, {}
     def trial(name, request):
         ir, record = layout_trial(source, opt, work / name, request)
         text = ir.read_text()
@@ -196,9 +219,15 @@ def compile_normalization_layout(source, opt, output_dir, rows, columns, prepare
         except UnsupportedGlobalAccess as exc:
             record["global_unavailable"] = str(exc)
             physical = None
+        if grid_ctas is not None and physical is not None:
+            # Equal cubins under the fixed four-warp launch have one schedule.
+            if arm.digest not in schedules:
+                schedules[arm.digest] = schedule_profile(arm.listing, arm.image.name,
+                                                         active_ctas(arm.image))
+            record["schedule"] = schedules[arm.digest]
         records[name], arms[name] = record, (arm.image, priced, physical)
     trial("incumbent", "")
-    if audit or records["incumbent"]["local_words"]:
+    if audit or grid_ctas is not None or records["incumbent"]["local_words"]:
         trials = [(f"original-{i}", f"reduction_index={i}:i64")
                   for i in range(records["incumbent"]["reduction_choices"])]
         for width in (1, 2, 4):
@@ -211,6 +240,9 @@ def compile_normalization_layout(source, opt, output_dir, rows, columns, prepare
                 errors[name] = str(exc)
     previous = previous_choice(records)
     winner = physical_choice(records, previous)
+    ranking = None
+    if grid_ctas is not None:
+        winner, ranking = rank_grid(records, winner, grid_ctas, sm_count, reuse=reuse, l2_bytes=l2_bytes)
     image, old_ir, physical_ir = arms[winner]
     complete = all("physical_total" in r for r in records.values())
     ir = physical_ir if complete else old_ir
@@ -221,5 +253,7 @@ def compile_normalization_layout(source, opt, output_dir, rows, columns, prepare
                    dependencies_certified=all("dependency_total" in r for r in records.values()),
                    fp32_certified=all("compute_total" in r for r in records.values()),
                    directory=str(work), records=records, rejected=errors)
+    if ranking is not None:
+        receipt["grid_ranking"] = ranking
     (work / "selection.json").write_text(json.dumps(receipt, indent=2))
     return NormalizationSelection(image, ir, receipt)
